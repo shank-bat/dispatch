@@ -1,0 +1,83 @@
+[project]
+name = "dispatch"
+version = "0.1.0"
+description = "A lightweight job scheduler for a single scientific-computing workstation"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Shashank" }]
+keywords = ["hpc", "scheduler", "cfd", "openfoam", "su2", "basilisk", "tui"]
+
+# Deliberately minimal. See docs/ARCHITECTURE.md §10 — every dependency here is
+# resident memory that a simulation cannot use.
+dependencies = [
+    "psutil>=6.0",
+    "textual>=0.80",
+]
+
+[project.scripts]
+dispatch = "dispatch.cli:main"
+dispatchd = "dispatch.daemon.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "mypy>=1.11",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dispatch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["dispatch"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "PTH", "ARG"]
+ignore = [
+    "SIM108", # ternaries are not always clearer than if/else
+    # `JobNotFound` and `IllegalTransition` read better at call sites than
+    # `JobNotFoundError` and `IllegalTransitionError`, and they are unambiguously
+    # exceptions from context (`raise`, `except`).
+    "N818",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG"]  # fixtures are frequently unused-by-name
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+files = ["src/dispatch", "tests"]
+
+[[tool.mypy.overrides]]
+module = "psutil.*"
+ignore_missing_imports = true
+
+# Tests are checked, but not held to `strict`. Annotating every pytest fixture parameter
+# adds noise without catching bugs -- the value of type checking here is in the source.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
