@@ -27,9 +27,25 @@ __all__ = [
     "PathsConfig",
     "SchedulerConfig",
     "load_config",
+    "physical_cores",
 ]
 
 APP_NAME: Final = "dispatch"
+
+
+def physical_cores() -> int | None:
+    """The machine's physical core count, ignoring SMT siblings.
+
+    ``None`` when it cannot be determined, which is a reason to fall back to the logical
+    count rather than to guess. psutil is imported lazily because this is called a handful
+    of times per daemon lifetime and ``config`` is imported by the CLI on every invocation.
+    """
+    try:
+        import psutil
+
+        return psutil.cpu_count(logical=False)
+    except Exception:  # pragma: no cover - psutil is a hard dependency, but never fatal
+        return None
 
 
 def _xdg(var: str, default: str) -> Path:
@@ -101,7 +117,7 @@ class SchedulerConfig:
     """
 
     total_cores: int | None = None
-    """Override the detected core count. ``None`` means ``os.cpu_count()``."""
+    """Override the detected core count. ``None`` means the machine's *physical* cores."""
 
     ram_margin_mb: int = 2048
     """RAM kept free above the sum of running jobs' estimates."""
@@ -125,8 +141,24 @@ class SchedulerConfig:
             raise ConfigError(f"scheduler.heartbeat_s must be positive, got {self.heartbeat_s}")
 
     def resolve_total_cores(self) -> int:
-        """The core count to schedule against."""
-        return self.total_cores or os.cpu_count() or 1
+        """The core count to schedule against.
+
+        **Physical** cores, not the logical count ``os.cpu_count()`` reports. Two
+        independent reasons, and they happen to give the same answer:
+
+        * MPI agrees with this number and not the other one. Open MPI sizes its default
+          slot count by physical cores, so a job launched with more ranks than the machine
+          has cores dies instantly with "not enough slots" -- before the solver runs at
+          all. Scheduling against the logical count on any SMT machine therefore admits
+          jobs that cannot start.
+        * It is the right number anyway. CFD solvers are memory-bandwidth bound, so a
+          second rank on the same physical core competes for the same cache and load/store
+          units rather than adding throughput.
+
+        A machine that genuinely wants hyperthreads sets ``scheduler.total_cores``
+        explicitly; that override is honoured, and the MPI launch adapts to it (§8.7).
+        """
+        return self.total_cores or physical_cores() or os.cpu_count() or 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +178,16 @@ class DaemonConfig:
     job_sample_interval_s: float = 30.0
     """Per-job resource sampling period while a job runs."""
 
+    progress_interval_s: float = 5.0
+    """How often a running job's log is read for its current time step.
+
+    Much shorter than the resource sampling period above, and affordable for a different
+    reason: this is one ``pread`` of the last few kilobytes of a file, whereas a resource
+    sample walks the whole process tree. Tying the two together would mean either walking
+    process trees every five seconds or watching a solver's time step update twice a
+    minute, and neither is a good trade.
+    """
+
     cancel_grace_s: float = 10.0
     """Seconds between rungs of the SIGINT -> SIGTERM -> SIGKILL cancellation ladder."""
 
@@ -160,7 +202,12 @@ class DaemonConfig:
     """Full-resolution retention for per-job samples; older ones are downsampled."""
 
     def __post_init__(self) -> None:
-        for name in ("sample_interval_s", "job_sample_interval_s", "cancel_grace_s"):
+        for name in (
+            "sample_interval_s",
+            "job_sample_interval_s",
+            "progress_interval_s",
+            "cancel_grace_s",
+        ):
             if getattr(self, name) <= 0:
                 raise ConfigError(f"daemon.{name} must be positive")
 

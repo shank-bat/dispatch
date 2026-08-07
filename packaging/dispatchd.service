@@ -1,0 +1,41 @@
+# Dispatch daemon, as a systemd user service.
+#
+# Optional. `dispatchd --detach` works without systemd at all, and on Debian's default
+# logind configuration (KillUserProcesses=no) it survives logout unaided. Use this unit if
+# you want the daemon started at boot and restarted on failure.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/dispatchd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dispatchd
+#
+# To have it start at boot rather than at first login:
+#
+#   loginctl enable-linger $USER
+#
+# `dispatch doctor` reports whether that is needed on this machine.
+
+[Unit]
+Description=Dispatch job scheduler
+Documentation=https://github.com/shu/dispatch
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dispatchd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Jobs run in their own sessions and must outlive the daemon, so systemd must not sweep
+# them up when the unit stops. This is the setting that makes "restarting Dispatch does
+# not stop my week-long simulation" true under systemd.
+KillMode=process
+TimeoutStopSec=30
+
+# The daemon needs to read and write case directories anywhere the user can, so this is
+# deliberately not sandboxed beyond the defaults.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

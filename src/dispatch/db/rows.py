@@ -54,6 +54,7 @@ def job_from_row(row: sqlite3.Row, *, tags: frozenset[str] = frozenset()) -> Job
         exit_code=row["exit_code"],
         exit_reason=_exit_reason(row["exit_reason"]),
         exit_signal=row["exit_signal"],
+        exit_detail=row["exit_detail"],
         stdout_path=_optional_path(row["stdout_path"]),
         stderr_path=_optional_path(row["stderr_path"]),
         pid=row["pid"],

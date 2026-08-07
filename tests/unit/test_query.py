@@ -270,7 +270,7 @@ def test_id_prefixes_are_lowercased() -> None:
 
 
 def test_a_realistic_mixed_query() -> None:
-    query = parse('naca0018 tag:paper -tag:scratch solver:openfoam cores>=16 endTime>500 after:7d')
+    query = parse("naca0018 tag:paper -tag:scratch solver:openfoam cores>=16 endTime>500 after:7d")
     assert query.text == "naca0018"
     assert query.tags_include == {"paper"}
     assert query.tags_exclude == {"scratch"}

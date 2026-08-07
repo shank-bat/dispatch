@@ -1,0 +1,414 @@
+/*
+ * Dispatch — application stylesheet.
+ *
+ * Everything visual lives here rather than in DEFAULT_CSS blocks, so the look can be
+ * changed without touching Python and the whole design can be read in one sitting.
+ *
+ * Colours come from the theme in `theme.py`; this file references variables and never
+ * hard-codes a hex value. The design rules it encodes:
+ *
+ *   - Separate with space, not with lines. Borders appear only where two regions would
+ *     otherwise be genuinely ambiguous.
+ *   - One accent. Blue means "this is selected" or "this has focus", and nothing else.
+ *   - Semantic colour is for state, never for decoration.
+ *   - Bold marks hierarchy, not emphasis. Most text is regular weight.
+ */
+
+/* ------------------------------------------------------------------ foundation */
+
+Screen {
+    background: $background;
+    color: $foreground;
+}
+
+/* Textual's default is a border on every focused widget, which in a table-heavy
+ * interface produces a box that jumps around as you navigate. Focus is shown by the
+ * cursor row instead. */
+*:focus {
+    border: none;
+}
+
+Tooltip {
+    background: $surface-lighten-1;
+    color: $foreground;
+    border: none;
+    padding: 0 1;
+}
+
+/* ------------------------------------------------------------------ chrome */
+
+/* All top chrome in one docked block. Widgets docked individually to the same edge
+ * overlap rather than stack, so the container is what makes them a column. */
+#chrome {
+    dock: top;
+    height: auto;
+}
+
+/* The top bar: application identity on the left, live status on the right. One line,
+ * always in the same place, so the eye learns where to find it. */
+#topbar {
+    height: 1;
+    padding: 0 2;
+    background: $surface;
+    color: $text-muted;
+}
+
+/* The screen's own heading, below the top bar. Gives each screen a little air before
+ * its content starts. */
+#heading {
+    height: 2;
+    padding: 1 2 0 2;
+    background: $background;
+}
+
+/* Disconnection notice. Not an alarm — a quiet strip that appears in the flow rather
+ * than a red bar that makes a routine daemon restart look like a disaster. */
+#banner {
+    height: 0;
+    padding: 0 2;
+    background: $surface;
+    color: $warning;
+    display: none;
+}
+
+#banner.visible {
+    display: block;
+    height: 1;
+}
+
+Footer {
+    background: $surface;
+    color: $text-muted;
+    height: 1;
+}
+
+FooterKey {
+    background: $surface;
+}
+
+FooterKey .footer-key--key {
+    color: $accent;
+    background: $surface;
+    text-style: none;
+}
+
+FooterKey .footer-key--description {
+    color: $text-muted;
+    background: $surface;
+}
+
+/* ------------------------------------------------------------------ typography */
+
+/* Section labels carry their own leading blank line, which is what separates the bands
+ * of the dashboard. Spacing does the work a horizontal rule would otherwise do. */
+.section {
+    height: 2;
+    padding: 1 2 0 2;
+    color: $text-muted;
+    text-style: none;
+}
+
+.hint {
+    height: auto;
+    padding: 0 2;
+    color: $text-disabled;
+}
+
+.detail {
+    height: auto;
+    padding: 0 2;
+    color: $text-muted;
+}
+
+/* ------------------------------------------------------------------ tables */
+
+/* Light by construction: no grid lines, no zebra striping, no border. Rows are separated
+ * by the space between their text, and the only strong visual element is the cursor. */
+DataTable {
+    background: $background;
+    color: $foreground;
+    border: none;
+    padding: 0 1;
+    /* Columns are fixed-width and ellipsised, so sideways scrolling would never reveal
+     * anything -- and the gutter it reserves shows up as a stray mark under short tables. */
+    overflow-x: hidden;
+    scrollbar-size-vertical: 1;
+}
+
+DataTable > .datatable--header {
+    background: $background;
+    color: $text-disabled;
+    text-style: none;
+}
+
+DataTable > .datatable--odd-row,
+DataTable > .datatable--even-row {
+    background: $background;
+}
+
+/* The one place a saturated colour is allowed: the selected row, in VS Code's list
+ * selection blue. Full-width and unstyled text, so it reads as a highlight rather than
+ * as a change of content. */
+DataTable > .datatable--cursor {
+    background: $block-cursor-background;
+    color: $foreground;
+    text-style: none;
+}
+
+/* When the table loses focus the selection stays visible but stops competing: the same
+ * row, a fraction of the colour. Otherwise a user who tabs to the search box loses their
+ * place entirely. */
+DataTable:blur > .datatable--cursor {
+    background: $block-cursor-background 35%;
+    color: $foreground;
+    text-style: none;
+}
+
+DataTable > .datatable--hover {
+    background: $background;
+}
+
+/* ------------------------------------------------------------------ inputs */
+
+Input {
+    background: $surface;
+    color: $foreground;
+    border: none;
+    padding: 0 2;
+    height: 1;
+}
+
+Input:focus {
+    background: $surface-lighten-1;
+    border: none;
+}
+
+Input > .input--placeholder {
+    color: $text-disabled;
+}
+
+Input > .input--cursor {
+    background: $input-cursor-background;
+    color: $input-cursor-foreground;
+}
+
+/* Prompts appear at the end of the body when asked for. Not docked: a docked prompt
+ * would land on top of the footer. */
+.prompt {
+    height: 1;
+    display: none;
+}
+
+.prompt.visible {
+    display: block;
+}
+
+/* ------------------------------------------------------------------ lists */
+
+ListView {
+    background: $background;
+    border: none;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+ListItem {
+    background: $background;
+    color: $foreground;
+    padding: 0 1;
+}
+
+ListItem.--highlight {
+    background: $block-cursor-background;
+    color: $foreground;
+}
+
+ListView:blur > ListItem.--highlight {
+    background: $block-cursor-background 35%;
+}
+
+/* ------------------------------------------------------------------ dashboard */
+
+DashboardScreen ResourceMeters {
+    height: 2;
+    padding: 1 2 0 2;
+    background: $background;
+}
+
+/* Auto height with a ceiling: with three jobs running the section is three rows tall and
+ * the queue summary sits directly beneath it, instead of floating below a void. Beyond
+ * the ceiling the table scrolls rather than pushing everything else off screen. */
+DashboardScreen #running {
+    height: auto;
+    max-height: 14;
+}
+
+DashboardScreen #recent {
+    height: 1fr;
+    min-height: 4;
+}
+
+DashboardScreen #next-up {
+    height: 2;
+    padding: 1 2 0 2;
+    color: $text-muted;
+}
+
+/* ------------------------------------------------------------------ queue */
+
+QueueScreen #queue-table {
+    height: 1fr;
+    margin-top: 1;
+}
+
+QueueScreen #why {
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+}
+
+/* ------------------------------------------------------------------ history */
+
+HistoryScreen #search {
+    background: $surface;
+}
+
+HistoryScreen #heading {
+    height: 2;
+    padding: 1 2 0 2;
+}
+
+HistoryScreen #results {
+    height: 1fr;
+    margin-top: 1;
+}
+
+HistoryScreen #hint {
+    height: 1;
+    padding: 0 2;
+    color: $text-disabled;
+}
+
+/* ------------------------------------------------------------------ logs */
+
+LogScreen #heading {
+    height: 2;
+    padding: 1 2 0 2;
+}
+
+LogScreen #log {
+    height: 1fr;
+    border: none;
+    padding: 0 2;
+    background: $background;
+    scrollbar-size-vertical: 1;
+}
+
+LogScreen #log-status {
+    height: 1;
+    padding: 0 2;
+    background: $surface;
+    color: $text-disabled;
+}
+
+/* ------------------------------------------------------------------ submit */
+
+SubmitScreen #panes {
+    height: 1fr;
+    margin-top: 1;
+}
+
+SubmitScreen #browser {
+    width: 42%;
+    height: 1fr;
+    background: $background;
+}
+
+/* The single vertical rule in the application. Two panes of similar-looking text with
+ * different meanings is exactly the case where space alone is not enough. */
+SubmitScreen #detail {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 2;
+    border-left: solid $border;
+    background: $background;
+}
+
+SubmitScreen #path-line {
+    height: 1;
+    padding: 0 2;
+    background: $surface;
+    color: $text-muted;
+}
+
+SubmitScreen #entries {
+    height: 1fr;
+}
+
+/* ------------------------------------------------------------------ plan & help */
+
+PlanScreen #plan,
+HelpScreen #help-body {
+    height: 1fr;
+    padding: 1 3;
+    background: $background;
+    scrollbar-size-vertical: 1;
+}
+
+/* ------------------------------------------------------------------ modals */
+
+ConfirmScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+/* Elevated surface and a thin border, the way a VS Code dialog reads: floating above the
+ * page rather than cut into it. */
+ConfirmScreen > Container {
+    width: 56;
+    height: auto;
+    padding: 1 3;
+    background: $surface-lighten-1;
+    border: round $border;
+}
+
+ConfirmScreen Label {
+    width: 100%;
+    height: auto;
+    color: $foreground;
+}
+
+ConfirmScreen .confirm-detail {
+    color: $text-muted;
+    padding: 1 0 1 0;
+}
+
+ConfirmScreen .confirm-keys {
+    color: $text-disabled;
+}
+
+/* ------------------------------------------------------------------ notifications */
+
+Toast {
+    background: $surface-lighten-1;
+    color: $foreground;
+    border: none;
+    border-left: thick $accent;
+    padding: 0 2;
+}
+
+Toast.-error {
+    border-left: thick $error;
+}
+
+Toast.-warning {
+    border-left: thick $warning;
+}
+
+Toast.-information {
+    border-left: thick $accent;
+}
+
+ToastRack {
+    align: right bottom;
+}

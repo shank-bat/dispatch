@@ -409,9 +409,7 @@ def test_delete_removes_attached_rows(
 
     for table in ("jobs", "notes", "job_events", "job_tags", "job_samples", "jobs_fts"):
         column = "job_id" if table != "jobs" else "id"
-        row = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (job.id,)
-        ).fetchone()
+        row = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (job.id,)).fetchone()
         count = row[0]
         assert count == 0, f"{table} still holds rows for the deleted job"
 

@@ -87,9 +87,7 @@ def test_capability_failure_is_reported_actionably(monkeypatch) -> None:
             else:
                 setattr(self._real, name, value)
 
-    monkeypatch.setattr(
-        "sqlite3.connect", lambda *a, **kw: NoFts5(real_connect(*a, **kw))
-    )
+    monkeypatch.setattr("sqlite3.connect", lambda *a, **kw: NoFts5(real_connect(*a, **kw)))
     with pytest.raises(DatabaseError) as excinfo:
         connect(":memory:")
     assert "FTS5" in str(excinfo.value)
@@ -112,9 +110,7 @@ def test_migrate_is_idempotent(conn: sqlite3.Connection) -> None:
 
 
 def test_migrate_creates_every_expected_table(conn: sqlite3.Connection) -> None:
-    tables = {
-        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {
         "jobs",
         "job_events",
@@ -125,6 +121,40 @@ def test_migrate_creates_every_expected_table(conn: sqlite3.Connection) -> None:
         "job_metadata",
         "job_provenance",
     } <= tables
+
+
+def test_an_existing_v1_database_gains_the_exit_detail_column() -> None:
+    """The upgrade a user with months of history actually performs.
+
+    Applying only ``001`` reproduces a database written before failure reasons existed;
+    migrating it must add the column without disturbing the rows already there.
+    """
+    conn = connect(":memory:")
+    conn.executescript(_migration_sql(1))
+    conn.execute("PRAGMA user_version = 1")
+
+    assert "exit_detail" not in _columns(conn, "jobs")
+    assert migrate(conn) == SCHEMA_VERSION
+    assert "exit_detail" in _columns(conn, "jobs")
+    conn.close()
+
+
+def test_the_new_column_is_null_for_jobs_that_predate_it(conn: sqlite3.Connection) -> None:
+    """Not an empty string: nothing was ever read from those logs, so there is no answer."""
+    row = conn.execute("SELECT exit_detail FROM jobs WHERE 0").description
+    assert row is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migration_sql(version: int) -> str:
+    from importlib import resources
+
+    root = resources.files("dispatch.db.migrations")
+    entry = next(e for e in root.iterdir() if e.name.startswith(f"{version:03d}_"))
+    return entry.read_text(encoding="utf-8")
 
 
 def test_migrate_creates_the_partial_queue_index(conn: sqlite3.Connection) -> None:

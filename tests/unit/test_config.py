@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from dispatch.core.config import Config, SchedulerConfig, load_config
+from dispatch.core.config import Config, SchedulerConfig, load_config, physical_cores
 from dispatch.core.errors import ConfigError
 
 
@@ -113,9 +113,7 @@ def test_a_bare_string_is_accepted_where_a_list_is_expected(tmp_path: Path) -> N
 
 
 def test_lists_become_tuples(tmp_path: Path) -> None:
-    config = load_config(
-        write(tmp_path, '[notifications]\non = ["job.completed", "job.failed"]\n')
-    )
+    config = load_config(write(tmp_path, '[notifications]\non = ["job.completed", "job.failed"]\n'))
     assert config.notifications.on == ("job.completed", "job.failed")
 
 
@@ -129,8 +127,17 @@ def test_zero_heartbeat_is_rejected() -> None:
         SchedulerConfig(heartbeat_s=0)
 
 
-def test_total_cores_defaults_to_the_machine() -> None:
-    assert SchedulerConfig().resolve_total_cores() == (os.cpu_count() or 1)
+def test_total_cores_defaults_to_the_machines_physical_cores() -> None:
+    """Physical, not logical -- see ``resolve_total_cores``.
+
+    Scheduling against the logical count on an SMT machine admits parallel jobs that MPI
+    then refuses to launch, because MPI sizes its slots by physical cores.
+    """
+    assert SchedulerConfig().resolve_total_cores() == (physical_cores() or os.cpu_count() or 1)
+
+
+def test_total_cores_never_exceeds_the_logical_count() -> None:
+    assert SchedulerConfig().resolve_total_cores() <= (os.cpu_count() or 1)
 
 
 def test_total_cores_can_be_overridden() -> None:

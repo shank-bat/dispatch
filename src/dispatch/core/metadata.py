@@ -245,9 +245,9 @@ class CaseMetadata:
             extra=dict(extra) if isinstance(extra, Mapping) else {},
         )
 
-    def searchable_pairs(self, spec: MetadataSpec | None = None) -> Iterator[
-        tuple[str, str | None, float | None]
-    ]:
+    def searchable_pairs(
+        self, spec: MetadataSpec | None = None
+    ) -> Iterator[tuple[str, str | None, float | None]]:
         """Yield ``(key, text_value, numeric_value)`` rows for the derived search index.
 
         Exactly one of the two value slots is populated per row, matching the

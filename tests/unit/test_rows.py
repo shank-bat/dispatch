@@ -112,9 +112,7 @@ def test_provenance_round_trips(repo: JobRepository, make_spec, clock: FakeClock
     assert restored.argv == ("mpirun", "-np", "20", "interFoam", "-parallel")
 
 
-def test_provenance_is_absent_for_a_job_that_never_started(
-    repo: JobRepository, make_spec
-) -> None:
+def test_provenance_is_absent_for_a_job_that_never_started(repo: JobRepository, make_spec) -> None:
     assert repo.provenance(repo.create(make_spec()).id) is None
 
 

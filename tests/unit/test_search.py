@@ -282,6 +282,7 @@ def test_dirty_filter_uses_provenance(repo: JobRepository, make_spec, clock: Fak
 
     clean = repo.create(make_spec("clean"))
     dirty = repo.create(make_spec("dirty"))
+
     def record(git: GitInfo) -> Provenance:
         return Provenance(
             captured_at=clock.now(),

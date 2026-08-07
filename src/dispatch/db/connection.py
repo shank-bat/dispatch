@@ -27,7 +27,7 @@ __all__ = ["SCHEMA_VERSION", "connect", "migrate", "transaction"]
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 """The schema version this code expects. Bump alongside a new migration file."""
 
 _MIGRATIONS_PACKAGE: Final = "dispatch.db.migrations"
@@ -98,21 +98,38 @@ def _apply_pragmas(conn: sqlite3.Connection, *, read_only: bool, timeout: float)
         conn.execute("PRAGMA synchronous = NORMAL")
 
 
+def missing_capabilities(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Return the SQLite features this build lacks, if any.
+
+    Exposed publicly so ``dispatch doctor`` can report the same answer without writing its
+    own SQL -- the probe belongs here with the rest of the database knowledge.
+
+    Args:
+        conn: Connection to test. A temporary in-memory one is used when omitted.
+    """
+    owned = conn is None
+    connection = conn if conn is not None else sqlite3.connect(":memory:")
+    missing: list[str] = []
+    try:
+        try:
+            connection.execute("CREATE VIRTUAL TABLE temp.__fts_probe USING fts5(x)")
+            connection.execute("DROP TABLE temp.__fts_probe")
+        except sqlite3.Error:
+            missing.append("FTS5 (full-text search)")
+
+        try:
+            connection.execute("SELECT json_valid('{}')")
+        except sqlite3.Error:
+            missing.append("JSON1 (json_valid, json_extract)")
+    finally:
+        if owned:
+            connection.close()
+    return missing
+
+
 def _require_capabilities(conn: sqlite3.Connection) -> None:
     """Fail loudly, now, if this SQLite build cannot support the schema."""
-    missing: list[str] = []
-
-    try:
-        conn.execute("CREATE VIRTUAL TABLE temp.__fts_probe USING fts5(x)")
-        conn.execute("DROP TABLE temp.__fts_probe")
-    except sqlite3.Error:
-        missing.append("FTS5 (full-text search)")
-
-    try:
-        conn.execute("SELECT json_valid('{}')")
-    except sqlite3.Error:
-        missing.append("JSON1 (json_valid, json_extract)")
-
+    missing = missing_capabilities(conn)
     if missing:
         raise DatabaseError(
             "This SQLite build is missing "

@@ -12,17 +12,63 @@ from pathlib import Path
 
 import pytest
 
+from dispatch.adapters.registry import AdapterRegistry
 from dispatch.core.clock import FakeClock
+from dispatch.core.config import Config, DaemonConfig, PathsConfig, SchedulerConfig
 from dispatch.core.metadata import FieldType, MetadataField, MetadataSpec, SpecRef
 from dispatch.core.models import JobSpec, ResourceRequest
+from dispatch.daemon.resources import ResourceModel
 from dispatch.db.connection import connect, migrate
 from dispatch.db.repository import JobRepository
+from tests.conftest_daemon import FakeAdapter, make_case
+
+__all__ = ["FakeAdapter", "make_case"]
 
 
 @pytest.fixture
 def clock() -> FakeClock:
     """A manually advanced clock, so time-dependent behaviour is deterministic."""
     return FakeClock()
+
+
+@pytest.fixture
+def dispatch_config(tmp_path: Path) -> Config:
+    """A configuration confined entirely to ``tmp_path``.
+
+    Every daemon test uses this, so nothing can touch the developer's real database,
+    logs, or socket -- including when a test fails halfway through.
+    """
+    return Config(
+        paths=PathsConfig(
+            database=tmp_path / "state" / "dispatch.db",
+            log_dir=tmp_path / "logs",
+            runtime_dir=tmp_path / "run",
+        ),
+        scheduler=SchedulerConfig(total_cores=8, reserved_cores=0, heartbeat_s=3600.0),
+        daemon=DaemonConfig(autostart=False, cancel_grace_s=0.2),
+    )
+
+
+@pytest.fixture
+def registry() -> AdapterRegistry:
+    """A registry holding only the fake adapter."""
+    built = AdapterRegistry({})
+    built.register(FakeAdapter)
+    return built
+
+
+@pytest.fixture
+def resources(dispatch_config: Config) -> ResourceModel:
+    """A ledger over eight cores, with memory reported as plentiful.
+
+    The memory probe is injected so scheduling behaviour does not depend on how much RAM
+    the machine running the tests happens to have free.
+    """
+    return ResourceModel(
+        dispatch_config.scheduler,
+        memory_probe=lambda: 64_000,
+        log_dir=dispatch_config.paths.log_dir,
+    )
 
 
 @pytest.fixture

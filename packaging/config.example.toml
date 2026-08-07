@@ -1,0 +1,67 @@
+# Dispatch configuration. Every value here is a default -- an empty file, or no file at
+# all, works. Copy to ~/.config/dispatch/config.toml and change what you care about.
+#
+# Unknown keys are a startup error rather than being ignored, so a typo cannot silently
+# leave the machine scheduling differently from what this file says.
+
+[scheduler]
+# "backfill" lets small jobs use idle cores while a large job waits, but only for a
+# bounded number of passes so the large job cannot be starved. "fifo" is strict order.
+# "shortest-first" packs the machine hardest and makes queue order least predictable.
+policy = "backfill"
+
+# Cores held back from jobs so the machine stays usable over SSH. The alternative is a
+# box you cannot log in to in order to cancel the job making it unresponsive.
+reserved_cores = 1
+
+# Override the detected core count. Leave unset to use all of them.
+# total_cores = 24
+
+# RAM kept free above the sum of running jobs' declared estimates.
+ram_margin_mb = 2048
+
+# Admission stops below this much free space where logs are written.
+min_free_disk_mb = 1024
+
+[daemon]
+# Start a daemon automatically when `dispatch` finds none running.
+autostart = true
+
+# Seconds between rungs of the SIGINT -> SIGTERM -> SIGKILL cancellation ladder.
+cancel_grace_s = 10.0
+
+# Whether stopping the daemon also stops running simulations. Changing this should feel
+# like a decision.
+shutdown_kills_jobs = false
+
+[notifications]
+on = ["job.completed", "job.failed"]
+sinks = ["log"]
+
+# The `command` sink runs anything, with the notification in its environment as
+# DISPATCH_EVENT, DISPATCH_TITLE, DISPATCH_BODY, and DISPATCH_JOB_ID. This is how ntfy,
+# Discord, or email are wired up without Dispatch growing an HTTP client.
+# [notifications.command]
+# argv = ["curl", "-d", "$DISPATCH_BODY", "https://ntfy.sh/eddy-dispatch"]
+
+[adapters.openfoam]
+# Where to source OpenFOAM from. Probed automatically if unset; set it if your install is
+# somewhere unusual, or if `dispatch doctor` reports the solver as missing.
+# bashrc = "/usr/lib/openfoam/openfoam2406/etc/bashrc"
+
+# Method used when Dispatch has to write a decomposeParDict from scratch. An existing one
+# is edited in place, preserving whatever method you chose.
+decomposition_method = "scotch"
+
+[adapters.basilisk]
+# qcc = "qcc"
+# flags = ["-O2", "-Wall"]
+# libs = ["-lm"]
+
+[adapters.calculix]
+# binary = "ccx"
+
+# [paths]
+# database = "~/.local/share/dispatch/dispatch.db"
+# log_dir = "~/.local/share/dispatch/logs"
+# runtime_dir = "~/.local/run/dispatch"

@@ -177,6 +177,9 @@ class Job:
     exit_code: int | None = None
     exit_reason: ExitReason | None = None
     exit_signal: str | None = None
+    exit_detail: str | None = None
+    """Why the job failed, quoted from its own output. ``None`` when it did not, or when
+    the log said nothing an adapter could make sense of."""
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     pid: int | None = None

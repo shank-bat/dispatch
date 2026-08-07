@@ -1,6 +1,7 @@
 # Dispatch — Architecture
 
-**Version:** 1.1 — Phase 1 design, approved with review changes
+**Status:** Implemented. All phases complete; this document describes the code as built.
+**Version:** 1.2 — Phase 1 design, approved with review changes
 (no mandatory linger §2.1 · configurable policy §6.2 · adapter API version §8.1.1 ·
 structured metadata §4.4 · tags §4.5 · provenance §6.9 · notifications §6.10 · dry run §6.11)
 **Target host:** `Eddy` — single Linux workstation, headless, SSH-only
@@ -343,7 +344,7 @@ optimistic update (`UPDATE ... WHERE id = ? AND state = ?`). Every transition al
 ```python
 @dataclass(slots=True)
 class ResourceModel:
-    total_cores: int          # os.cpu_count()
+    total_cores: int          # physical cores, not logical CPUs — see §8.7
     reserved_cores: int       # config, default 1 — keeps the box responsive over SSH
     allocated_cores: int      # Σ cores of PREPARING+RUNNING jobs — a ledger, not a measurement
     total_ram_mb: int
@@ -786,6 +787,26 @@ multi-day run is ~2900 rows per job — small, and genuinely useful for "how muc
 actually need?" the next time a similar case is queued. Samples for terminal jobs are downsampled
 by a retention job (config, default: keep full resolution 7 days, then 1-in-10).
 
+**Progress is sampled separately, and far more often** (`daemon.progress_interval_s`, default
+5 s). Reading a job's current time step is one `pread` of the last 8 KB of its log; a resource
+sample walks a whole process tree. Sharing one timer would force a choice between walking process
+trees every five seconds and watching a solver's time step update twice a minute. The two loops
+publish to the same `job.progress` topic with disjoint fields, so clients **merge** rather than
+replace — otherwise each sampler erases the other's half of the picture between updates.
+
+The current time step is displayed as a value in its own right (`t 0.35/50`), not folded into a
+percentage. They answer different questions: the percentage estimates how much longer, the time
+step says where the solution actually is — and it is the only one of the two that exists at all
+for a case with no declared end time.
+
+**Failure reasons.** When a job reaches `FAILED`, the executor reads the tail of its stderr,
+stdout, and step transcript and asks the adapter to summarise it (`explain_failure`), storing the
+result in `jobs.exit_detail` for `dispatch show`, the log viewer, and failure notifications. An
+exit code says a run failed and never says why, and the answer is always sitting in a log the user
+then has to go and open. Preparation failures are covered too, reading the step transcript — a
+decomposition that will not divide is among the most explicable failures there is, and none of its
+output reaches the solver's own log.
+
 ### 6.7 Startup recovery
 
 Run before the socket is bound, so no client sees an inconsistent world:
@@ -1062,7 +1083,22 @@ class SolverAdapter(Protocol):
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
         """Optional solver-native clean stop. Return False to use the signal ladder."""
+
+    def finalize(self, ctx: CaseContext) -> None:
+        """Undo case edits made to steer *this* run. Called however the run ended."""
+
+    def explain_failure(self, tail: str, ctx: CaseContext) -> str | None:
+        """Why it failed, read out of the end of its own output (§6.6)."""
 ```
+
+`finalize` exists because `stop_gracefully` usually works by **editing the case**, and such an
+edit is only correct for the run it stopped. OpenFOAM's is the motivating example: cancelling
+sets `stopAt writeNow` in `controlDict`, and left in place that makes every subsequent run of the
+case write once and exit at its first time step — exiting 0, so nothing reports a problem and the
+case simply appears to have stopped working. The executor calls `finalize` from a `finally`, so
+cancellation and crash paths cannot skip it, and synchronously, because an `await` in a `finally`
+during task cancellation would be interrupted before the restore happened. It is for run control
+only: a cancelled run's *results* belong to the user and Dispatch does not delete them.
 
 ### 8.1.1 API versioning
 
@@ -1142,6 +1178,17 @@ the adapter probes the usual locations and reports a clear ERROR finding if it c
 **Progress:** `^Time = ([0-9.eE+-]+)` from the log tail, compared against `endTime` from
 `controlDict` to produce a real percentage.
 
+**Cancellation edits the case, and puts it back.** `stop_gracefully` sets `stopAt writeNow` in
+`controlDict` so the solver writes and exits cleanly rather than being killed mid-write. The
+previous value is saved to `system/.dispatch-stopAt` and restored by `finalize` when the run ends;
+`plan()` also restores it on the way in, so a daemon killed between the two does not leave the
+case permanently stopping at its first time step. See §8.1.
+
+**Failure reasons** are read from the `--> FOAM FATAL ERROR` block, cut where the stack trace
+begins. Parallel runs are the normal case, so the `[rank]` labels `mpirun` prefixes to every line
+are stripped first — nothing anchored to a line start matches otherwise — and the ranks' identical
+messages are collapsed to one.
+
 ### 8.4 SU2 adapter
 
 **Detect** (0.85): a `*.cfg` in the directory containing SU2 keys (`SOLVER=`, `MESH_FILENAME=`,
@@ -1183,6 +1230,35 @@ otherwise. Returning `None` is a first-class answer and the TUI shows elapsed ti
 `ccx` on a `*.inp` deck; detect on `*.inp` containing `*STEP`; parallelism via
 `OMP_NUM_THREADS` in the step's `env` rather than `mpirun`. This needs no new interface surface —
 which is the check that the interface is complete.
+
+### 8.7 Parallel launch: one definition of "a core"
+
+Three adapters end in `mpirun -np N`, and they share `adapters/mpi.py` for it, because getting
+`N` right is a scheduler question rather than a solver one.
+
+**The rule: a core is a physical core.** `os.cpu_count()` reports *logical* CPUs — on an SMT
+machine, roughly twice the number that exists. Open MPI sizes its default slot count by physical
+cores. Scheduling against the logical count therefore admits jobs the launcher then refuses:
+
+```
+There are not enough slots available in the system to satisfy the 23
+slots that were requested by the application:  interFoam
+```
+
+The solver never starts. The job fails in under a second with an empty stdout, so it presents as
+a broken *case* rather than a mis-sized *request* — a genuinely misleading failure, and the reason
+this is written down rather than left as a one-line default.
+
+`SchedulerConfig.resolve_total_cores()` therefore counts physical cores. That also happens to be
+the right scheduling answer on its own merits: CFD solvers are memory-bandwidth bound, and a
+second rank on a core's sibling thread contends for the same cache and load/store units instead of
+adding throughput.
+
+**The override still works.** `scheduler.total_cores` is honoured as written. When a rank count
+exceeds the machine's slots, `mpi.launch_argv()` adds `--oversubscribe` so the user gets the run
+they asked for, and validation reports a WARNING explaining that the ranks will share cores. The
+flag is not added unconditionally: it also disables the launcher's guard against an accidentally
+oversized rank count, which is worth keeping for jobs that fit.
 
 ---
 
@@ -1291,8 +1367,24 @@ Idle CPU: two heartbeat wakeups per minute with no clients and no jobs. Measurab
 
 ## 12. Testing strategy
 
-`pytest` + `pytest-asyncio` + `coverage`. Target: >90% on `core`, `db`, `adapters`, and
-`daemon/scheduler`.
+`pytest` + `pytest-asyncio` + `coverage`. 483 tests, about nine seconds, no solver
+required.
+
+Measured coverage, rather than a target:
+
+| Layer | Coverage | Note |
+|---|---|---|
+| `core` | 92–100% | The domain. Exhaustive on the state machine and the query grammar. |
+| `db` | 93–96% | Real SQLite, not a mock: the behaviour under test is largely SQL behaviour. |
+| `daemon` scheduling (`scheduler`, `policies`, `resources`, `recovery`) | 91–99% | Deterministic via an injected clock and a fake executor. |
+| `daemon` execution (`executor`, `process`, `server`) | 75–83% | Real subprocesses and real signals. |
+| `adapters` | 57–93% | Plans, detection, and validation are covered; the uncovered remainder is mostly `solver_version` probes and error branches that need each solver installed. |
+| `ipc` | 66–99% | Protocol and encoders near-complete; reconnection backoff is the main gap. |
+| `tui` | 14–98% | State, tailing, and formatting are well covered; the submit wizard and log viewer are exercised only for composition. |
+
+The lower numbers are concentrated where a test would need a real solver, a real terminal,
+or a real network failure. The claim being made is not that everything is covered, but that
+the parts where a mistake would silently corrupt history or lose a simulation are.
 
 - **`core`** — pure functions, exhaustive state-transition table tests, config parsing.
 - **`db`** — real SQLite on tmpfs; migrations forward from empty; concurrent-reader tests under
@@ -1445,15 +1537,15 @@ Each phase ends with tests passing and something demonstrable.
 
 | Phase | Deliverable | Demonstrable outcome |
 |---|---|---|
-| **1** | This document | Reviewed and approved (rev 1.1: §2.1, §4.4, §4.5, §5.2, §6.9–6.11, §8.1.1) |
-| **2a** | `core` + `db` | Schema created; jobs persisted; state machine enforced; tags, structured metadata, provenance, and the query language work — all via tests |
-| **2b** | `daemon`: resources, scheduler, policies, executor, process, provenance, notify, dryrun, recovery + `ipc` | `dispatchd` runs `sleep` jobs through a `FakeAdapter`; `--dry-run` prints a plan; `socat` drives the full protocol; kill -9 the daemon mid-job and watch it re-adopt |
-| **3** | `tui` | Dashboard, queue, history, logs, submit wizard (with plan preview and tag editing) against real jobs |
-| **4** | `OpenFOAMAdapter` | A real Foam case submitted, auto-decomposed, run, monitored |
-| **5** | `SU2Adapter` | A real SU2 case end-to-end |
-| **6** | `BasiliskAdapter` | Compile-then-run proves the plan abstraction |
-| **7** | Packaging | systemd unit, `uv build`, README, install docs |
-| **8+** | `CalculiXAdapter` | New adapter, zero scheduler changes — the thesis, verified |
+| **1** | This document | **Done** — reviewed and approved (rev 1.1: §2.1, §4.4, §4.5, §5.2, §6.9–6.11, §8.1.1) |
+| **2a** | `core` + `db` | **Done** — Schema created; jobs persisted; state machine enforced; tags, structured metadata, provenance, and the query language work — all via tests |
+| **2b** | `daemon`: resources, scheduler, policies, executor, process, provenance, notify, dryrun, recovery + `ipc` | **Done** — `dispatchd` runs `sleep` jobs through a `FakeAdapter`; `--dry-run` prints a plan; `socat` drives the full protocol; kill -9 the daemon mid-job and watch it re-adopt |
+| **3** | `tui` | **Done** — Dashboard, queue, history, logs, submit wizard (with plan preview and tag editing) against real jobs |
+| **4** | `OpenFOAMAdapter` | **Done** — A real Foam case submitted, auto-decomposed, run, monitored |
+| **5** | `SU2Adapter` | **Done** — detection, validation, metadata, plans, and version probing verified against SU2 8.5.0 |
+| **6** | `BasiliskAdapter` | **Done** — compile-then-run proves the plan abstraction; verified by plan assertions (see §14.2) |
+| **7** | Packaging | **Done** — systemd unit, `uv build`, README, install docs |
+| **8+** | `CalculiXAdapter` | **Done** — New adapter, zero scheduler changes — the thesis, verified |
 
 Phase 2b is the risk concentration: process supervision, exit-code durability, and recovery are
 where correctness is genuinely hard. Everything after it is comparatively mechanical.

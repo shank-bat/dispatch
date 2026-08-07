@@ -48,7 +48,7 @@ MAX_LIMIT: Final = 1000
 _JOB_COLUMNS: Final = """
     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb, priority,
     state, created_at, started_at, finished_at, exit_code, exit_reason, exit_signal,
-    stdout_path, stderr_path, pid, pid_start_time, metadata,
+    exit_detail, stdout_path, stderr_path, pid, pid_start_time, metadata,
     runtime_s, peak_rss_mb, mean_cpu_pct
 """
 
@@ -61,6 +61,7 @@ _TRANSITION_FIELDS: Final = frozenset(
         "exit_code",
         "exit_reason",
         "exit_signal",
+        "exit_detail",
         "pid",
         "pid_start_time",
         "runtime_s",
@@ -395,9 +396,7 @@ class JobRepository:
                 ).fetchone()
                 raise IllegalTransition(job_id, current["state"] if current else "?", target)
 
-            self._append_event(
-                job_id, "state", detail or f"{source.value} -> {target.value}", now
-            )
+            self._append_event(job_id, "state", detail or f"{source.value} -> {target.value}", now)
 
         return self.get(job_id)
 
@@ -434,12 +433,18 @@ class JobRepository:
         reason: ExitReason | None = None,
         signal_name: str | None = None,
         finished_at: float | None = None,
+        detail_text: str | None = None,
     ) -> Job:
         """Move a job to a terminal state and compute its runtime.
 
         Runtime is derived here rather than by the caller so that every path -- normal
         exit, cancellation, recovery of a job that finished while the daemon was down --
         records it the same way.
+
+        Args:
+            detail_text: Why the job ended, in the solver's words, for a failure. Stored
+                as-is; extracting it is the executor's job, because only it knows where
+                the log is.
         """
         if state not in TERMINAL_STATES:
             raise ValidationError(f"{state} is not a terminal state")
@@ -464,6 +469,7 @@ class JobRepository:
             exit_code=exit_code,
             exit_reason=reason,
             exit_signal=signal_name,
+            exit_detail=detail_text,
             runtime_s=runtime,
             detail=detail,
         )
@@ -507,6 +513,21 @@ class JobRepository:
             return
         self._conn.execute(f"UPDATE jobs SET {', '.join(assignments)} WHERE id = :id", params)
 
+    def set_log_paths(self, job_id: str, *, stdout: Path, stderr: Path) -> Job:
+        """Record where a job's output will be written.
+
+        Assigned after creation because the paths derive from the job id, which does not
+        exist until the row does. The daemon owns the log layout; the repository only
+        remembers what it chose.
+        """
+        cursor = self._conn.execute(
+            "UPDATE jobs SET stdout_path = ?, stderr_path = ? WHERE id = ?",
+            (str(stdout), str(stderr), job_id),
+        )
+        if cursor.rowcount != 1:
+            raise JobNotFound(job_id)
+        return self.get(job_id)
+
     def update_metadata(self, job_id: str, metadata: CaseMetadata) -> Job:
         """Replace a job's metadata and rebuild its derived indexes."""
         with transaction(self._conn):
@@ -532,9 +553,7 @@ class JobRepository:
             self._reindex(job_id)
         return self.get(job_id)
 
-    def edit_tags(
-        self, job_id: str, *, add: Iterable[str] = (), remove: Iterable[str] = ()
-    ) -> Job:
+    def edit_tags(self, job_id: str, *, add: Iterable[str] = (), remove: Iterable[str] = ()) -> Job:
         """Add and remove tags in one operation.
 
         Tags are editable at any point in a job's life, including long after it finished --
@@ -551,7 +570,7 @@ class JobRepository:
                     DELETE FROM job_tags
                     WHERE job_id = ?
                       AND tag_id IN (SELECT id FROM tags WHERE name IN
-                          ({','.join('?' * len(removals))}))
+                          ({",".join("?" * len(removals))}))
                     """,
                     [job_id, *sorted(removals)],
                 )
@@ -693,7 +712,7 @@ class JobRepository:
         )
         rows = self._conn.execute(
             f"""
-            SELECT {_prefixed(_JOB_COLUMNS, 'j')} FROM jobs j {where}
+            SELECT {_prefixed(_JOB_COLUMNS, "j")} FROM jobs j {where}
             ORDER BY j.created_at DESC, j.seq DESC
             LIMIT ? OFFSET ?
             """,
@@ -766,9 +785,7 @@ class JobRepository:
             params.append(query.created_before)
 
         if query.dirty is not None:
-            clauses.append(
-                "j.id IN (SELECT job_id FROM job_provenance WHERE git_dirty = ?)"
-            )
+            clauses.append("j.id IN (SELECT job_id FROM job_provenance WHERE git_dirty = ?)")
             params.append(1 if query.dirty else 0)
 
         for comparison in query.comparisons:
@@ -831,7 +848,7 @@ class JobRepository:
             f"""
             SELECT jt.job_id AS job_id, t.name AS name
             FROM job_tags jt JOIN tags t ON t.id = jt.tag_id
-            WHERE jt.job_id IN ({','.join('?' * len(ids))})
+            WHERE jt.job_id IN ({",".join("?" * len(ids))})
             """,
             ids,
         ).fetchall()
