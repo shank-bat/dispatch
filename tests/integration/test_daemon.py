@@ -265,6 +265,65 @@ async def test_cancelling_a_finished_job_is_an_error(client: DaemonClient, tmp_p
         await client.call(Method.JOB_CANCEL, id=job_id)
 
 
+async def test_a_job_can_be_asked_to_run_after_another(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """The whole feature, over the real socket, on a machine with cores to spare.
+
+    Eight cores, two one-core jobs: without the dependency the second would start beside
+    the first immediately.
+    """
+    first = await client.call(
+        Method.JOB_SUBMIT,
+        workdir=str(make_case(tmp_path / "first", script="sleep 1")),
+        cores=1,
+    )
+    first_id = first["job"]["id"]
+    await await_state(client, first_id, "RUNNING")
+
+    second = await client.call(
+        Method.JOB_SUBMIT,
+        workdir=str(make_case(tmp_path / "second", script="exit 0")),
+        cores=1,
+        depends_on_job_id=first_id,
+    )
+    second_id = second["job"]["id"]
+    assert second["job"]["depends_on_job_id"] == first_id
+
+    detail = await client.call(Method.JOB_GET, id=second_id)
+    assert detail["job"]["state"] == "QUEUED"
+    assert "waiting for" in (detail["waiting_because"] or "")
+    snapshot = await client.call(Method.SYSTEM_SNAPSHOT)
+    assert snapshot["free_cores"] >= 1, "the cores were there; only the dependency held it back"
+
+    await await_state(client, first_id, "COMPLETED")
+    await await_state(client, second_id, "COMPLETED")
+
+
+async def test_submitting_after_an_unknown_job_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Better than queueing a job whose condition can never be met."""
+    with pytest.raises(RemoteError):
+        await client.call(
+            Method.JOB_SUBMIT,
+            workdir=str(make_case(tmp_path / "orphan")),
+            cores=1,
+            depends_on_job_id="no-such-job",
+        )
+
+
+async def test_a_job_without_a_dependency_is_unaffected(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """The default path: nothing to wait for, so it starts on submission as it always has."""
+    result = await client.call(
+        Method.JOB_SUBMIT, workdir=str(make_case(tmp_path / "plain")), cores=1
+    )
+    assert result["job"]["depends_on_job_id"] is None
+    await await_state(client, result["job"]["id"], "COMPLETED")
+
+
 async def test_the_queue_explains_why_a_job_waits(client: DaemonClient, tmp_path: Path) -> None:
     blocker = make_case(tmp_path / "blocker", script="sleep 10")
     await client.call(Method.JOB_SUBMIT, workdir=str(blocker), cores=8)

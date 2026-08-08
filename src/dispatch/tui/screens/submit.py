@@ -19,7 +19,8 @@ from typing import Any
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from dispatch.ipc.protocol import Method
@@ -43,6 +44,7 @@ class SubmitScreen(DispatchScreen):
         Binding("f", "force_submit", "force"),
         Binding("c", "edit_cores", "cores"),
         Binding("t", "edit_tags", "tags"),
+        Binding("a", "run_after", "run after"),
         Binding("p", "edit_path", "go to path"),
         Binding("period", "toggle_hidden", "hidden"),
     ]
@@ -53,6 +55,8 @@ class SubmitScreen(DispatchScreen):
         self.entries: list[dict[str, Any]] = []
         self.cores = 1
         self.tags: list[str] = []
+        self.run_after: dict[str, Any] | None = None
+        """The job this one should wait for. ``None`` -- the default -- means none."""
         self.show_hidden = False
         self._inspection: dict[str, Any] | None = None
         self._prompt_mode = ""
@@ -160,6 +164,14 @@ class SubmitScreen(DispatchScreen):
         )
         if self.tags:
             _row(text, "tags", " ".join(self.tags))
+        # Always shown, including its default, so that "this job starts when it fits" is
+        # visible rather than assumed.
+        _row(
+            text,
+            "run after",
+            self.run_after["name"] if self.run_after else "none",
+            style=Palette.TEXT if self.run_after else Palette.MUTED,
+        )
 
         validation = result["validation"]
         _row(
@@ -189,7 +201,11 @@ class SubmitScreen(DispatchScreen):
 
         text.append("\n")
         if validation["passed"]:
-            text.append(_keyline(("s", "submit"), ("d", "plan"), ("c", "cores"), ("t", "tags")))
+            text.append(
+                _keyline(
+                    ("s", "submit"), ("d", "plan"), ("c", "cores"), ("t", "tags"), ("a", "after")
+                )
+            )
         else:
             text.append(
                 _keyline(("f", "submit anyway"), ("d", "plan"), ("c", "cores"))
@@ -253,6 +269,25 @@ class SubmitScreen(DispatchScreen):
 
     def action_edit_path(self) -> None:
         self._open_prompt("path", "path: ")
+
+    def action_run_after(self) -> None:
+        """Choose a job this one should wait for, or clear the choice.
+
+        A picker rather than a typed id: the jobs worth waiting for are the ones already on
+        screen, and nobody wants to retype a UUID prefix from the queue view.
+        """
+        candidates = self.app_state.running + self.app_state.queued
+        if not candidates:
+            self.notify_error("There are no unfinished jobs to wait for.")
+            return
+
+        def _chosen(job_id: str | None) -> None:
+            if job_id is None:  # backed out; leave the current choice alone
+                return
+            self.run_after = self.app_state.get(job_id) if job_id else None
+            self._render_detail()
+
+        self.app.push_screen(RunAfterScreen(candidates, current=self.run_after), _chosen)
 
     def _open_prompt(self, mode: str, placeholder: str) -> None:
         self._prompt_mode = mode
@@ -323,6 +358,7 @@ class SubmitScreen(DispatchScreen):
                 cores=self.cores,
                 tags=self.tags,
                 force=force,
+                depends_on_job_id=self.run_after["id"] if self.run_after else None,
             )
         except Exception as exc:
             self.notify_error(str(exc))
@@ -331,6 +367,58 @@ class SubmitScreen(DispatchScreen):
         job = result["job"]
         self.notify_ok(f"Queued {job['name']} ({job['cores']} cores)")
         self.dismiss()
+
+
+class RunAfterScreen(ModalScreen[str | None]):
+    """Pick the job a submission should wait for.
+
+    Dismisses with the chosen job's id, with ``""`` for "none" — the first entry, and the
+    default — or with ``None`` when the user backs out and the current choice should stand.
+
+    Deliberately just a list: choosing one job to wait for is the whole feature, and
+    anything more would be a dependency editor.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "cancel")]
+
+    def __init__(self, jobs: list[dict[str, Any]], *, current: dict[str, Any] | None) -> None:
+        super().__init__()
+        self.jobs = jobs
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Label(Text("run after", style=f"bold {Palette.TEXT}"))
+            items = [ListItem(Label(Text("none", style=Palette.MUTED)))]
+            for job in self.jobs:
+                label = Text()
+                label.append(f"{job['id'][:8]}  ", style=Palette.FAINT)
+                label.append(job["name"], style=Palette.TEXT)
+                label.append(f"  {job['state'].lower()}", style=Palette.MUTED)
+                items.append(ListItem(Label(label)))
+            view = ListView(*items, id="run-after-list")
+            view.index = self._initial_index()
+            yield view
+            yield Label(_keyline(("enter", "choose"), ("esc", "cancel")), classes="confirm-keys")
+
+    def _initial_index(self) -> int:
+        """Start on the current choice, so reopening the picker shows what is set."""
+        if self._current is None:
+            return 0
+        for offset, job in enumerate(self.jobs, start=1):
+            if job["id"] == self._current["id"]:
+                return offset
+        return 0
+
+    def on_mount(self) -> None:
+        self.query_one("#run-after-list", ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        index = event.list_view.index or 0
+        self.dismiss("" if index == 0 else self.jobs[index - 1]["id"])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class PlanScreen(DispatchScreen):

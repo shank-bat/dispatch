@@ -121,6 +121,9 @@ class JobSpec:
     tags: frozenset[str] = frozenset()
     note: str | None = None
     metadata: CaseMetadata | None = None
+    depends_on_job_id: str | None = None
+    """Run only after this job has completed. ``None`` -- the default -- means the job is
+    scheduled as soon as it fits, which is how every job behaves unless asked otherwise."""
 
     def __post_init__(self) -> None:
         if not self.solver:
@@ -188,6 +191,13 @@ class Job:
     metadata: CaseMetadata = field(default_factory=CaseMetadata.empty)
     provenance: Provenance | None = None
     metrics: JobMetrics = field(default_factory=JobMetrics)
+    depends_on_job_id: str | None = None
+    """The job this one was asked to run after, if any (§6.2).
+
+    ``None`` for every job that did not ask, which is the default and the overwhelming
+    majority: such a job is scheduled purely on resources, exactly as before this field
+    existed.
+    """
 
     # -- convenience -----------------------------------------------------------------
 

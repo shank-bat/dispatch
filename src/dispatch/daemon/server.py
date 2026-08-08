@@ -347,6 +347,11 @@ class IpcServer:
         cores = _as_int(params.get("cores"), default=1)
         ram_mb = params.get("ram_mb")
         force = bool(params.get("force"))
+        # Optional, and absent from almost every submission. Resolved through the same
+        # prefix expansion as every other job id the user types, so an unknown or
+        # ambiguous one is refused here rather than becoming a job that waits forever.
+        after = str(params.get("depends_on_job_id") or "").strip()
+        depends_on_job_id = self._repo.resolve_id(after) if after else None
 
         result = self._inspector.inspect(
             workdir,
@@ -383,6 +388,7 @@ class IpcServer:
             tags=frozenset(params.get("tags") or ()),
             note=params.get("note"),
             metadata=metadata,
+            depends_on_job_id=depends_on_job_id,
         )
 
         can, reason = self._resources.can_admit(spec.resources)

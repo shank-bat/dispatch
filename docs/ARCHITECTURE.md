@@ -39,8 +39,10 @@ scheduler and is the justification for nearly every decision below.
 process supervision, live log viewing, and a permanent searchable record of every run.
 
 **Explicitly out of scope:** users, authentication, permissions, fair-share, partitions,
-reservations, node management, accounting, job dependencies (deferred), array jobs (deferred),
-checkpoint/restart, a network API, and a web interface.
+reservations, node management, accounting, array jobs (deferred), checkpoint/restart, a
+network API, and a web interface. A job may name **one** job to run after (§6.2.1); a
+dependency *graph*, with fan-in, fan-out, and a workflow engine to walk it, remains out of
+scope.
 
 Because there is exactly one user (`shu`) and one machine, Dispatch does not authenticate, does not
 authorize, and does not negotiate. The Unix socket's file permissions *are* the security model.
@@ -279,6 +281,7 @@ class Job:
     stderr_path: Path
     pid: int | None
     pid_start_time: float | None   # PID-reuse guard
+    depends_on_job_id: str | None  # run only after this job completes; NULL by default (§6.2.1)
     tags: frozenset[str]           # user-defined labels — "paper", "re100000", "naca0018"
     metadata: CaseMetadata         # structured, adapter-declared (§4.4)
     provenance: Provenance | None  # reproducibility record, captured at start (§6.9)
@@ -463,6 +466,9 @@ CREATE TABLE jobs (
     pid               INTEGER,
     pid_start_time    REAL,                           -- /proc create_time; defeats PID reuse
     metadata          TEXT    NOT NULL DEFAULT '{}',  -- JSON object, solver-specific
+
+    -- "run after" (§6.2.1). NULL for almost every job, and for every job predating it.
+    depends_on_job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
 
     -- forward-declared metrics (§5.4); NULL until a later phase populates them
     runtime_s         REAL,
@@ -695,6 +701,32 @@ argument, not a rewrite.
 
 The scheduler operates on `Job` snapshots and a `Resources` value object. It calls
 `executor.launch(job)` and knows nothing else about how a job runs.
+
+#### 6.2.1 Run after
+
+A job may name one other job to run after. It is optional, off by default, and the only
+thing it changes is whether that one job is a candidate on a given pass:
+
+```python
+eligible = [job for job in queued if job.depends_on_job_id is None or parent_completed(job)]
+selected = policy.select(eligible, capacity)
+```
+
+The filter sits *before* the policy rather than inside it, which is what keeps the effect
+local. Policies stay pure functions of (queue, capacity) and never learn about
+dependencies; the rest of the queue is offered exactly the capacity it would have been
+offered anyway, so a blocked job neither holds up the jobs behind it nor leaves cores idle
+on its account. There is no sequential mode and no global ordering — everything else about
+admission is unchanged.
+
+"Satisfied" means the named job reached `COMPLETED`. A parent that failed, was cancelled,
+or ended `UNKNOWN` leaves its dependent queued with `Scheduler.explain()` saying which job
+it is waiting for and what happened to it. Nothing propagates and no new state exists: the
+condition the user asked for was not met, and inventing a policy for that — cascade-fail,
+auto-cancel, run-anyway — would be guessing on their behalf. Cancelling it is one keypress.
+
+Re-evaluation needs no new machinery: the scheduler is already nudged on every terminal
+transition, which is exactly when the answer can change.
 
 ### 6.3 Executor and the ExecutionPlan
 
@@ -1007,7 +1039,7 @@ with "restart the daemon", not a `KeyError`.
 | `hello` | protocol, client → daemon version, protocol, hostname, boot time |
 | `daemon.info` | — → version, uptime, pid, db path, adapter names |
 | `system.snapshot` | — → cores total/free/allocated, RAM, load, per-core % |
-| `job.submit` | workdir, name?, solver?, cores, ram?, priority?, notes? → job |
+| `job.submit` | workdir, name?, solver?, cores, ram?, priority?, notes?, depends_on_job_id? → job |
 | `job.list` | states?, limit?, offset? → jobs + derived queue positions |
 | `job.get` | id → job, events, notes, latest samples |
 | `job.cancel` | id, force? → ack |

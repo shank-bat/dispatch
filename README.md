@@ -43,6 +43,7 @@ you want the daemon started at boot.
 dispatch                                  # the interactive interface
 dispatch submit ~/cases/wing --cores 20   # queue a case
 dispatch submit ~/cases/wing --cores 20 --dry-run   # show what would happen; run nothing
+dispatch submit ~/cases/wake --cores 8 --after 3f2a  # start only once job 3f2a completes
 dispatch status                           # machine and queue
 dispatch ls                               # active jobs
 dispatch logs <id> -f                     # follow a job's output

@@ -139,6 +139,30 @@ def test_an_existing_v1_database_gains_the_exit_detail_column() -> None:
     conn.close()
 
 
+def test_an_existing_v2_database_gains_the_dependency_column_and_keeps_its_jobs() -> None:
+    """The upgrade for a machine with history: a job written before "run after" existed
+    must survive it, and must come back with no dependency at all."""
+    conn = connect(":memory:")
+    conn.executescript(_migration_sql(1) + _migration_sql(2))
+    conn.execute("PRAGMA user_version = 2")
+    conn.execute(
+        """
+        INSERT INTO jobs (id, seq, name, workdir, solver, cores, state, created_at,
+                          stdout_path, stderr_path)
+        VALUES ('old-job', 1, 'cavity', '/tmp/cavity', 'openfoam', 4, 'QUEUED', 1.0, 'o', 'e')
+        """
+    )
+
+    assert "depends_on_job_id" not in _columns(conn, "jobs")
+    assert migrate(conn) == SCHEMA_VERSION
+    assert "depends_on_job_id" in _columns(conn, "jobs")
+
+    row = conn.execute("SELECT state, depends_on_job_id FROM jobs WHERE id = 'old-job'").fetchone()
+    assert row["state"] == "QUEUED"
+    assert row["depends_on_job_id"] is None
+    conn.close()
+
+
 def test_the_new_column_is_null_for_jobs_that_predate_it(conn: sqlite3.Connection) -> None:
     """Not an empty string: nothing was ever read from those logs, so there is no answer."""
     row = conn.execute("SELECT exit_detail FROM jobs WHERE 0").description

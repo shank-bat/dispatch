@@ -423,6 +423,64 @@ def test_delete_leaves_the_tag_vocabulary_alone(repo: JobRepository, make_spec, 
     assert "paper" in repo.get(keeper.id).tags
 
 
+# -- run after ---------------------------------------------------------------------------------
+
+
+def test_a_job_has_no_dependency_by_default(repo: JobRepository, make_spec) -> None:
+    """Every job written before this column existed reads back exactly like this one."""
+    assert repo.create(make_spec()).depends_on_job_id is None
+
+
+def test_a_dependency_is_stored_and_read_back(repo: JobRepository, make_spec) -> None:
+    parent = repo.create(make_spec("parent"))
+    child = repo.create(make_spec("child", depends_on=parent.id))
+    assert repo.get(child.id).depends_on_job_id == parent.id
+    assert repo.get(parent.id).depends_on_job_id is None
+
+
+def test_depending_on_a_job_that_does_not_exist_is_refused(repo: JobRepository, make_spec) -> None:
+    """Refused at submission rather than becoming a job that waits forever."""
+    with pytest.raises(JobNotFound):
+        repo.create(make_spec("child", depends_on="no-such-job"))
+    assert repo.list_jobs().total == 0
+
+
+def test_a_dependency_survives_reopening_the_database(tmp_path, make_spec) -> None:
+    """It has to outlive a reboot, which is the whole reason it is a column."""
+    from dispatch.db.connection import connect, migrate
+
+    path = tmp_path / "state" / "dispatch.db"
+
+    first = connect(path)
+    migrate(first)
+    repo = JobRepository(first)
+    parent = repo.create(make_spec("parent"))
+    child = repo.create(make_spec("child", depends_on=parent.id))
+    first.close()
+
+    second = connect(path)
+    migrate(second)
+    try:
+        reopened = JobRepository(second)
+        assert reopened.get(child.id).depends_on_job_id == parent.id
+        assert [job.id for job in reopened.queued()] == [parent.id, child.id]
+    finally:
+        second.close()
+
+
+def test_deleting_the_parent_clears_the_dependency(
+    repo: JobRepository, make_spec, clock: FakeClock
+) -> None:
+    """Deleting a finished job must not fail, and must not take its dependent with it."""
+    parent = _run_to_completion(repo, make_spec("parent"), clock)
+    child = repo.create(make_spec("child", depends_on=parent.id))
+
+    repo.delete(parent.id)
+
+    assert repo.get(child.id).depends_on_job_id is None
+    assert repo.get(child.id).state is JobState.QUEUED
+
+
 # -- helpers ---------------------------------------------------------------------------------------
 
 

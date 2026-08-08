@@ -122,6 +122,7 @@ def make_spec(tmp_path: Path):
         metadata=None,
         solver_binary: str | None = None,
         workdir: Path | None = None,
+        depends_on: str | None = None,
     ) -> JobSpec:
         directory = workdir or (tmp_path / name)
         directory.mkdir(parents=True, exist_ok=True)
@@ -135,6 +136,7 @@ def make_spec(tmp_path: Path):
             tags=frozenset(tags),
             note=note,
             metadata=metadata,
+            depends_on_job_id=depends_on,
         )
 
     return _make

@@ -151,13 +151,22 @@ class Scheduler:
         if not queued:
             return []
 
+        # A job that was asked to run after another one is not a candidate until that job
+        # has completed. Removing it from the queue *before* the policy sees it, rather
+        # than teaching every policy about dependencies, is what keeps the effect local:
+        # the rest of the queue is offered the same capacity it would have been offered
+        # anyway, so nothing else waits and no core sits idle on its account.
+        eligible = [job for job in queued if self._dependency_satisfied(job)]
+        if not eligible:
+            return []
+
         ok, reason = self._resources.check_disk()
         if not ok:
             log.warning("Not admitting jobs: %s", reason)
             return []
 
         capacity = self._resources.capacity()
-        selected = self._policy.select(queued, capacity)
+        selected = self._policy.select(eligible, capacity)
 
         started: list[Job] = []
         for job in selected:
@@ -171,6 +180,29 @@ class Scheduler:
                 {"started": [job.id for job in started], "queued": len(queued) - len(started)},
             )
         return started
+
+    def _dependency_satisfied(self, job: Job) -> bool:
+        """Whether a job's ``run after`` dependency, if it has one, has been met."""
+        return self._blocking_dependency(job) is None
+
+    def _blocking_dependency(self, job: Job) -> str | None:
+        """Why a job's dependency is not yet met, or ``None`` if nothing is blocking it.
+
+        A dependency counts as met only once the other job has **completed**. A parent that
+        failed, was cancelled, or ended unknowably leaves its dependent queued rather than
+        starting it on the strength of an outcome the user did not ask to wait for; the
+        reason says so, and the job can be cancelled or released by hand from there.
+        """
+        if job.depends_on_job_id is None:
+            return None
+        parent = self._repo.get_optional(job.depends_on_job_id)
+        if parent is None:
+            # Only reachable if the row went away without the foreign key clearing this
+            # column. Blocked rather than started: the condition was never satisfied.
+            return "waiting for a job that no longer exists"
+        if parent.state is JobState.COMPLETED:
+            return None
+        return f"waiting for {parent.name} ({parent.state.value.lower()})"
 
     def _admit(self, job: Job) -> bool:
         """Allocate for a job and hand it to the executor.
@@ -237,6 +269,9 @@ class Scheduler:
             return "held"
         if job.state is not JobState.QUEUED:
             return None
+        blocking = self._blocking_dependency(job)
+        if blocking is not None:
+            return blocking
         can, reason = self._resources.can_admit(job.resources)
         if can:
             return "waiting for its turn"

@@ -27,7 +27,7 @@ __all__ = ["SCHEMA_VERSION", "connect", "migrate", "transaction"]
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
 """The schema version this code expects. Bump alongside a new migration file."""
 
 _MIGRATIONS_PACKAGE: Final = "dispatch.db.migrations"

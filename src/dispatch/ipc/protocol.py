@@ -188,6 +188,7 @@ def encode_job(job: Job, *, queue_position: int | None = None) -> dict[str, Any]
         "priority": job.priority,
         "state": job.state.value,
         "queue_position": queue_position,
+        "depends_on_job_id": job.depends_on_job_id,
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,

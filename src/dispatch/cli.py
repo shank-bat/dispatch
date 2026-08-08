@@ -51,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--ram", type=int, metavar="MB", help="RAM estimate in megabytes")
     submit.add_argument("--solver", help="force a solver instead of detecting one")
     submit.add_argument("-t", "--tag", action="append", default=[], help="tag (repeatable)")
+    submit.add_argument(
+        "--after",
+        metavar="ID",
+        help="run only once this job has completed (id, or a unique prefix of one)",
+    )
     submit.add_argument("--note", help="a note to attach")
     submit.add_argument(
         "--dry-run",
@@ -210,6 +215,7 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
         tags=args.tag,
         note=args.note,
         force=args.force,
+        depends_on_job_id=args.after,
     )
     job = result["job"]
     _print_findings(console, result.get("validation"))
@@ -258,6 +264,8 @@ async def _show(client: DaemonClient, args: Any, console: Any, config: Config) -
     if job["ram_estimate_mb"]:
         table.add_row("ram estimate", f"{job['ram_estimate_mb']} MB")
     table.add_row("priority", str(job["priority"]))
+    if job.get("depends_on_job_id"):
+        table.add_row("run after", job["depends_on_job_id"][:8])
     if job["tags"]:
         table.add_row("tags", " ".join(job["tags"]))
     if detail.get("waiting_because"):

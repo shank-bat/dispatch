@@ -422,6 +422,79 @@ async def test_every_screen_mounts_its_children(offline_config: Config, screen_n
         assert screen.query("#topbar"), f"{screen_name} has no top bar"
 
 
+async def test_the_run_after_picker_defaults_to_none(offline_config: Config) -> None:
+    """The default must be "none", and reachable without choosing anything."""
+    from dispatch.tui.app import DispatchApp
+    from dispatch.tui.screens.submit import RunAfterScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        chosen: list[str | None] = []
+        await app.push_screen(
+            RunAfterScreen([job("a1", name="parent", state="RUNNING")], current=None),
+            chosen.append,
+        )
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert chosen == [""]  # "" clears the dependency; the first entry is "none"
+
+
+async def test_the_run_after_picker_returns_the_chosen_job(offline_config: Config) -> None:
+    from dispatch.tui.app import DispatchApp
+    from dispatch.tui.screens.submit import RunAfterScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        chosen: list[str | None] = []
+        await app.push_screen(
+            RunAfterScreen([job("a1", name="parent", state="RUNNING")], current=None),
+            chosen.append,
+        )
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert chosen == ["a1"]
+
+
+async def test_backing_out_of_the_run_after_picker_changes_nothing(
+    offline_config: Config,
+) -> None:
+    from dispatch.tui.app import DispatchApp
+    from dispatch.tui.screens.submit import RunAfterScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        chosen: list[str | None] = []
+        await app.push_screen(
+            RunAfterScreen([job("a1", state="RUNNING")], current=None), chosen.append
+        )
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert chosen == [None]  # None means "leave the current choice alone"
+
+
+async def test_a_new_submission_waits_for_nothing_by_default(offline_config: Config) -> None:
+    from dispatch.tui.app import DispatchApp
+    from dispatch.tui.screens.submit import SubmitScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = SubmitScreen(Path.home())
+        await app.push_screen(screen)
+        await pilot.pause()
+        assert screen.run_after is None
+
+
 async def test_no_widget_shadows_a_textual_internal() -> None:
     """Screens must not assign attributes that Textual's own machinery owns.
 

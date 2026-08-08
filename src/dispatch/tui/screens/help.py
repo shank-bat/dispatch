@@ -63,6 +63,7 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("p", "type a path"),
             ("c", "set cores"),
             ("t", "set tags"),
+            ("a", "run after another job"),
             ("d", "preview the plan"),
             ("s", "submit"),
             ("f", "submit despite errors"),

@@ -85,6 +85,13 @@ class QueueScreen(DispatchScreen):
         if job["state"] == "HELD":
             return Text("held — press H to release", style=Palette.WARNING)
 
+        parent_id = job.get("depends_on_job_id")
+        if parent_id:
+            parent = self.app_state.get(parent_id)
+            if parent is None or parent["state"] != "COMPLETED":
+                name = parent["name"] if parent else parent_id[:8]
+                return Text(f"waiting for {name}", style=Palette.WARNING)
+
         free = int(self.app_state.snapshot.get("free_cores", 0))
         if job["cores"] > free:
             return Text(

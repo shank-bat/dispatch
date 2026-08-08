@@ -7,6 +7,7 @@ making policies pure functions of (queue, capacity).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ import pytest
 from dispatch.core.config import SchedulerConfig
 from dispatch.core.errors import ConfigError
 from dispatch.core.models import Job, JobSpec, ResourceRequest
-from dispatch.core.states import JobState
+from dispatch.core.states import ExitReason, JobState
 from dispatch.daemon.events import EventBus
 from dispatch.daemon.policies import (
     POLICIES,
@@ -80,6 +81,36 @@ def queue(repo: JobRepository, tmp_path: Path, *specs: tuple[str, int, int]) -> 
             )
         )
     return created
+
+
+def queue_after(
+    repo: JobRepository, tmp_path: Path, name: str, cores: int, parent_id: str | None
+) -> Job:
+    """Create one job that must wait for ``parent_id`` before it may start."""
+    directory = tmp_path / name
+    directory.mkdir(parents=True, exist_ok=True)
+    return repo.create(
+        JobSpec(
+            workdir=directory,
+            solver="fake",
+            resources=ResourceRequest(cores=cores),
+            name=name,
+            depends_on_job_id=parent_id,
+        )
+    )
+
+
+def start_running(repo: JobRepository, resources: ResourceModel, job: Job) -> Job:
+    """Put a job into RUNNING with its cores allocated, as the executor would."""
+    resources.acquire(job.id, job.resources)
+    repo.mark_preparing(job.id)
+    return repo.mark_started(job.id, pid=4242, pid_start_time=1.0)
+
+
+def complete(repo: JobRepository, resources: ResourceModel, job: Job) -> Job:
+    """Finish a running job successfully and give its cores back."""
+    resources.release(job.id)
+    return repo.mark_finished(job.id, state=JobState.COMPLETED, exit_code=0, reason=ExitReason.OK)
 
 
 # -- the ledger ---------------------------------------------------------------------------
@@ -383,3 +414,159 @@ async def test_state_moves_to_preparing_only_via_the_executor(
     (job,) = queue(repo, tmp_path, ("a", 1, 0))
     await scheduler.run_once()
     assert repo.get(job.id).state is JobState.QUEUED
+
+
+# -- run after --------------------------------------------------------------------------------
+
+
+async def test_a_job_with_no_dependency_starts_as_soon_as_it_fits(
+    scheduler, executor, repo, tmp_path
+) -> None:
+    """The default, and the behaviour every existing job keeps: purely opportunistic.
+
+    Eight cores, two four-core jobs, no dependencies -- both start on the same pass.
+    """
+    queue(repo, tmp_path, ("a", 4, 0), ("b", 4, 0))
+    started = await scheduler.run_once()
+    assert sorted(j.name for j in started) == ["a", "b"]
+    assert all(job.depends_on_job_id is None for job in started)
+
+
+async def test_a_dependent_job_does_not_start_while_its_parent_runs(
+    scheduler, executor, resources, repo, tmp_path
+) -> None:
+    """The point of the feature: free cores are not enough on their own.
+
+    Four cores are genuinely idle and the job would fit in them, and it still waits.
+    """
+    (parent,) = queue(repo, tmp_path, ("parent", 4, 0))
+    child = queue_after(repo, tmp_path, "child", 4, parent.id)
+    start_running(repo, resources, parent)
+
+    started = await scheduler.run_once()
+
+    assert started == []
+    assert resources.free_cores >= child.cores  # it would have fitted
+    assert repo.get(child.id).state is JobState.QUEUED
+
+
+async def test_a_dependent_job_starts_once_its_parent_has_completed(
+    scheduler, executor, resources, repo, tmp_path
+) -> None:
+    (parent,) = queue(repo, tmp_path, ("parent", 4, 0))
+    child = queue_after(repo, tmp_path, "child", 4, parent.id)
+    start_running(repo, resources, parent)
+    assert await scheduler.run_once() == []
+
+    complete(repo, resources, parent)
+
+    started = await scheduler.run_once()
+    assert [j.id for j in started] == [child.id]
+
+
+async def test_an_unrelated_job_runs_while_a_dependent_one_waits(
+    scheduler, executor, resources, repo, tmp_path
+) -> None:
+    """A dependency constrains the job that asked for one, and nothing else."""
+    (parent,) = queue(repo, tmp_path, ("parent", 4, 0))
+    child = queue_after(repo, tmp_path, "child", 4, parent.id)
+    (unrelated,) = queue(repo, tmp_path, ("unrelated", 2, 0))
+    start_running(repo, resources, parent)
+
+    started = await scheduler.run_once()
+
+    assert [j.id for j in started] == [unrelated.id]
+    assert repo.get(child.id).state is JobState.QUEUED
+
+
+async def test_a_blocked_dependent_job_does_not_hold_up_the_queue_behind_it(
+    scheduler, executor, resources, repo, tmp_path
+) -> None:
+    """No global sequential mode: the blocked job is skipped, not the rest of the queue.
+
+    The dependent job sits at the head of the queue on priority, and the jobs behind it
+    still get the whole machine.
+    """
+    (parent,) = queue(repo, tmp_path, ("parent", 4, 0))
+    directory = tmp_path / "blocked"
+    directory.mkdir(parents=True, exist_ok=True)
+    repo.create(
+        JobSpec(
+            workdir=directory,
+            solver="fake",
+            resources=ResourceRequest(cores=1),
+            name="blocked",
+            priority=10,
+            depends_on_job_id=parent.id,
+        )
+    )
+    queue(repo, tmp_path, ("behind", 4, 0))
+    start_running(repo, resources, parent)
+
+    started = await scheduler.run_once()
+
+    assert [j.name for j in started] == ["behind"]
+
+
+async def test_a_dependency_on_a_queued_job_blocks_until_it_has_run(
+    scheduler, executor, repo, tmp_path
+) -> None:
+    """Satisfied by completion, not by mere existence -- a parent still in the queue counts."""
+    (parent,) = queue(repo, tmp_path, ("parent", 8, 0))
+    child = queue_after(repo, tmp_path, "child", 1, parent.id)
+
+    started = await scheduler.run_once()
+
+    assert [j.id for j in started] == [parent.id]
+    assert repo.get(child.id).state is JobState.QUEUED
+
+
+async def test_a_dependent_job_stays_queued_when_its_parent_fails(
+    scheduler, executor, resources, repo, tmp_path
+) -> None:
+    """The simplest consistent behaviour: it waits, visibly, rather than running anyway.
+
+    Nothing propagates, no new state is invented, and the job can still be cancelled by
+    hand -- which is the one thing a user might reasonably want to do about it.
+    """
+    (parent,) = queue(repo, tmp_path, ("parent", 4, 0))
+    child = queue_after(repo, tmp_path, "child", 4, parent.id)
+    start_running(repo, resources, parent)
+    resources.release(parent.id)
+    repo.mark_finished(parent.id, state=JobState.FAILED, exit_code=1, reason=ExitReason.NONZERO)
+
+    assert await scheduler.run_once() == []
+    assert repo.get(child.id).state is JobState.QUEUED
+    reason = scheduler.explain(repo.get(child.id))
+    assert reason is not None and "parent" in reason and "failed" in reason
+
+
+def test_explain_names_the_job_being_waited_for(scheduler, resources, repo, tmp_path) -> None:
+    (parent,) = queue(repo, tmp_path, ("parent", 4, 0))
+    child = queue_after(repo, tmp_path, "child", 1, parent.id)
+    start_running(repo, resources, parent)
+
+    reason = scheduler.explain(repo.get(child.id))
+
+    assert reason is not None and "waiting for parent" in reason
+
+
+def test_explain_is_unchanged_for_a_job_with_no_dependency(
+    scheduler, resources, repo, tmp_path
+) -> None:
+    (job,) = queue(repo, tmp_path, ("a", 8, 0))
+    resources.acquire("other", ResourceRequest(cores=8))
+    reason = scheduler.explain(repo.get(job.id))
+    assert reason is not None and "cores free" in reason
+
+
+async def test_a_dependency_on_a_job_that_no_longer_exists_blocks_rather_than_starts(
+    scheduler, repo, tmp_path
+) -> None:
+    """Defensive: the condition was never met, so the safe answer is to keep waiting."""
+    (job,) = queue(repo, tmp_path, ("orphan", 1, 0))
+    dangling = replace(job, depends_on_job_id="00000000-0000-0000-0000-000000000000")
+
+    assert not scheduler._dependency_satisfied(dangling)
+    reason = scheduler.explain(dangling)
+    assert reason is not None and "no longer exists" in reason

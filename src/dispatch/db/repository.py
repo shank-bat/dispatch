@@ -49,7 +49,7 @@ _JOB_COLUMNS: Final = """
     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb, priority,
     state, created_at, started_at, finished_at, exit_code, exit_reason, exit_signal,
     exit_detail, stdout_path, stderr_path, pid, pid_start_time, metadata,
-    runtime_s, peak_rss_mb, mean_cpu_pct
+    runtime_s, peak_rss_mb, mean_cpu_pct, depends_on_job_id
 """
 
 # Columns a transition is permitted to set. An allowlist rather than "whatever the caller
@@ -139,6 +139,10 @@ class JobRepository:
         metadata = spec.metadata or CaseMetadata.empty(spec.solver)
 
         with transaction(self._conn):
+            if spec.depends_on_job_id is not None and not self._exists(spec.depends_on_job_id):
+                # Checked here as well as by the foreign key so the user gets Dispatch's own
+                # error rather than an IntegrityError from sqlite3.
+                raise JobNotFound(spec.depends_on_job_id)
             seq = int(
                 self._conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM jobs").fetchone()[0]
             )
@@ -146,10 +150,12 @@ class JobRepository:
                 """
                 INSERT INTO jobs (
                     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb,
-                    priority, state, created_at, stdout_path, stderr_path, metadata
+                    priority, state, created_at, stdout_path, stderr_path, metadata,
+                    depends_on_job_id
                 ) VALUES (
                     :id, :seq, :name, :workdir, :solver, :solver_binary, :cores, :ram,
-                    :priority, :state, :created_at, :stdout, :stderr, :metadata
+                    :priority, :state, :created_at, :stdout, :stderr, :metadata,
+                    :depends_on
                 )
                 """,
                 {
@@ -167,6 +173,7 @@ class JobRepository:
                     "stdout": str(stdout_path) if stdout_path else None,
                     "stderr": str(stderr_path) if stderr_path else None,
                     "metadata": _dumps(metadata.to_json()),
+                    "depends_on": spec.depends_on_job_id,
                 },
             )
             self._write_tags(job_id, spec.tags)

@@ -59,6 +59,7 @@ def job_from_row(row: sqlite3.Row, *, tags: frozenset[str] = frozenset()) -> Job
         stderr_path=_optional_path(row["stderr_path"]),
         pid=row["pid"],
         pid_start_time=row["pid_start_time"],
+        depends_on_job_id=row["depends_on_job_id"],
         tags=tags,
         metadata=_metadata(row["metadata"]),
         metrics=JobMetrics(
