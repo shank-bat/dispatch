@@ -40,6 +40,7 @@ class FakeAdapter(BaseAdapter):
     name: ClassVar[str] = "fake"
     display_name: ClassVar[str] = "Fake Solver"
     adapter_version: ClassVar[int] = 7
+    log_name: ClassVar[str] = "log.fake"
 
     metadata_spec: ClassVar[MetadataSpec] = MetadataSpec(
         ref=SpecRef(adapter="fake", version=1),

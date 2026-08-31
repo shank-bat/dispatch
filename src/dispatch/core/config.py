@@ -25,7 +25,10 @@ __all__ = [
     "DaemonConfig",
     "NotificationConfig",
     "PathsConfig",
+    "PlotConfig",
+    "ProjectsConfig",
     "SchedulerConfig",
+    "installed_gpus",
     "load_config",
     "physical_cores",
 ]
@@ -43,9 +46,82 @@ def physical_cores() -> int | None:
     try:
         import psutil
 
-        return psutil.cpu_count(logical=False)
+        count = psutil.cpu_count(logical=False)
+        return int(count) if count else None
     except Exception:  # pragma: no cover - psutil is a hard dependency, but never fatal
         return None
+
+
+NVIDIA_GPU_DIR: Final = "/proc/driver/nvidia/gpus"
+"""One directory per NVIDIA device, created by the kernel driver."""
+
+KFD_NODE_DIR: Final = "/sys/class/kfd/kfd/topology/nodes"
+"""AMD's compute topology. Node 0 is the CPU, so nodes are filtered by ``simd_count``."""
+
+
+def _count_nvidia() -> int:
+    """NVIDIA devices, from the driver's own ``/proc`` directory."""
+    try:
+        return sum(1 for entry in Path(NVIDIA_GPU_DIR).iterdir() if entry.is_dir())
+    except OSError:
+        return 0
+
+
+def _count_amd() -> int:
+    """AMD compute devices, from the ROCm kernel driver's topology.
+
+    Every node here has a ``properties`` file; the CPU appears as a node too and is told
+    apart by reporting ``simd_count 0``. Counting nodes without that filter would report
+    a GPU on every machine with the driver loaded, which is worse than reporting none.
+    """
+    found = 0
+    try:
+        nodes = sorted(Path(KFD_NODE_DIR).iterdir())
+    except OSError:
+        return 0
+    for node in nodes:
+        try:
+            text = (node / "properties").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            key, _, value = line.partition(" ")
+            if key == "simd_count" and value.strip().isdigit() and int(value) > 0:
+                found += 1
+                break
+    return found
+
+
+GPU_PROBES: Final = (_count_nvidia, _count_amd)
+"""The *only* place in Dispatch that knows a specific GPU vendor exists.
+
+Everything above it -- the ledger, the scheduler, the job model, the interface -- deals in
+a plain integer count, so supporting a new accelerator means adding a probe here and
+nothing else. Vendor command-line tools (``nvidia-smi``, ``rocm-smi``) are deliberately
+not invoked: a subprocess on every daemon start, on a machine whose driver may be
+mid-upgrade, is a far worse trade than reading a directory -- and
+``scheduler.total_gpus`` overrides the answer outright when the guess is wrong.
+"""
+
+
+def installed_gpus() -> int:
+    """How many GPUs this machine appears to have.
+
+    The first probe that finds anything wins, rather than the sum: a workstation with a
+    discrete accelerator and an integrated display GPU has one device worth scheduling,
+    and adding them would hand out a GPU that cannot run the job. Zero when nothing is
+    found, which is the right answer for most machines and for every machine running the
+    test suite. Never raises -- an unreadable ``/proc`` means no GPU work, not a daemon
+    that refuses to start.
+    """
+    for probe in GPU_PROBES:
+        try:
+            found = probe()
+        except Exception:  # pragma: no cover - a probe must never be fatal
+            continue
+        if found:
+            return found
+    return 0
 
 
 def _xdg(var: str, default: str) -> Path:
@@ -119,6 +195,13 @@ class SchedulerConfig:
     total_cores: int | None = None
     """Override the detected core count. ``None`` means the machine's *physical* cores."""
 
+    total_gpus: int | None = None
+    """Override the detected GPU count. ``None`` means whatever :func:`installed_gpus` finds.
+
+    Set it to ``0`` on a machine whose GPUs belong to something else, and Dispatch will
+    refuse GPU jobs at submission with a clear reason instead of queueing them forever.
+    """
+
     ram_margin_mb: int = 2048
     """RAM kept free above the sum of running jobs' estimates."""
 
@@ -137,6 +220,8 @@ class SchedulerConfig:
             raise ConfigError(f"scheduler.reserved_cores must be >= 0, got {self.reserved_cores}")
         if self.total_cores is not None and self.total_cores < 1:
             raise ConfigError(f"scheduler.total_cores must be >= 1, got {self.total_cores}")
+        if self.total_gpus is not None and self.total_gpus < 0:
+            raise ConfigError(f"scheduler.total_gpus must be >= 0, got {self.total_gpus}")
         if self.heartbeat_s <= 0:
             raise ConfigError(f"scheduler.heartbeat_s must be positive, got {self.heartbeat_s}")
 
@@ -159,6 +244,17 @@ class SchedulerConfig:
         explicitly; that override is honoured, and the MPI launch adapts to it (§8.7).
         """
         return self.total_cores or physical_cores() or os.cpu_count() or 1
+
+    def resolve_total_gpus(self) -> int:
+        """The GPU count to schedule against.
+
+        The configured value when given -- including an explicit ``0`` -- otherwise
+        whatever the machine reports. Unlike cores there is no reservation: see
+        :attr:`~dispatch.core.models.SystemSnapshot.free_gpus`.
+        """
+        if self.total_gpus is not None:
+            return self.total_gpus
+        return installed_gpus()
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +319,73 @@ class NotificationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectsConfig:
+    """Where project directories live, and how far to look for them (§9.5)."""
+
+    root: Path = field(default_factory=lambda: Path.home() / "projects")
+    """The one directory searched by name. Never the whole filesystem."""
+
+    max_depth: int = 6
+    """How deep below the root to descend. Deep enough for ``paper1/cases/re100/cavity``."""
+
+    max_entries: int = 20000
+    """Directories visited before the walk gives up and returns what it has.
+
+    A bound rather than a promise of completeness: an unbounded walk over a home
+    directory that happens to contain a checked-out Linux tree would stall the daemon,
+    and a search that returns the first several thousand matches instantly is more useful
+    than one that returns all of them a minute later.
+    """
+
+    limit: int = 50
+    """Results returned to the interface."""
+
+    skip: Sequence[str] = (
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "site-packages",
+    )
+    """Directory names never descended into. Big, uninteresting, and never a case."""
+
+    def __post_init__(self) -> None:
+        if self.max_depth < 1:
+            raise ConfigError(f"projects.max_depth must be >= 1, got {self.max_depth}")
+        if self.max_entries < 1:
+            raise ConfigError(f"projects.max_entries must be >= 1, got {self.max_entries}")
+        if self.limit < 1:
+            raise ConfigError(f"projects.limit must be >= 1, got {self.limit}")
+        object.__setattr__(self, "root", Path(self.root).expanduser())
+
+
+@dataclass(frozen=True, slots=True)
+class PlotConfig:
+    """Limits on extracting plottable series from a job's log (§9.6)."""
+
+    max_log_bytes: int = 32 * 1024 * 1024
+    """How much of a log to parse. A longer one is read from its end.
+
+    Residual histories are the point, so this is generous -- but it is a limit rather than
+    "read the file", because a solver left running for a month can produce a log larger
+    than the machine's memory.
+    """
+
+    max_points: int = 2000
+    """Points per series after downsampling. Bounds the IPC message and the render."""
+
+    def __post_init__(self) -> None:
+        if self.max_log_bytes < 1024:
+            raise ConfigError(f"plot.max_log_bytes must be >= 1024, got {self.max_log_bytes}")
+        if self.max_points < 2:
+            raise ConfigError(f"plot.max_points must be >= 2, got {self.max_points}")
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """The complete configuration."""
 
@@ -230,6 +393,8 @@ class Config:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    projects: ProjectsConfig = field(default_factory=ProjectsConfig)
+    plot: PlotConfig = field(default_factory=PlotConfig)
     adapters: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     """Per-adapter settings, e.g. ``{"openfoam": {"bashrc": "/opt/openfoam/etc/bashrc"}}``.
 
@@ -248,7 +413,7 @@ class Config:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], *, source: Path | None = None) -> Self:
         """Build a config from parsed TOML, rejecting unknown keys."""
-        known = {"paths", "scheduler", "daemon", "notifications", "adapters"}
+        known = {"paths", "scheduler", "daemon", "notifications", "projects", "plot", "adapters"}
         unknown = set(data) - known
         if unknown:
             raise ConfigError(
@@ -263,6 +428,8 @@ class Config:
             notifications=_build(
                 NotificationConfig, data.get("notifications", {}), "notifications"
             ),
+            projects=_build(ProjectsConfig, data.get("projects", {}), "projects"),
+            plot=_build(PlotConfig, data.get("plot", {}), "plot"),
             adapters=dict(data.get("adapters", {})),
             source=source,
         )

@@ -23,6 +23,7 @@ from dispatch.core.plan import CommandStep, StepKind
 from dispatch.core.states import ExitReason, JobState
 from dispatch.daemon.events import EventBus
 from dispatch.daemon.executor import JobExecutor
+from dispatch.daemon.joblog import assign_log_paths
 from dispatch.daemon.process import (
     ProcessManager,
     describe_exit,
@@ -33,7 +34,7 @@ from dispatch.daemon.process import (
 from dispatch.daemon.recovery import recover
 from dispatch.daemon.resources import ResourceModel
 from dispatch.db.repository import JobRepository
-from tests.conftest_daemon import make_case
+from tests.conftest_daemon import FakeAdapter, make_case
 
 
 @pytest.fixture
@@ -52,19 +53,29 @@ def executor(
     )
 
 
-def submit(repo: JobRepository, config: Config, workdir: Path, *, cores: int = 1):
-    """Create a queued job with its log paths assigned, as the server would."""
+def submit(
+    repo: JobRepository,
+    config: Config,
+    workdir: Path,
+    *,
+    cores: int = 1,
+    resources: ResourceRequest | None = None,
+):
+    """Create a queued job with its log paths assigned, exactly as the server would.
+
+    Shares :func:`~dispatch.daemon.joblog.assign_log_paths` with the real submit handler
+    rather than reimplementing the layout, so a test cannot pass against a log location
+    the daemon no longer uses.
+    """
     job = repo.create(
         JobSpec(
             workdir=workdir,
             solver="fake",
-            resources=ResourceRequest(cores=cores),
+            resources=resources or ResourceRequest(cores=cores),
             name=workdir.name,
         )
     )
-    log_dir = config.paths.job_dir(job.id)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return repo.set_log_paths(job.id, stdout=log_dir / "stdout.log", stderr=log_dir / "stderr.log")
+    return assign_log_paths(repo, config, job, FakeAdapter.log_name)
 
 
 async def run_to_completion(executor: JobExecutor, job, timeout: float = 20.0):
@@ -97,8 +108,8 @@ async def test_solver_output_lands_in_the_log_file(
     job = submit(repo, dispatch_config, case)
     await run_to_completion(executor, job)
 
-    assert job.stdout_path is not None
-    assert "Time = 0.5" in job.stdout_path.read_text()
+    assert job.stdout_path == case / "log.fake"
+    assert "Time = 0.5" in (case / "log.fake").read_text()
 
 
 async def test_a_nonzero_exit_fails_the_job(executor, repo, dispatch_config, tmp_path) -> None:

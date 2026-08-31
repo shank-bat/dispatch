@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Static
 
@@ -29,6 +30,13 @@ class DashboardScreen(DispatchScreen):
 
     TITLE = "Dashboard"
     nav_key = "1"
+
+    BINDINGS = [
+        Binding("enter", "open", "logs"),
+        Binding("p", "plot", "plot"),
+    ]
+    """The dashboard is where a running job is being watched, so the two things worth
+    doing to one from here -- read its output, plot its numbers -- are bound directly."""
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -47,6 +55,7 @@ class DashboardScreen(DispatchScreen):
         # because it touches only local state.
         self.set_interval(1.0, self.refresh_view)
         self.refresh_view()
+        self.query_one("#running", JobTable).focus()
 
     def refresh_view(self) -> None:
         """Re-render from the cached state."""
@@ -57,6 +66,29 @@ class DashboardScreen(DispatchScreen):
         self.query_one("#recent", JobTable).show(state.finished[:8])
         self.query_one("#next-up", Static).update(self._next_up())
         self.update_status()
+
+    def _selected(self) -> str | None:
+        """The job under the cursor in whichever table has focus.
+
+        Two tables share this screen, so "the selected job" depends on where the cursor
+        is; falling back to the active table matches what somebody glancing at the screen
+        would mean by it.
+        """
+        for widget_id in ("#running", "#recent"):
+            table = self.query_one(widget_id, JobTable)
+            if table.has_focus and table.selected_job_id:
+                return table.selected_job_id
+        return self.query_one("#running", JobTable).selected_job_id
+
+    def action_open(self) -> None:
+        job_id = self._selected()
+        if job_id:
+            self.dispatch_app.open_logs(job_id)
+
+    def action_plot(self) -> None:
+        job_id = self._selected()
+        if job_id:
+            self.dispatch_app.open_plot(job_id)
 
     def _next_up(self) -> Text:
         """One line describing what runs next, and why it has not started."""

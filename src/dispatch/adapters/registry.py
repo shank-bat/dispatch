@@ -192,6 +192,7 @@ class AdapterRegistry:
         *,
         cores: int = 1,
         ram_mb: int | None = None,
+        gpus: int = 0,
         entry: Path | None = None,
         env: Mapping[str, str] | None = None,
         adapter: str | None = None,
@@ -202,6 +203,7 @@ class AdapterRegistry:
             workdir=path,
             cores=cores,
             ram_mb=ram_mb,
+            gpus=gpus,
             entry=entry,
             env=dict(env or {}),
             settings=self._settings.get(adapter or "", {}),
@@ -221,11 +223,20 @@ def build_default_registry(
     """
     from dispatch.adapters.basilisk import BasiliskAdapter
     from dispatch.adapters.calculix import CalculiXAdapter
+    from dispatch.adapters.ml import MLAdapter
     from dispatch.adapters.openfoam import OpenFOAMAdapter
+    from dispatch.adapters.pinn import PINNAdapter
     from dispatch.adapters.su2 import SU2Adapter
 
     registry = AdapterRegistry(settings)
-    for adapter_cls in (OpenFOAMAdapter, SU2Adapter, BasiliskAdapter, CalculiXAdapter):
+    for adapter_cls in (
+        OpenFOAMAdapter,
+        SU2Adapter,
+        BasiliskAdapter,
+        CalculiXAdapter,
+        MLAdapter,
+        PINNAdapter,
+    ):
         registry.register(adapter_cls)
     if load_plugins:
         registry.load_entry_points()

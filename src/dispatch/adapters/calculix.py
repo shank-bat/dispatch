@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
 
+from dispatch.adapters import gpuenv
 from dispatch.adapters.base import BaseAdapter, CaseContext, Progress
 from dispatch.core.metadata import (
     CaseMetadata,
@@ -47,6 +48,12 @@ class CalculiXAdapter(BaseAdapter):
     name: ClassVar[str] = "calculix"
     display_name: ClassVar[str] = "CalculiX"
     adapter_version: ClassVar[int] = 1
+    log_name: ClassVar[str] = "log.calculix"
+    """The analysis log, beside the deck.
+
+    Not ``<deck>.log``: ``ccx`` writes its own ``.dat``, ``.sta`` and ``.cvg`` files next
+    to the deck, and colliding with that family would be a genuine hazard.
+    """
 
     metadata_spec: ClassVar[MetadataSpec] = MetadataSpec(
         ref=SpecRef(adapter="calculix", version=1),
@@ -169,7 +176,7 @@ class CalculiXAdapter(BaseAdapter):
         if deck is None:
             raise FileNotFoundError(f"No CalculiX input deck in {ctx.workdir}")
 
-        env = dict(ctx.env)
+        env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
         env["OMP_NUM_THREADS"] = str(ctx.cores)
         env["CCX_NPROC_EQUATION_SOLVER"] = str(ctx.cores)
 

@@ -19,9 +19,18 @@ from enum import StrEnum
 from typing import Any, Final
 
 from dispatch.core.metadata import MetadataSpec
-from dispatch.core.models import Job, JobEvent, Note, Page, Sample, SystemSnapshot
+from dispatch.core.models import (
+    Job,
+    JobEvent,
+    Note,
+    Page,
+    ResourceKind,
+    Sample,
+    SystemSnapshot,
+)
 from dispatch.core.plan import DryRunReport, ExecutionPlan
 from dispatch.core.provenance import Provenance
+from dispatch.core.series import PlotData, Series
 from dispatch.core.validation import ValidationReport
 
 __all__ = [
@@ -66,6 +75,8 @@ class Method(StrEnum):
     JOB_NOTE = "job.note"
     JOB_TAG = "job.tag"
     JOB_PROVENANCE = "job.provenance"
+    JOB_SERIES = "job.series"
+    """Plottable numerical series read out of a job's own output (§9.6)."""
 
     TAGS_LIST = "tags.list"
     HISTORY_SEARCH = "history.search"
@@ -74,6 +85,8 @@ class Method(StrEnum):
     CASE_VALIDATE = "case.validate"
     CASE_DRYRUN = "case.dryrun"
     FS_LIST = "fs.list"
+    PROJECTS_SEARCH = "projects.search"
+    """Find a project directory by name under the configured root (§9.5)."""
 
     SUBSCRIBE = "subscribe"
     UNSUBSCRIBE = "unsubscribe"
@@ -184,6 +197,8 @@ def encode_job(job: Job, *, queue_position: int | None = None) -> dict[str, Any]
         "solver": job.solver,
         "solver_binary": job.solver_binary,
         "cores": job.cores,
+        "gpus": job.gpus,
+        "resource_kind": job.resource_kind.value,
         "ram_estimate_mb": job.ram_estimate_mb,
         "priority": job.priority,
         "state": job.state.value,
@@ -198,6 +213,8 @@ def encode_job(job: Job, *, queue_position: int | None = None) -> dict[str, Any]
         "exit_detail": job.exit_detail,
         "stdout_path": str(job.stdout_path) if job.stdout_path else None,
         "stderr_path": str(job.stderr_path) if job.stderr_path else None,
+        "log_path": str(job.log_path) if job.log_path else None,
+        "output_path": str(job.output_path) if job.output_path else None,
         "pid": job.pid,
         "tags": sorted(job.tags),
         "metadata": job.metadata.to_json(),
@@ -218,6 +235,9 @@ def encode_snapshot(snapshot: SystemSnapshot) -> dict[str, Any]:
         "allocated_cores": snapshot.allocated_cores,
         "reserved_cores": snapshot.reserved_cores,
         "free_cores": snapshot.free_cores,
+        "total_gpus": snapshot.total_gpus,
+        "allocated_gpus": snapshot.allocated_gpus,
+        "free_gpus": snapshot.free_gpus,
         "cpu_percent": snapshot.cpu_percent,
         "per_core_percent": list(snapshot.per_core_percent),
         "total_ram_mb": snapshot.total_ram_mb,
@@ -300,6 +320,12 @@ def encode_dry_run(report: DryRunReport) -> dict[str, Any]:
         "solver": report.solver,
         "solver_binary": report.solver_binary,
         "cores": report.cores,
+        "gpus": report.resources.gpus if report.resources else 0,
+        "resource_kind": (
+            report.resources.kind.value if report.resources else ResourceKind.CPU.value
+        ),
+        "resources": report.resources.describe() if report.resources else f"{report.cores} cores",
+        "log_path": str(report.log_path) if report.log_path else None,
         "would_submit": report.would_submit,
         "detections": [encode_detection(d) for d in report.detections],
         "validation": encode_report(report.validation),
@@ -310,6 +336,9 @@ def encode_dry_run(report: DryRunReport) -> dict[str, Any]:
                 "cores_requested": report.projection.cores_requested,
                 "cores_free": report.projection.cores_free,
                 "cores_total": report.projection.cores_total,
+                "gpus_requested": report.projection.gpus_requested,
+                "gpus_free": report.projection.gpus_free,
+                "gpus_total": report.projection.gpus_total,
                 "would_start_immediately": report.projection.would_start_immediately,
                 "blocking_reason": report.projection.blocking_reason,
             }
@@ -322,6 +351,47 @@ def encode_dry_run(report: DryRunReport) -> dict[str, Any]:
 def encode_provenance(prov: Provenance) -> dict[str, Any]:
     """Render a reproducibility record."""
     return prov.to_json()
+
+
+def encode_series(series: Series) -> dict[str, Any]:
+    """Render one numerical series.
+
+    ``samples`` travels with the values rather than being reconstructed at the far end:
+    it is what lets the client pair two series that were not recorded on the same steps
+    without guessing (see :func:`dispatch.core.series.align`).
+    """
+    return {
+        "key": series.key,
+        "label": series.label,
+        "unit": series.unit,
+        "axis": series.axis,
+        "values": list(series.values),
+        "samples": list(series.samples),
+    }
+
+
+def encode_plot_data(data: PlotData) -> dict[str, Any]:
+    """Render everything plottable that was found in one job's output."""
+    return {
+        "series": [encode_series(item) for item in data.series],
+        "samples": data.samples,
+        "truncated": data.truncated,
+    }
+
+
+def encode_project_hit(hit: Any) -> dict[str, Any]:
+    """Render one project-search result.
+
+    Typed loosely for the same reason :func:`encode_detection` is: the walker that
+    produces these lives in the daemon, and ``ipc`` may not import ``daemon`` (§3).
+    """
+    return {
+        "path": str(hit.path),
+        "name": hit.name,
+        "relative": hit.relative,
+        "score": hit.score,
+        "depth": hit.depth,
+    }
 
 
 def encode_page(page: Page[Job], positions: dict[str, int] | None = None) -> dict[str, Any]:

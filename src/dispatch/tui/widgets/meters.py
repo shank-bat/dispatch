@@ -1,8 +1,8 @@
 """Machine status, as one line.
 
 Previously this was four labelled bars stacked in a block — a dashboard widget. It is now
-a status bar: cores, CPU, memory, and load on a single row, each a compact figure with a
-short sparkline-style gauge beside it.
+a status bar: cores, CPU, memory, load, and — on a machine that has any — GPUs, on a
+single row, each a compact figure with a short sparkline-style gauge beside it.
 
 The reason is proportion. The machine's state is context for the job list, not the subject
 of the screen, and four rows of chrome above the content said otherwise.
@@ -12,6 +12,10 @@ are shown.** ``allocated`` is what Dispatch has promised out of its ledger and i
 admission decisions use; ``cpu`` is what the cores are actually doing. They disagree
 whenever a solver blocks on I/O, and collapsing them into one tidy number would hide the
 single most confusing thing about the scheduler.
+
+The GPU figure has no measured counterpart at all. It is the ledger, and only the ledger:
+a card's utilisation reads near zero between training steps, so a measurement here would
+say "idle" about a GPU that is fully committed.
 """
 
 from __future__ import annotations
@@ -75,6 +79,21 @@ class ResourceMeters(Static):
             f"{used_ram / 1024:.1f}/{total_ram / 1024:.0f}G",
             used_ram / total_ram,
         )
+
+        # Shown only on a machine that has one. A permanent "gpu 0/0" on the great
+        # majority of workstations would be a column of noise reporting the absence of a
+        # feature, which is the opposite of what a status bar is for.
+        total_gpus = int(data.get("total_gpus", 0))
+        if total_gpus:
+            allocated_gpus = int(data.get("allocated_gpus", 0))
+            text.append(SEPARATOR)
+            _field(
+                text,
+                "gpu",
+                f"{allocated_gpus}/{total_gpus}",
+                allocated_gpus / total_gpus,
+                note=f"{int(data.get('free_gpus', 0))} free",
+            )
 
         load = data.get("load_average") or [0.0]
         text.append(SEPARATOR)

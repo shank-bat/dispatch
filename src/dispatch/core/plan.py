@@ -26,7 +26,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from dispatch.core.errors import ValidationError
-from dispatch.core.models import Detection
+from dispatch.core.models import Detection, ResourceRequest
 from dispatch.core.validation import ValidationReport
 
 __all__ = [
@@ -195,13 +195,20 @@ class StepOutcome:
 
 @dataclass(frozen=True, slots=True)
 class ResourceProjection:
-    """What admitting a hypothetical job would mean for the machine. Dry-run only."""
+    """What admitting a hypothetical job would mean for the machine. Dry-run only.
+
+    Both pools are reported whether or not the job uses them, because "would this start
+    now" is answered by whichever one is short and the user should be able to see which.
+    """
 
     cores_requested: int
     cores_free: int
     cores_total: int
     would_start_immediately: bool
     blocking_reason: str | None = None
+    gpus_requested: int = 0
+    gpus_free: int = 0
+    gpus_total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +230,11 @@ class DryRunReport:
     projection: ResourceProjection | None = None
     suggested_tags: Sequence[str] = ()
     stdout_path: Path | None = None
+    log_path: Path | None = None
+    """Where the solver's output would be written, in the case directory (§6.4)."""
+
+    resources: ResourceRequest | None = None
+    """The full request, so the report can say ``1 GPU, 4 cores`` rather than just cores."""
 
     @property
     def would_submit(self) -> bool:

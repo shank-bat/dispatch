@@ -1,8 +1,10 @@
 # Dispatch — Architecture
 
 **Status:** Implemented. All phases complete; this document describes the code as built.
-**Version:** 1.2 — Phase 1 design, approved with review changes
-(no mandatory linger §2.1 · configurable policy §6.2 · adapter API version §8.1.1 ·
+**Version:** 1.3 — adds working-directory logs §6.4 · CPU/GPU resources §4.3.1 ·
+ML and PINN adapters §8.8 · adapter log parsers §8.9 · project search §9.5 ·
+terminal plotting §9.6 · schema 004 §5.3
+(1.2: no mandatory linger §2.1 · configurable policy §6.2 · adapter API version §8.1.1 ·
 structured metadata §4.4 · tags §4.5 · provenance §6.9 · notifications §6.10 · dry run §6.11)
 **Target host:** `Eddy` — single Linux workstation, headless, SSH-only
 **Runtime:** Python 3.13, managed by `uv`
@@ -143,13 +145,18 @@ All paths are XDG-derived and overridable in config.
 ~/.local/share/dispatch/dispatch.db    # SQLite, WAL mode
 ~/.local/share/dispatch/logs/
     daemon.log                         # daemon's own rotating log
-    jobs/<uuid>/stdout.log             # per-job, written by the kernel (see §6.4)
-    jobs/<uuid>/stderr.log
     jobs/<uuid>/exit_code              # sentinel, survives daemon death (see §6.5)
     jobs/<uuid>/steps.log              # preparation step transcript (decomposePar &c.)
+    jobs/<uuid>/stdout.log             # only when the case directory cannot hold the log
 ~/.local/run/dispatch/daemon.sock      # AF_UNIX, mode 0600
 ~/.local/run/dispatch/daemon.pid       # flock'd, single-instance guard
 ```
+
+**The solver's own log does not live here.** It is written into the case directory, under a
+name the adapter chooses — `~/projects/cavity/log.foam` — so that a person browsing the case
+finds their output where they would look for it rather than under a UUID (§6.4). What stays
+in the per-job directory is Dispatch's own bookkeeping: the step transcript and the exit
+sentinel, neither of which the user asked for and neither of which belongs in their case.
 
 `~/.local/run` is used rather than `$XDG_RUNTIME_DIR` (`/run/user/1000`) because the latter is
 cleared on logout on some configurations, and the daemon must outlive logout. The runtime dir is
@@ -179,6 +186,7 @@ dispatch/
 │   │   ├── plan.py                # ExecutionPlan, CommandStep, StepOutcome, DryRunReport
 │   │   ├── metadata.py            # MetadataSpec, MetadataField, structured envelope
 │   │   ├── provenance.py          # Provenance dataclass (reproducibility record)
+│   │   ├── series.py              # Series, PlotData — plottable numbers (§9.6)
 │   │   ├── tags.py                # tag normalisation + validation rules
 │   │   ├── validation.py          # ValidationReport, Finding, Severity
 │   │   ├── errors.py              # exception hierarchy
@@ -210,6 +218,9 @@ dispatch/
 │   │   ├── provenance.py          # environment/git/version capture at job start
 │   │   ├── notify.py              # NotificationSink protocol + built-in sinks
 │   │   ├── dryrun.py              # detect + validate + plan, without side effects
+│   │   ├── joblog.py              # where a job's log goes; rotation (§6.4)
+│   │   ├── plotdata.py            # log -> adapter -> series, on request only (§9.6)
+│   │   ├── projects.py            # bounded name search under ~/projects (§9.5)
 │   │   ├── recovery.py            # startup reconciliation of RUNNING jobs
 │   │   ├── selfcheck.py           # startup capability + linger diagnosis (§2.1)
 │   │   └── logsetup.py            # daemon logging configuration
@@ -219,8 +230,14 @@ dispatch/
 │   │   ├── registry.py            # AdapterRegistry, entry-point discovery
 │   │   ├── detect.py              # detection orchestration + confidence ranking
 │   │   ├── openfoam.py
+│   │   ├── foamlog.py             # OpenFOAM residual/timing parser (§9.6)
 │   │   ├── su2.py
 │   │   ├── basilisk.py
+│   │   ├── calculix.py
+│   │   ├── pyjob.py               # shared: dispatch.toml, entrypoints, metric curves
+│   │   ├── ml.py                  # generic Python training runs
+│   │   ├── pinn.py                # physics-informed neural networks
+│   │   ├── gpuenv.py              # the one place that hides GPUs from a process
 │   │   └── shellenv.py            # capture env from a sourced shell script
 │   │
 │   ├── tui/
@@ -232,12 +249,15 @@ dispatch/
 │   │   │   ├── submit.py          # filesystem browser + detect + validate wizard
 │   │   │   ├── logs.py            # live log viewer
 │   │   │   ├── history.py         # search
+│   │   │   ├── plot.py            # X/Y selection + terminal chart (§9.6)
+│   │   │   ├── projects.py        # project name search (§9.5)
 │   │   │   └── help.py
 │   │   ├── widgets/
 │   │   │   ├── meters.py          # CPU/RAM bars
 │   │   │   ├── jobtable.py
 │   │   │   ├── dirbrowser.py
 │   │   │   └── logtail.py         # tail -f widget
+│   │   ├── plot.py                # braille/block canvas — pure, no dependency
 │   │   └── tailer.py              # async file tailer (see §9.4)
 │   │
 │   └── cli.py                     # argparse front door: TUI by default, verbs otherwise
@@ -268,6 +288,8 @@ class Job:
     solver: str                    # adapter name, e.g. "openfoam"
     solver_binary: str | None      # resolved application, e.g. "interFoam"
     cores: int
+    gpus: int                      # 0 for CPU work (§4.3)
+    resource_kind: ResourceKind    # CPU | GPU — which pool it was admitted from
     ram_estimate_mb: int | None
     priority: int                  # higher runs first; default 0
     state: JobState
@@ -278,7 +300,8 @@ class Job:
     exit_code: int | None
     exit_reason: str | None
     stdout_path: Path
-    stderr_path: Path
+    stderr_path: Path              # the same file as stdout for jobs since §6.4
+    log_path: Path | None          # the case-directory log; NULL for older jobs
     pid: int | None
     pid_start_time: float | None   # PID-reuse guard
     depends_on_job_id: str | None  # run only after this job completes; NULL by default (§6.2.1)
@@ -350,6 +373,8 @@ class ResourceModel:
     total_cores: int          # physical cores, not logical CPUs — see §8.7
     reserved_cores: int       # config, default 1 — keeps the box responsive over SSH
     allocated_cores: int      # Σ cores of PREPARING+RUNNING jobs — a ledger, not a measurement
+    total_gpus: int           # detected, or scheduler.total_gpus
+    allocated_gpus: int       # Σ gpus of PREPARING+RUNNING jobs
     total_ram_mb: int
     ram_margin_mb: int        # config, default 2048
 ```
@@ -362,6 +387,53 @@ decision in the design and it is why `htop` and Dispatch will sometimes disagree
 RAM gating is implemented from day one but only *engages* for jobs that declare
 `ram_estimate_mb`; jobs without an estimate are admitted on cores alone. This satisfies "future
 RAM-aware scheduling should be easy" by simply having already done the easy part.
+
+#### 4.3.1 CPU and GPU are two pools, not one number
+
+A job declares a `ResourceRequest`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ResourceRequest:
+    cores: int                      # always ≥ 1, GPU jobs included
+    ram_mb: int | None = None
+    gpus: int = 0
+    kind: ResourceKind = CPU        # CPU | GPU
+```
+
+`kind` and `gpus` are kept consistent **in the constructor**, so a CPU job holding a GPU is
+not a state the rest of the system has to defend against: it cannot be constructed, and the
+schema carries the same `CHECK` so it cannot be written either. `ResourceRequest.build()`
+fills in whichever of `--gpus` / `--resource` the user omitted, and refuses the one
+combination that genuinely contradicts itself (`--resource cpu --gpus 2`).
+
+Both pools are counted the same way and checked independently in `Capacity.fits`:
+
+| Situation | Outcome |
+|---|---|
+| 1-GPU job asking for 1 core, on a box with 20 free cores | Starts; 19 cores remain for CPU work |
+| CPU job asking for 20 cores, on a box with a free GPU | Starts; the GPU stays free |
+| Second 1-GPU job while the only GPU is held | Waits — with `0 of 1 GPUs free` as the reason |
+| Job asking for more GPUs than exist | Refused **at submission**, not queued forever |
+
+The consequence is the requirement in one sentence: *a GPU job does not consume CPU capacity
+beyond the cores it actually declared, and a CPU job never reserves a GPU.*
+
+Three things this deliberately does **not** do:
+
+* **No GPU reservation.** `reserved_cores` exists so an SSH session stays responsive.
+  Nothing about logging in needs a GPU, and a one-GPU machine that permanently reserved it
+  would be a machine with no GPU.
+* **No measured GPU utilisation.** A card reads near-idle between training steps, so
+  measurement-based admission would put two jobs on one device and send both out of memory.
+  §13.2 applies here more strongly than it does to CPUs.
+* **No device-index assignment.** See §13.24.
+
+**Detection is one function.** `core/config.installed_gpus()` reads `/proc/driver/nvidia/gpus`
+and the ROCm topology under `/sys/class/kfd`, and that pair of paths is the only place in
+Dispatch that knows a GPU vendor exists. Everything above it — ledger, scheduler, job model,
+interface, search — deals in an integer. `scheduler.total_gpus` overrides the answer, including
+with an explicit `0`.
 
 ### 4.4 Structured metadata
 
@@ -451,6 +523,9 @@ CREATE TABLE jobs (
     solver            TEXT    NOT NULL,               -- adapter name
     solver_binary     TEXT,                           -- resolved application
     cores             INTEGER NOT NULL CHECK (cores >= 1),
+    resource_kind     TEXT    NOT NULL DEFAULT 'cpu' CHECK (resource_kind IN ('cpu','gpu')),
+    gpus              INTEGER NOT NULL DEFAULT 0
+                          CHECK (gpus >= 0 AND (resource_kind = 'gpu') = (gpus > 0)),
     ram_estimate_mb   INTEGER CHECK (ram_estimate_mb IS NULL OR ram_estimate_mb > 0),
     priority          INTEGER NOT NULL DEFAULT 0,
     state             TEXT    NOT NULL CHECK (state IN (
@@ -462,7 +537,8 @@ CREATE TABLE jobs (
     exit_code         INTEGER,
     exit_reason       TEXT,                           -- 'ok','nonzero','signal:TERM','oom','lost'
     stdout_path       TEXT    NOT NULL,
-    stderr_path       TEXT    NOT NULL,
+    stderr_path       TEXT    NOT NULL,           -- same file as stdout since §6.4
+    log_path          TEXT,                       -- the case-directory log; NULL for older rows
     pid               INTEGER,
     pid_start_time    REAL,                           -- /proc create_time; defeats PID reuse
     metadata          TEXT    NOT NULL DEFAULT '{}',  -- JSON object, solver-specific
@@ -483,6 +559,7 @@ CREATE TABLE jobs (
 CREATE INDEX idx_jobs_queue   ON jobs (priority DESC, seq ASC) WHERE state = 'QUEUED';
 CREATE INDEX idx_jobs_active  ON jobs (state) WHERE state IN ('PREPARING','RUNNING');
 CREATE INDEX idx_jobs_recent  ON jobs (finished_at DESC) WHERE finished_at IS NOT NULL;
+CREATE INDEX idx_jobs_gpu     ON jobs (state, gpus) WHERE gpus > 0;
 
 CREATE TABLE job_events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -583,9 +660,10 @@ because typing `tag:paper solver:openfoam cores>=16` is faster than operating fo
 | `naca0018` | free text across name, workdir, notes, metadata |
 | `tag:paper`, `-tag:scratch` | has / lacks a tag |
 | `solver:openfoam`, `state:failed` | enumerated field equality |
+| `resource:gpu`, `resource:cpu` | which pool the job was admitted from (§4.3.1) |
 | `app:interFoam` | `solver_binary` |
 | `endTime>500`, `deltaT<=1e-4` | typed comparison on any declared metadata field (§4.4) |
-| `cores>=16`, `runtime>2h` | job columns, with unit-suffix parsing |
+| `cores>=16`, `gpus>=1`, `runtime>2h` | job columns, with unit-suffix parsing |
 | `after:2026-01-01`, `before:2026-06` | date ranges on `created_at` |
 | `dirty:true` | launched from a git repo with uncommitted changes (§6.9) |
 
@@ -602,6 +680,24 @@ Plain numbered `.sql` files applied in a transaction, tracked in `schema_version
 ORM. The runner is ~40 lines: read `PRAGMA user_version`, apply every file above it, bump. Forward
 only. On a version *newer* than the code understands, the daemon refuses to start rather than
 corrupting data — a real risk on a machine that runs for months across upgrades.
+
+| # | Adds | What an existing row gets |
+|---|---|---|
+| 001 | the initial schema | — |
+| 002 | `jobs.exit_detail` | `NULL` — its log was never read for this, and inventing an explanation after the fact would be worse than a blank |
+| 003 | `jobs.depends_on_job_id` | `NULL` — schedule as soon as it fits, exactly as before |
+| 004 | `jobs.resource_kind`, `jobs.gpus`, `jobs.log_path` | `'cpu'`, `0`, `NULL` — which is what every job before this feature *was*, and whose output is still where it was written |
+
+Every column added so far has been nullable or defaulted, and that is a rule rather than a
+coincidence: **the upgrade path must never require deleting the database.** Migration 004's
+one interesting detail is that its `CHECK` spans two new columns
+(`(resource_kind = 'gpu') = (gpus > 0)`), so the consistency the domain model enforces in
+`ResourceRequest.__post_init__` is enforced by SQLite too — no writer, present or future,
+can leave a CPU job holding a GPU.
+
+Reading is deliberately more tolerant than writing (`db/rows.py`): a row whose
+`resource_kind` this version does not recognise loads as the CPU job it most likely was
+rather than refusing to load. History written by a *newer* Dispatch must still render.
 
 ### 5.4 Metadata coverage
 
@@ -758,12 +854,47 @@ The executor's whole job:
 `decomposePar` is a `PREPARE` step. `reconstructPar` is a `PREPARE` step. `mpirun -np 16 interFoam
 -parallel` is the `SOLVE` step. The executor cannot tell them apart, and that is the point.
 
-### 6.4 Zero-copy job logging
+### 6.4 Zero-copy job logging, in the case directory
 
-Job stdout/stderr are **not** piped through the daemon. The executor opens the log files and passes
-the file descriptors directly to `create_subprocess_exec(stdout=fd, stderr=fd2)`. The kernel writes
-solver output straight to disk; the daemon never sees a byte, allocates no buffers, and is never
+Job stdout/stderr are **not** piped through the daemon. The executor opens the log file and passes
+the file descriptor directly to `create_subprocess_exec(stdout=fd, stderr=fd)`. The kernel writes
+solver output straight to disk, the daemon never sees a byte, allocates no buffers, and is never
 woken by chatty output.
+
+**The file is in the case directory.** `~/projects/cavity/log.foam`, not
+`~/.local/share/dispatch/logs/jobs/3f2a…/stdout.log`. The old location was a fine place for a
+machine to keep a file and a poor place for a person to find one: the output of your own
+simulation should be visible when you `ls` your own case, and nobody remembers a UUID.
+
+Three details make that work without giving the daemon any solver knowledge:
+
+**The adapter names the file.** `SolverAdapter.log_name` — `log.foam`, `log.su2`,
+`log.calculix`, `log.pinn`. It is a solver convention, recognisable to somebody who has never
+heard of Dispatch, so it belongs with the rest of that solver's knowledge. Grep `daemon/` for
+`foam` and there is still nothing to find (§1.1); the daemon opens whatever string it is given.
+
+**One file, not two.** stdout and stderr are opened `O_APPEND` onto the same path, so the kernel
+orders the writes. This is what a solver's users produce by hand (`… > log.foam 2>&1`) and it is
+what they read: a launcher's complaint on stderr belongs immediately after the last line of
+stdout that preceded it, not in a second file whose timestamps have to be reconciled by eye.
+`stdout_path` and `stderr_path` both point at it, so every existing reader — `dispatch logs`,
+the log viewer, the progress sampler, the failure explainer — needed no change, and jobs from
+before the change still have two distinct files and still work.
+
+**A second run rotates the first aside.** Two runs of one case would otherwise share a file,
+and the older job's history would silently start showing the newer run's output — a quiet
+corruption of the record, which is the thing Dispatch is least allowed to get wrong. So an
+existing non-empty log is renamed to `log.foam.1` (the next free number, not a cascade), and
+`Repository.repoint_logs` updates the finished job that wrote it. Nothing is deleted, and
+`dispatch logs` on a job from last month still shows that job's output.
+
+**The per-job directory does not go away.** It still holds `steps.log` and the `exit_code`
+sentinel — Dispatch's own bookkeeping, which the user did not ask for and which does not belong
+in their case — and it is the fallback when the case directory will not take the log: a
+read-only mount, a directory owned by somebody else, a full disk. A case that cannot hold its
+log is a reason to put the log elsewhere and say so in a job event, never a reason to refuse to
+run the job. The destination is chosen at submission (so the dry run and the queue can show it)
+and re-checked at launch (because a case directory can be unmounted while a job sits queued).
 
 A solver that prints 40 MB of residuals over three days costs the daemon exactly zero.
 
@@ -1050,15 +1181,20 @@ with "restart the daemon", not a `KeyError`.
 | `job.tag` | id, add[], remove[] → job |
 | `tags.list` | — → tag names with job counts |
 | `job.provenance` | id → full reproducibility record |
+| `job.series` | id → plottable numerical series read from the job's log (§9.6) |
 | `history.search` | query string (§5.2 syntax), limit, offset → page of jobs |
 | `case.detect` | path → detections ranked by confidence |
 | `case.validate` | path, solver, cores → ValidationReport |
 | `case.dryrun` | same params as `job.submit` → DryRunReport (§6.11), no side effects |
 | `fs.list` | path → directories (+ per-entry "looks like a case" hint) |
+| `projects.search` | query, limit → directories under the projects root, ranked (§9.5) |
 | `subscribe` / `unsubscribe` | topics → ack |
 
-`fs.list` runs daemon-side rather than in the TUI so that the "this directory is an OpenFOAM case"
-hint in the browser comes from the real adapters — the TUI stays solver-ignorant, per §3.
+`fs.list` and `projects.search` run daemon-side rather than in the TUI so that the "this directory
+is an OpenFOAM case" hint comes from the real adapters — the TUI stays solver-ignorant, per §3.
+The same reasoning puts `job.series` there: the parser belongs to the adapter, so the interface
+asks for numbers rather than reading a solver's log itself. Both do their filesystem work in a
+worker thread, so a cold projects tree or a gigabyte of residuals cannot stall the event loop.
 
 ### 7.5 Events and backpressure
 
@@ -1090,6 +1226,7 @@ class SolverAdapter(Protocol):
     adapter_version: ClassVar[int]        # this adapter's own revision, recorded in provenance
     metadata_spec: ClassVar[MetadataSpec] # declared fields (§4.4)
     env_keys: ClassVar[Sequence[str]]     # environment variables worth recording (§6.9)
+    log_name: ClassVar[str]               # "log.foam" — the case-directory log (§6.4)
 
     @classmethod
     def detect(cls, path: Path) -> Detection | None:
@@ -1103,6 +1240,9 @@ class SolverAdapter(Protocol):
 
     def parse_progress(self, tail: str) -> Progress | None:
         """Extract current time / iteration from the last chunk of the log."""
+
+    def parse_series(self, text: str, ctx: CaseContext) -> PlotData:
+        """Numerical series worth plotting, read from the job's output (§9.6)."""
 
     def collect_metadata(self, ctx: CaseContext) -> CaseMetadata:
         """Structured case settings, validated against metadata_spec (§4.4)."""
@@ -1139,6 +1279,10 @@ both versions and the adapter's distribution, and **the daemon still starts** wi
 adapters — one stale third-party plugin must not take the scheduler down along with three months of
 queued work. `dispatch doctor` lists loaded and rejected adapters.
 
+`log_name`, `parse_series`, and `CaseContext.gpus` were all added *additively*, with defaults —
+a generic log name, no series, and a GPU count an old adapter simply does not read — so
+`ADAPTER_API_VERSION` stayed at 1 and no third-party adapter was invalidated by any of it.
+
 The contract that `ADAPTER_API_VERSION` covers is exactly: the method set above, their signatures,
 and the semantics of `CaseContext`, `Detection`, `ValidationReport`, `ExecutionPlan`, and
 `CaseMetadata`. Additive changes (a new optional method with a default) do not bump it; removing or
@@ -1146,8 +1290,9 @@ changing the meaning of anything listed does. `adapter_version` is separate and 
 the adapter author's own revision counter, recorded in each job's provenance so that "this run was
 produced by OpenFOAM adapter rev 3" is answerable later.
 
-`CaseContext` bundles `workdir`, requested `cores`, resolved environment, the job's metadata, and a
-`Logger` — dependency-injected so adapters are testable with a temp directory and no daemon.
+`CaseContext` bundles `workdir`, requested `cores` and `gpus`, resolved environment, the job's
+metadata, and a `Logger` — dependency-injected so adapters are testable with a temp directory and
+no daemon.
 
 Every method is pure-ish and side-effect-light except `plan()` (which only *describes* side
 effects) and `stop_gracefully()`. Adapters never spawn processes themselves; they return steps and
@@ -1294,6 +1439,94 @@ oversized rank count, which is worth keeping for jobs that fit.
 
 ---
 
+### 8.8 ML and PINN adapters
+
+Scientific ML sits beside the CFD work rather than replacing it, so it gets adapters like
+everything else — and the daemon needed no change at all to run a training script, which is the
+same evidence Basilisk's compile step produced (§8.5).
+
+Both share `adapters/pyjob.py`: finding the interpreter, resolving the entrypoint, building the
+one-command plan, reading loss curves back out. They differ in exactly two things — what makes a
+directory theirs, and what their log is called.
+
+**Detection is the whole problem, and the answer is to ask.** A `pyproject.toml` means somebody
+wrote Python. A `requirements.txt` means the same. `main.py` is a convention that predates machine
+learning by decades. An adapter that treated any of those as evidence would attach itself to every
+repository on the machine and start marking the user's dotfiles as a training run.
+
+So the primary signal is an explicit declaration, written once and version-controlled beside the
+code it describes:
+
+```toml
+# dispatch.toml, in the project directory
+[job]
+adapter    = "pinn"
+entrypoint = "train_burgers.py"
+args       = ["--config", "configs/burgers.yaml"]
+venv       = ".venv"
+```
+
+This is the same relationship `system/controlDict` has to an OpenFOAM case — a file in the case
+directory that says what the case is — chosen by the user instead of by the solver. It also
+answers *which script*, which no heuristic can, so `--entrypoint`-style guessing never arises.
+A declaration naming one adapter silences the other: the question has already been answered.
+
+| Adapter | Signal | Confidence |
+|---|---|---|
+| `ml` | `dispatch.toml` names it | 0.95 |
+| `ml` | `train.py` **and** a dependency manifest (`pyproject.toml`, `requirements.txt`, …) | 0.60 |
+| `pinn` | `dispatch.toml` names it | 0.95 |
+| `pinn` | imports or requires a PINN library (`deepxde`, `modulus`, `sciann`, …) **and** has a runnable entrypoint | 0.75 |
+
+`train.py` beside a manifest is about as close to a self-describing training run as a filesystem
+gets, and it is still only 0.60 so anything with a stronger claim wins outright. PINN detection can
+be more confident precisely because its evidence is better: `import deepxde` is not something a
+project does by accident, whereas `import torch` proves nothing and is deliberately not on the
+list. Nor is directory naming — a rule keying on "pinn" would eventually claim somebody's
+`spinning_disk` case, and the declaration already covers every case a name would have.
+
+**No preparation step.** A scheduler that silently ran `pip install` into a user's environment as a
+side effect of queueing a run would be doing something nobody asked for, hours later, when the job
+was finally admitted. The plan is one command.
+
+**GPU awareness is one module.** `adapters/gpuenv.py` is the only place that knows how to *hide* a
+device, mirroring `config.installed_gpus()` being the only place that knows how to *count* one.
+Its rule is stated for both kinds of job:
+
+* **No GPUs granted** → `CUDA_VISIBLE_DEVICES` (and the two ROCm spellings) set to the empty
+  string. This is what makes "a CPU job does not accidentally take a GPU" true of the *process*
+  rather than only of the ledger, and it applies to every adapter, CFD ones included.
+* **GPUs granted** → whatever the environment already said is passed through untouched, including
+  a machine-wide restriction an administrator set. See §13.24 for why no index is invented.
+
+### 8.9 Where a log parser lives
+
+`parse_series` is the second solver-specific reader in the interface, after `parse_progress`, and
+it follows the same rule: **the daemon reads bytes off a disk; the adapter interprets them.**
+`daemon/plotdata.py` opens the file, bounds the read, and hands text to `adapter.parse_series`.
+It has no idea what a residual is.
+
+Three properties are load-bearing, and each is enforced by where the code sits rather than by
+discipline:
+
+* **It runs when a person asks.** No timer parses logs for plots, nothing is parsed at job
+  completion on the chance somebody might look later. Pressing `p` is the only trigger — the same
+  demand-driven rule the dashboard sampler follows (§6.1).
+* **It cannot change a job's state.** Nothing in the path writes to the database. A parser that
+  misreads a line costs a wrong point on a chart; it can never turn a completed run into a failed
+  one (§13.25).
+* **It is bounded.** At most `plot.max_log_bytes` is read, from the *end* of the file, and every
+  series is downsampled to `plot.max_points` before it goes on the wire. Plotting a month-old run
+  that produced four gigabytes of residuals costs a bounded read and a bounded message.
+
+`adapters/foamlog.py` is the reference implementation and shows what a good one does: time steps
+are the record boundary, only the *first* initial residual of each field per step is kept (a
+PIMPLE run solves for pressure several times within a step, and the later values are a different
+quantity), `mpirun`'s rank labels come off first, `nan` and `inf` from a diverging run are
+dropped, and **only series that actually appeared are emitted** — a 2-D case has no `residual(Uz)`
+and is offered none. `adapters/pyjob.py` does the equivalent for training output, and SU2 or
+CalculiX can add one without touching a line outside their own file.
+
 ## 9. TUI
 
 Textual, keyboard-only, no mouse bindings registered. The TUI holds **no** authoritative state: it
@@ -1303,16 +1536,22 @@ renders a local `AppState` that is populated by daemon events and refreshed on r
 
 | Screen | Key | Contents |
 |---|---|---|
-| Dashboard | `1` | CPU/RAM meters, core ledger, running jobs, next queued, recent completions, hostname, clock |
+| Dashboard | `1` | CPU/RAM/GPU meters, ledger, running jobs, next queued, recent completions, clock |
 | Queue | `2` | Full queue, reorder, hold/release, priority, cancel |
 | History | `3` | FTS search box + results, filters |
-| Submit | `n` | Directory browser → detection → validation → cores/priority → confirm |
-| Logs | `Enter` on a job | Live stdout/stderr, split or tabbed, search |
+| Submit | `n` | Directory browser (or `/` project search) → detection → validation → cores/GPUs → confirm |
+| Logs | `Enter` on a job | Live output, preparation transcript, search |
+| Plot | `p` on a job | X/Y series selection and a terminal chart (§9.6) |
 | Help | `?` | Key reference |
 
 Global keys: `q` quit, `?` help, `1`/`2`/`3` screens, `n` new job, `/` search in context,
-`j`/`k` + arrows navigate, `Enter` open, `x` cancel, `h`/`H` hold/release, `+`/`-` priority,
-`g`/`G` top/bottom. Vim-ish, because the target user lives in a terminal.
+`j`/`k` + arrows navigate, `Enter` open, `p` plot, `x` cancel, `h`/`H` hold/release,
+`+`/`-` priority, `g`/`G` top/bottom. Vim-ish, because the target user lives in a terminal.
+
+Jobs show their resource claim in one column rather than a bare core count — `CPU  20c`,
+`GPU  1G`, `GPU  2G·4c` — because "is the GPU busy" and "are the cores busy" are different
+questions and a single number answers neither. History keeps the same column, so a run from
+last year still says what kind of work it was.
 
 ### 9.2 Update strategy
 
@@ -1337,7 +1576,11 @@ never asked; `case.validate` → findings shown inline with severity colouring. 
 submission (overridable with an explicit `F` "force queue anyway", because the user knows things
 the validator does not). WARNINGs are shown and passed. Then cores (defaulting to the existing
 decomposition count when one exists — the single most useful default in the whole application),
-priority, optional RAM estimate, optional note, and confirm.
+GPUs (`g`, zero unless asked), priority, optional RAM estimate, optional note, and confirm.
+
+The confirmation view names the file the job will write (`~/projects/cavity/log.foam`) as well as
+the commands it will run. "Where will this write" is a question people ask while deciding whether
+to submit at all, and it is answerable before anything is queued.
 
 ### 9.4 Live log viewer
 
@@ -1359,6 +1602,108 @@ The viewer keeps a bounded ring buffer of the last N lines (default 5000) in mem
 emits a 2 GB log must not be able to OOM the TUI. `G` follows the tail; any scroll up detaches
 follow mode; `/` searches the buffer with `n`/`N` navigation.
 
+`e` cycles the streams a job actually has. Since stdout and stderr now share one file (§6.4), the
+second stream is the **preparation transcript** — decomposition, compilation, whatever ran before
+the solver — which holds the explanation for most preparation failures and was previously not
+viewable in the interface at all. A job old enough to have a distinct `stderr.log` still offers it.
+
+### 9.5 Finding a project
+
+The wizard opens a directory browser, and that remains the right default: Dispatch does not guess
+where your work lives, so you show it (§9.3). But the case you want is often four levels down a
+tree you last opened in March, and browsing there is eight keystrokes of remembering. So `/` from
+the new-job screen searches directory *names* under one configured root:
+
+```
+search projects: cavity
+  ● openfoam/cavity          openfoam
+    paper1/cavityRe100
+    validation/cavity3D
+```
+
+Selecting one fills in the working directory and the wizard continues exactly as before —
+detection, validation, cores, confirm. Nothing about submission changes; this replaces only the
+walking. `dispatch find cavity` is the same search from a shell, with `-0` for bare paths so it
+composes into a pipeline.
+
+Four constraints shape it, and each rules something out:
+
+* **One configured root** (`[projects] root`, default `~/projects`) — never the filesystem. A
+  search that could wander into `/` will eventually sit on an NFS mount for thirty seconds, and
+  Dispatch's whole position on locations is that the user says where.
+* **No index and no background scanner.** Building one would mean a walker, inotify watches, and a
+  cache to invalidate — a periodic loop, in a program whose defining property is that it has none
+  (§13.26). A bounded walk takes single-digit milliseconds warm and runs only on a keystroke.
+* **Bounded in every direction** — depth, directories visited, results returned — and the walk
+  *says* when a limit stopped it. "Not in the list" must never be able to read as "not on the
+  machine".
+* **Nothing may throw.** An unreadable directory, a symlink pointing at its own parent, a mount
+  that went away: each is skipped and the search returns what it found. Symlinked directories are
+  not followed *or* offered, since selecting one would submit a job against a path the user did
+  not choose; a visited `(device, inode)` set catches the loops symlinks alone do not.
+
+Ranking is names first, paths a distant second — an exact name beats a prefix beats a word
+boundary beats a substring, and all of them beat a match that only appears in the path. Ties break
+on depth, so a project sorts above its own sub-cases. Results carry the same "looks like a case"
+mark the browser uses, which is the other reason the search runs daemon-side: the mark comes from
+the real adapters.
+
+### 9.6 Terminal plotting
+
+Select a job, press `p`, and choose what to put on each axis:
+
+```
+x axis                  residual(Ux) · residual(p)
+→ Iteration   40           0.1 ┤⠉⠒⠢⢄⡀
+  Time        40               │⡀   ⠈⠑⠢⢄⣀
+  Execution…  40        0.01767┤⠈⠉⠒⠢⠤⣀⡀ ⠈⠉⠑⠒⠤⣀
+                               │      ⠈⠉⠒⠢⠤⣀⡀ ⠙⠲⠤⣀⡀
+y axis                 0.003122┤            ⠈⠙⠒⠦⢤⣀⡉⠉⠒⠦⢄⡀
+● residual(Ux) 40              │                  ⠉⠙⠒⠦⢄⣈⠓⠦⣄⣀
+● residual(p)  40         1e-04┤                        ⠉⠑⠒⠬⢭⣑⡲⢤⣀
+  continuity   40              └──────────────────────────────────
+  courant_max  40               0            149.5           299   Iteration
+```
+
+**No image is produced and no file is written.** Not as an implementation detail either: a test
+asserts that rendering creates nothing on disk and that no plotting library is in `sys.modules`.
+The output is `rich.text.Text`, which is the only form that survives an SSH session to a headless
+machine.
+
+The data path is §8.9: log → adapter → series → X/Y choice → renderer. The rendering itself
+(`tui/plot.py`) is pure arithmetic over numbers and a size — no widgets, no I/O — because the hard
+part of a terminal chart is the arithmetic at the edges (a constant series, a single point, a
+range of zero, a `nan` that got this far) and all of it should be testable without a terminal.
+
+Four design points:
+
+**Resolution comes from Unicode, not from the terminal.** A braille cell carries a 2×4 grid of
+addressable dots, so a chart 60 columns wide has 120 horizontal samples and a residual curve looks
+like a curve. `m` switches to 2×2 quadrant blocks for terminals whose font lacks braille — a
+keystroke rather than a bug report. No dependency either way.
+
+**Series are a flat pool, not one X with a list of Ys.** Pinning the independent variable at parse
+time would decide that iteration is the X axis, and `execution time vs. iteration` — "is it slowing
+down?" — could not be expressed at all. Any series may go on either axis; `Series.axis` only
+orders the selector.
+
+**Every value remembers which sample it came from.** A quantity printed on every step and one
+printed sporadically produce series of different lengths, and zipping those plots one quantity
+against the wrong one. Pairing is an inner join on sample index (`core.series.align`), and when the
+overlap is smaller than either series the screen says so. This is the "handle it explicitly rather
+than silently producing nonsense" requirement, discharged.
+
+**Log scale is offered, not imposed.** Residuals span six decades and are unreadable linearly;
+execution time spans one and is unreadable logarithmically. So a log Y axis is chosen automatically
+when the data is strictly positive and spans more than two decades, and `l` overrides the guess —
+after which the guess stops applying. A log axis requested for data containing zero or negative
+values (continuity errors, for instance) says so rather than drawing an empty chart.
+
+Selection and chart live on one screen rather than a wizard followed by a picture: moving the
+cursor redraws immediately, which turns "choose a plot" into "look through the data". `space`
+overlays up to four Y series, because residuals are read against each other. `tab` switches lists,
+`r` re-reads a running job's log, `Esc`/`q` goes back.
+
 ---
 
 ## 10. Resource footprint
@@ -1370,7 +1715,9 @@ follow mode; `/` searches the buffer with `n`/`N` navigation.
 | `dispatch` TUI | < 70 MB | Textual's floor is ~50 MB; bounded log ring buffer; paged tables |
 
 Deliberate exclusions to protect the floor: no Rich or Textual in the daemon's import graph
-(enforced by test), no ORM, no pandas/numpy, no `watchfiles`, no `click`. Final dependency set:
+(enforced by test), no ORM, no pandas/numpy, no `watchfiles`, no `click`, and **no plotting
+library** — the terminal charts are a braille canvas in ~250 lines of stdlib arithmetic (§13.27).
+Final dependency set:
 `textual`, `rich` (a Textual dependency regardless), `psutil`. Everything else is stdlib —
 `sqlite3`, `asyncio`, `tomllib`, `json`, `uuid`, `dataclasses`, `importlib.metadata`.
 
@@ -1388,6 +1735,10 @@ Idle CPU: two heartbeat wakeups per minute with no clients and no jobs. Measurab
 | Daemon killed during `PREPARING` | Half-decomposed case | Step transcript records the last completed step; job → `UNKNOWN`; re-submitting re-runs `decomposePar -force`, which is idempotent |
 | Machine hard reset | Running jobs lost | Recovery marks them `UNKNOWN`/`lost`; the queue is intact and resumes |
 | Disk full | Solver fails, logs truncate | Pre-flight checks free space; daemon logs the condition and pauses admission below a configured floor |
+| Case directory unwritable at launch | None | Log falls back to the per-job directory, a job event records why, the job runs (§6.4) |
+| Two runs of one case | None | The earlier log is rotated to `log.<name>.1` and its job's record follows it (§13.23) |
+| GPU job on a machine with no GPU | Refused at submission | The reason names `scheduler.total_gpus`, rather than the job queueing forever |
+| A solver log a parser cannot read | None | Plotting reports no series; job state is untouched (§13.25) |
 | DB corruption | Fatal | WAL + `synchronous=NORMAL`; `PRAGMA integrity_check` at startup; refuse to start and say so rather than proceed |
 | Two daemons started | Fatal for the second | `flock` on `daemon.pid`; second instance exits with a clear message |
 | Stale socket after crash | Bind fails | Startup unlinks a socket whose `flock` is unheld |
@@ -1399,8 +1750,10 @@ Idle CPU: two heartbeat wakeups per minute with no clients and no jobs. Measurab
 
 ## 12. Testing strategy
 
-`pytest` + `pytest-asyncio` + `coverage`. 483 tests, about nine seconds, no solver
-required.
+`pytest` + `pytest-asyncio` + `coverage`. 727 tests, about ten seconds, and none of it
+requires OpenFOAM, SU2, Basilisk, CalculiX, CUDA, PyTorch, TensorFlow, or JAX to be
+installed. Adapters are tested by asserting on the command lists and environments they
+produce; GPUs are a configured integer; solver logs are fixtures.
 
 Measured coverage, rather than a target:
 
@@ -1437,7 +1790,29 @@ the parts where a mistake would silently corrupt history or lose a simulation ar
   event backpressure and resync, handshake mismatch.
 - **`integration`** — a real daemon on a temp socket, a real client, submitting `sleep 0.2` jobs
   through the full path with a `FakeAdapter`; assert the DB end state and the event sequence.
+- **logs** — that the filename comes from the adapter, that the file lands in the case
+  directory, that stdout and stderr both reach it, that an unwritable case falls back and still
+  runs, that a second run rotates the first aside and repoints its record, and that a job written
+  before the convention is still readable.
+- **resources** — the CPU/GPU invariant at construction and in the schema, both admission
+  directions, two requests that cannot both fit, survival of a daemon restart, and the CLI
+  flag combinations including the contradictory one.
+- **ML/PINN adapters** — mostly tests that detection *refuses*: a plain Python project, a bare
+  `train.py`, a `requirements.txt`, a directory named `pinn`, a project that merely imports
+  `torch`. Then plans, entrypoint resolution, and the GPU environment in both states.
+- **plots** — the series algebra (pairing with gaps, downsampling, mismatched lengths), the
+  OpenFOAM parser against realistic output including PIMPLE inner loops, rank prefixes, `nan`,
+  truncated final lines and empty logs, and the renderer — including a test that it writes no
+  file and imports no plotting library.
+- **project search** — recursive matching and ranking, symlink loops, symlinked directories,
+  unreadable directories, depth and entry bounds, a missing root, and a directory that vanishes
+  mid-walk.
+- **migrations** — a database built at the *previous* schema version by running the real
+  migration files, populated with rows written the way an older Dispatch wrote them, migrated
+  forward, and read back through the repository.
 - **Architecture tests** — the import-graph check (§3) and the `grep` check (§1.1) as real tests.
+  The latter caught two prose mentions of `log.foam` in daemon docstrings during this work, which
+  is exactly what it is for.
 
 ---
 
@@ -1561,6 +1936,68 @@ documentation that drifts from behaviour. Because `plan()` returns data rather t
 actions, the real path *is* the dry-run path minus the final call. Any future adapter gets dry-run
 for free and cannot get it wrong.
 
+
+**13.22 The solver's log lives in the case directory, named by the adapter.**
+Keeping it under `~/.local/share/dispatch/logs/jobs/<uuid>/` was tidy for Dispatch and hostile to
+its user: your own simulation's output should be visible when you `ls` your own case, and nobody
+remembers a UUID. Rejected alternatives: a **symlink** from the case to the internal file (breaks
+on `rsync -L`, on archiving a case, and on any tool that resolves it; and it still writes the real
+bytes somewhere the user did not choose); **copying** at completion (doubles the disk cost of a
+40 GB log and gives nothing while the job is running, which is when people read it); a **fixed
+name** chosen by the daemon (`log.txt` — throws away the convention that makes `log.foam`
+instantly recognisable, and would have put a solver name in the daemon). The adapter supplies the
+name, so the daemon still contains no solver knowledge (§1.1). The per-job directory keeps the
+step transcript and the exit sentinel, which are Dispatch's bookkeeping rather than the user's
+results, and is the fallback when the case directory cannot be written.
+
+**13.23 A second run rotates the previous log aside, and repoints the job that wrote it.**
+Two runs of one case share a path, so something has to give. **Appending** conflates two runs in
+one file and makes `dispatch logs <old-id>` show output the old job never produced.
+**Truncating** destroys results that belong to the user. **Unique per-job names**
+(`log.foam.3f2a1b`) put a UUID back in the case directory, which is the thing being fixed.
+So the old file is renamed to the next free `log.foam.N` — the convention its users already
+follow by hand — and `Repository.repoint_logs` updates the finished job's row to match. Nothing is
+deleted and no history entry ever points at another run's output. Rotation takes the next free
+number rather than cascading, so one run rewrites one path rather than N.
+
+**13.24 The GPU ledger grants a count, not device indices.**
+`--gpus 2` reserves two GPUs; it does not say *which* two, and `CUDA_VISIBLE_DEVICES` is left
+alone for a GPU job. Assigning indices is the obvious next step and was rejected *for now* on one
+specific ground: an assignment that does not survive a daemon restart is worse than none. A
+re-adopted job's real devices are not recorded anywhere, so a restarted daemon would re-derive
+indices, hand a newly admitted job a device the surviving job is already using, and produce an
+out-of-memory failure whose cause is invisible. Doing it properly means a column, a migration, and
+a recovery path — for a feature nobody has asked for on a workstation with one or two cards. What
+*is* done is the half that costs nothing and prevents the common accident: a job granted no GPUs
+has every visibility variable set empty, so CPU work cannot wander onto a device (§8.8). When
+index assignment arrives it is a column and a change to `ResourceModel.acquire`, not a redesign.
+
+**13.25 Log parsing may not touch job state.**
+Progress, failure explanation, and now plot data are all read out of solver logs by adapter code,
+and none of them writes to `jobs`. This is a rule about *paths*, not intentions:
+`daemon/plotdata.py` has no repository, so a parser that misreads a diverging residual as `nan`
+cannot reclassify a `COMPLETED` run. It preserves the `FAILED` / `UNKNOWN` distinction (§13.12) for
+the same reason it exists — those states record what the *process* did, and a text heuristic is not
+allowed a vote.
+
+**13.26 Project search is a bounded walk on a keystroke, not an index.**
+An index would make search instant and would cost a background walker, inotify watches, a cache,
+and an invalidation strategy — a periodic loop in the one program that advertises having none
+(§6.1). Measured against a real projects tree the walk is single-digit milliseconds warm, and it
+runs only while somebody is typing into the search box. Rejected also: **`locate`/`mlocate`**
+(a dependency, a daily cron job, and stale by up to 24 hours) and **searching the whole
+filesystem** (Dispatch's position on locations is that the user says where). The bound is
+explicit, and when it bites the result says so rather than quietly looking complete.
+
+**13.27 Plots are drawn with Unicode, and no plotting dependency is added.**
+`plotext` and `termplotlib` both exist and both do this well. Rejected on the footprint rule that
+governs every other dependency decision here (§10): a braille canvas plus axis arithmetic is
+roughly 250 lines, it is exactly the 250 lines this application needs, and it does not put a
+transitive dependency tree into the process that has to stay under 70 MB. Image output — PNG, SVG,
+sixel, kitty graphics — was excluded by requirement and is also simply wrong for the target: the
+machine is headless and reached over SSH, and a picture that some terminals cannot show is not a
+plot. The braille/blocks toggle exists because font support for braille is good but not universal.
+
 ---
 
 ## 14. Implementation roadmap
@@ -1578,6 +2015,7 @@ Each phase ends with tests passing and something demonstrable.
 | **6** | `BasiliskAdapter` | **Done** — compile-then-run proves the plan abstraction; verified by plan assertions (see §14.2) |
 | **7** | Packaging | **Done** — systemd unit, `uv build`, README, install docs |
 | **8+** | `CalculiXAdapter` | **Done** — New adapter, zero scheduler changes — the thesis, verified |
+| **9** | Working-directory logs, CPU/GPU resources, ML + PINN adapters, project search, terminal plotting | **Done** — schema 004; two adapters added with no daemon change; `p` plots a residual history over SSH |
 
 Phase 2b is the risk concentration: process supervision, exit-code durability, and recovery are
 where correctness is genuinely hard. Everything after it is comparatively mechanical.

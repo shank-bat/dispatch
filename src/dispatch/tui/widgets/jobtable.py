@@ -20,7 +20,7 @@ from textual.widgets import DataTable
 
 from dispatch.tui.theme import Palette, state_style
 
-__all__ = ["JobTable", "format_duration", "state_text"]
+__all__ = ["JobTable", "format_duration", "resource_text", "state_text"]
 
 PROGRESS_WIDTH = 10
 PROGRESS_FULL = "━"
@@ -38,7 +38,7 @@ class JobTable(DataTable[Any]):
         ("", 3),
         ("job", 26),
         ("state", 11),
-        ("cores", 5),
+        ("res", 11),
         ("solver", 13),
         ("progress", 17),
         ("step", 14),
@@ -96,7 +96,7 @@ class JobTable(DataTable[Any]):
             Text(str(position) if position else "", style=Palette.FAINT),
             Text(_ellipsise(job["name"], 26), style=Palette.TEXT),
             state_text(job["state"]),
-            Text(str(job["cores"]), justify="right", style=Palette.MUTED),
+            resource_text(job),
             Text(
                 _ellipsise(job.get("solver_binary") or job["solver"], 13),
                 style=Palette.MUTED,
@@ -112,6 +112,31 @@ class JobTable(DataTable[Any]):
             ]
         )
         return cells
+
+
+def resource_text(job: dict[str, Any]) -> Text:
+    """What kind of work this is and how much of the machine it holds.
+
+    One column rather than two, reading ``CPU  20c`` or ``GPU  1G``. The kind is what the
+    eye is scanning for -- "is the GPU busy" is a different question from "are the cores
+    busy" and a bare number cannot answer either -- so it leads, in colour, and the
+    quantity follows in the muted text every other number on the row uses.
+
+    A GPU job that also asked for several cores shows both (``GPU  1G·4c``), because a
+    GPU job holding eight cores is a fact the queue needs to explain.
+    """
+    kind = str(job.get("resource_kind") or "cpu").upper()
+    gpus = int(job.get("gpus") or 0)
+    cores = int(job.get("cores") or 0)
+
+    text = Text()
+    text.append(f"{kind:<4}", style=Palette.ACCENT if gpus else Palette.FAINT)
+    if gpus:
+        amount = f"{gpus}G" + (f"·{cores}c" if cores > 1 else "")
+    else:
+        amount = f"{cores}c"
+    text.append(amount, style=Palette.MUTED)
+    return text
 
 
 def state_text(state: str) -> Text:

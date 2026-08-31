@@ -17,6 +17,15 @@ reserved_cores = 1
 # Override the detected core count. Leave unset to use all of them.
 # total_cores = 24
 
+# Override the detected GPU count. Dispatch counts NVIDIA devices under
+# /proc/driver/nvidia/gpus and AMD compute devices under /sys/class/kfd; set this if it
+# guesses wrong, or to 0 on a machine whose GPUs belong to something else -- GPU jobs are
+# then refused at submission with a reason rather than queueing forever.
+# `dispatch doctor` prints what it detected.
+#
+# Unlike cores, none are held back: nothing about logging in over SSH needs a GPU.
+# total_gpus = 2
+
 # RAM kept free above the sum of running jobs' declared estimates.
 ram_margin_mb = 2048
 
@@ -33,6 +42,26 @@ cancel_grace_s = 10.0
 # Whether stopping the daemon also stops running simulations. Changing this should feel
 # like a decision.
 shutdown_kills_jobs = false
+
+[projects]
+# Where `dispatch find` and the new-job screen's `/` search look. One directory, never the
+# whole filesystem -- Dispatch does not guess where your work lives.
+root = "~/projects"
+
+# Bounds on the walk. It runs on a keystroke rather than from an index, so it has to stay
+# fast; when a limit stops it, the results say so rather than looking complete.
+max_depth = 6
+max_entries = 20000
+limit = 50
+
+[plot]
+# Reading a job's log for `p`. A very long log is read from its end -- the recent part is
+# the one worth having -- and the interface says when that happened.
+max_log_bytes = 33554432
+
+# Points per series after downsampling. Bounds the IPC message and the render; both ends
+# of every series are always kept.
+max_points = 2000
 
 [notifications]
 on = ["job.completed", "job.failed"]
@@ -60,6 +89,25 @@ decomposition_method = "scotch"
 
 [adapters.calculix]
 # binary = "ccx"
+
+# The ML and PINN adapters take their per-project settings from a `dispatch.toml` in the
+# project directory rather than from here, since entrypoints and virtual environments are
+# properties of a project rather than of the machine:
+#
+#     # ~/projects/pinn_burgers/dispatch.toml
+#     [job]
+#     adapter    = "pinn"
+#     entrypoint = "train_burgers.py"
+#     args       = ["--config", "configs/burgers.yaml"]
+#     venv       = ".venv"
+#
+# What belongs here is the machine-wide fallback interpreter, used when a project ships no
+# virtual environment and names no python of its own.
+# [adapters.ml]
+# python = "python3.13"
+#
+# [adapters.pinn]
+# python = "python3.13"
 
 # [paths]
 # database = "~/.local/share/dispatch/dispatch.db"

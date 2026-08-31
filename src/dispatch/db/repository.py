@@ -48,8 +48,8 @@ MAX_LIMIT: Final = 1000
 _JOB_COLUMNS: Final = """
     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb, priority,
     state, created_at, started_at, finished_at, exit_code, exit_reason, exit_signal,
-    exit_detail, stdout_path, stderr_path, pid, pid_start_time, metadata,
-    runtime_s, peak_rss_mb, mean_cpu_pct, depends_on_job_id
+    exit_detail, stdout_path, stderr_path, log_path, pid, pid_start_time, metadata,
+    runtime_s, peak_rss_mb, mean_cpu_pct, depends_on_job_id, resource_kind, gpus
 """
 
 # Columns a transition is permitted to set. An allowlist rather than "whatever the caller
@@ -112,6 +112,7 @@ class JobRepository:
         *,
         stdout_path: Path | None = None,
         stderr_path: Path | None = None,
+        log_path: Path | None = None,
         state: JobState = JobState.QUEUED,
     ) -> Job:
         """Insert a new job and everything attached to it.
@@ -125,6 +126,7 @@ class JobRepository:
             stdout_path: Where the solver's stdout will go. Assigned by the daemon, which
                 owns the log layout; the repository only records it.
             stderr_path: As above, for stderr.
+            log_path: The working-directory log, when the case directory can hold one.
             state: Initial state. ``QUEUED`` normally; ``REJECTED`` when validation failed
                 and the job is being recorded rather than run.
 
@@ -150,12 +152,12 @@ class JobRepository:
                 """
                 INSERT INTO jobs (
                     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb,
-                    priority, state, created_at, stdout_path, stderr_path, metadata,
-                    depends_on_job_id
+                    priority, state, created_at, stdout_path, stderr_path, log_path,
+                    metadata, depends_on_job_id, resource_kind, gpus
                 ) VALUES (
                     :id, :seq, :name, :workdir, :solver, :solver_binary, :cores, :ram,
-                    :priority, :state, :created_at, :stdout, :stderr, :metadata,
-                    :depends_on
+                    :priority, :state, :created_at, :stdout, :stderr, :log,
+                    :metadata, :depends_on, :resource_kind, :gpus
                 )
                 """,
                 {
@@ -172,6 +174,9 @@ class JobRepository:
                     "created_at": now,
                     "stdout": str(stdout_path) if stdout_path else None,
                     "stderr": str(stderr_path) if stderr_path else None,
+                    "log": str(log_path) if log_path else None,
+                    "resource_kind": spec.resources.kind.value,
+                    "gpus": spec.resources.gpus,
                     "metadata": _dumps(metadata.to_json()),
                     "depends_on": spec.depends_on_job_id,
                 },
@@ -520,20 +525,72 @@ class JobRepository:
             return
         self._conn.execute(f"UPDATE jobs SET {', '.join(assignments)} WHERE id = :id", params)
 
-    def set_log_paths(self, job_id: str, *, stdout: Path, stderr: Path) -> Job:
+    def set_log_paths(
+        self, job_id: str, *, stdout: Path, stderr: Path, log: Path | None = None
+    ) -> Job:
         """Record where a job's output will be written.
 
         Assigned after creation because the paths derive from the job id, which does not
         exist until the row does. The daemon owns the log layout; the repository only
         remembers what it chose.
+
+        Args:
+            log: The working-directory log, when there is one. ``None`` leaves the column
+                as it was, so a fallback that only moves ``stdout`` cannot silently claim
+                a case-directory log that was never written.
         """
-        cursor = self._conn.execute(
-            "UPDATE jobs SET stdout_path = ?, stderr_path = ? WHERE id = ?",
-            (str(stdout), str(stderr), job_id),
-        )
+        assignments = "stdout_path = ?, stderr_path = ?"
+        params: list[Any] = [str(stdout), str(stderr)]
+        if log is not None:
+            assignments += ", log_path = ?"
+            params.append(str(log))
+        params.append(job_id)
+        cursor = self._conn.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", params)
         if cursor.rowcount != 1:
             raise JobNotFound(job_id)
         return self.get(job_id)
+
+    def repoint_logs(self, old: Path, new: Path) -> int:
+        """Follow a job log that has been rotated aside, for jobs that already finished.
+
+        A second run in the same case directory renames the previous ``log.foam`` out of
+        the way (§6.4). Without this, the earlier job's record would point at a path whose
+        contents now belong to the newer run, and ``dispatch logs`` on it would show the
+        wrong output entirely -- a quiet corruption of the history, which is the one thing
+        Dispatch is supposed to be reliable about.
+
+        Only terminal jobs are followed: an active job's log is by definition not the one
+        being rotated away, and rewriting a running job's path would point supervision at
+        a file nothing is writing to.
+
+        Returns:
+            How many job records were updated.
+        """
+        before, after = str(old), str(new)
+        placeholders = ",".join("?" * len(TERMINAL_STATES))
+        cursor = self._conn.execute(
+            f"""
+            UPDATE jobs
+               SET log_path    = CASE WHEN log_path    = ? THEN ? ELSE log_path    END,
+                   stdout_path = CASE WHEN stdout_path = ? THEN ? ELSE stdout_path END,
+                   stderr_path = CASE WHEN stderr_path = ? THEN ? ELSE stderr_path END
+             WHERE state IN ({placeholders})
+               AND (log_path = ? OR stdout_path = ? OR stderr_path = ?)
+            """,
+            [
+                before,
+                after,
+                before,
+                after,
+                before,
+                after,
+                *sorted(state.value for state in TERMINAL_STATES),
+                before,
+                before,
+                before,
+            ],
+        )
+        return int(cursor.rowcount)
 
     def update_metadata(self, job_id: str, metadata: CaseMetadata) -> Job:
         """Replace a job's metadata and rebuild its derived indexes."""
@@ -764,6 +821,11 @@ class JobRepository:
         if query.solvers:
             values = sorted(query.solvers)
             clauses.append(f"LOWER(j.solver) IN ({','.join('?' * len(values))})")
+            params.extend(values)
+
+        if query.resources:
+            values = sorted(query.resources)
+            clauses.append(f"j.resource_kind IN ({','.join('?' * len(values))})")
             params.extend(values)
 
         for app in sorted(query.apps):

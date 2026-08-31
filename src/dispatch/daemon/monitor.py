@@ -117,6 +117,10 @@ class SystemMonitor:
         The two disagree whenever a solver blocks on I/O, and showing both is the honest
         presentation: one is what Dispatch has promised, the other is what the CPUs are
         doing.
+
+        GPUs are reported from the ledger only. There is no measured counterpart, and
+        inventing one would mean shelling out to a vendor tool on every dashboard tick --
+        for a number that must not influence admission anyway (§13.2).
         """
         import psutil
 
@@ -135,6 +139,8 @@ class SystemMonitor:
             available_ram_mb=int(memory.available / (1024 * 1024)),
             load_average=self._resources.load_average(),
             uptime_s=max(0.0, self._clock.now() - self._boot),
+            total_gpus=self._resources.total_gpus,
+            allocated_gpus=self._resources.allocated_gpus,
         )
 
 

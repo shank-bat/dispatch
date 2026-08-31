@@ -57,7 +57,8 @@ class LogScreen(DispatchScreen):
 
     BINDINGS = [
         Binding("escape,q", "back", "back"),
-        Binding("e", "toggle_stream", "stdout/stderr"),
+        Binding("e", "toggle_stream", "output/steps"),
+        Binding("p", "plot", "plot"),
         Binding("G,end", "follow", "follow"),
         Binding("slash", "search", "search"),
         Binding("n", "next_match", "next match"),
@@ -71,7 +72,7 @@ class LogScreen(DispatchScreen):
         # from ever mounting its children.
         super().__init__()
         self.job_id = job_id
-        self._stream = "stdout"
+        self._stream = "output"
         self._tail_task: asyncio.Task[None] | None = None
         self._tailer: AsyncTailer | None = None
         self._lines: deque[str] = deque(maxlen=MAX_LINES)
@@ -102,12 +103,36 @@ class LogScreen(DispatchScreen):
     # -- tailing -------------------------------------------------------------------------
 
     @property
+    def _streams(self) -> list[str]:
+        """Which streams this job actually has, in toggle order.
+
+        ``output`` is the solver's log and ``steps`` is the preparation transcript --
+        decomposition, compilation, whatever ran before the solver. That second one used
+        to be invisible in the interface even though it holds the explanation for most
+        preparation failures.
+
+        ``stderr`` appears only for jobs old enough to have a separate one. New jobs
+        write both streams to a single file (§6.4), so offering an always-identical
+        second view of it would be a key that does nothing.
+        """
+        streams = ["output", "steps"]
+        job = self.app_state.get(self.job_id) or {}
+        if job.get("stderr_path") and job.get("stderr_path") != job.get("stdout_path"):
+            streams.insert(1, "stderr")
+        return streams
+
+    @property
     def _path(self) -> Path | None:
         job = self.app_state.get(self.job_id)
         if job is None:
             return None
+        if self._stream == "steps":
+            # Derived rather than carried on the job: the transcript is internal
+            # bookkeeping in a directory Dispatch owns, and the interface reads log files
+            # off the disk directly anyway (§9.4).
+            return self.dispatch_app.config.paths.job_dir(self.job_id) / "steps.log"
         key = "stderr_path" if self._stream == "stderr" else "stdout_path"
-        raw = job.get(key)
+        raw = job.get(key) or job.get("output_path")
         return Path(raw) if raw else None
 
     def _start_tail(self) -> None:
@@ -206,9 +231,19 @@ class LogScreen(DispatchScreen):
         self.dismiss()
 
     def action_toggle_stream(self) -> None:
-        self._stream = "stderr" if self._stream == "stdout" else "stdout"
+        """Cycle through whichever streams this job has."""
+        streams = self._streams
+        try:
+            position = streams.index(self._stream)
+        except ValueError:
+            position = -1
+        self._stream = streams[(position + 1) % len(streams)]
         self._start_tail()
         self.update_status()
+
+    def action_plot(self) -> None:
+        """Plot the numbers in the log currently being read."""
+        self.dispatch_app.open_plot(self.job_id)
 
     def action_follow(self) -> None:
         widget = self.query_one("#log", RichLog)

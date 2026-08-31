@@ -46,6 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
     submit = sub.add_parser("submit", help="queue a case")
     submit.add_argument("path", type=Path, help="the case directory")
     submit.add_argument("-c", "--cores", type=int, default=1, help="cores to request")
+    submit.add_argument(
+        "-g",
+        "--gpus",
+        type=int,
+        metavar="N",
+        help="GPUs to request; implies --resource gpu",
+    )
+    submit.add_argument(
+        "--resource",
+        choices=["cpu", "gpu"],
+        help="which pool this job draws from (default: gpu when --gpus is given, else cpu)",
+    )
     submit.add_argument("-n", "--name", help="job name (defaults to the directory name)")
     submit.add_argument("-p", "--priority", type=int, default=0, help="higher runs first")
     submit.add_argument("--ram", type=int, metavar="MB", help="RAM estimate in megabytes")
@@ -75,8 +87,20 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("id", help="job id, or a unique prefix of one")
 
     search = sub.add_parser("search", help="search the history")
-    search.add_argument("query", nargs="*", help="e.g. tag:paper solver:openfoam cores>=16")
+    search.add_argument(
+        "query", nargs="*", help="e.g. tag:paper solver:openfoam cores>=16 resource:gpu"
+    )
     search.add_argument("-n", "--limit", type=int, default=50)
+
+    find = sub.add_parser("find", help="find a project directory by name")
+    find.add_argument("name", nargs="*", help="part of a directory name, e.g. cavity")
+    find.add_argument("-n", "--limit", type=int, default=20, help="how many to show")
+    find.add_argument(
+        "-0",
+        "--paths-only",
+        action="store_true",
+        help="print bare paths, one per line, for use in a shell pipeline",
+    )
 
     for name, help_text in (
         ("cancel", "stop a job"),
@@ -106,7 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
     logs = sub.add_parser("logs", help="print or follow a job's output")
     logs.add_argument("id")
     logs.add_argument("-f", "--follow", action="store_true", help="follow, like tail -f")
-    logs.add_argument("-e", "--stderr", action="store_true", help="show stderr instead")
+    logs.add_argument(
+        "-e",
+        "--stderr",
+        action="store_true",
+        help="show stderr instead (only differs for jobs from before merged logs)",
+    )
+    logs.add_argument(
+        "--steps",
+        action="store_true",
+        help="show the preparation transcript instead of the solver's output",
+    )
     logs.add_argument("-n", "--lines", type=int, default=50, help="how many lines to show")
 
     sub.add_parser("status", help="show the machine and the queue")
@@ -197,6 +231,8 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
             Method.CASE_DRYRUN,
             workdir=str(path),
             cores=args.cores,
+            gpus=args.gpus or 0,
+            resource=args.resource,
             ram_mb=args.ram,
             solver=args.solver,
             name=args.name or "",
@@ -208,6 +244,8 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
         Method.JOB_SUBMIT,
         workdir=str(path),
         cores=args.cores,
+        gpus=args.gpus,
+        resource=args.resource,
         ram_mb=args.ram,
         solver=args.solver,
         name=args.name or "",
@@ -222,9 +260,12 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
     position = job.get("queue_position")
     where = f" at queue position {position}" if position else ""
     console.print(
-        f"[green]Queued[/green] {job['name']} ({job['solver']}, {job['cores']} cores){where}"
+        f"[green]Queued[/green] {job['name']} ({job['solver']}, {_resources(job)}){where}"
     )
     console.print(f"  id {job['id']}")
+    if job.get("log_path"):
+        # The single most useful line of the output: where to look while it runs.
+        console.print(f"  log {job['log_path']}")
     return 0
 
 
@@ -248,6 +289,48 @@ async def _search(client: DaemonClient, args: Any, console: Any, config: Config)
     return 0
 
 
+async def _find(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
+    """Find a project directory by name under the configured root.
+
+    ``--paths-only`` exists so this composes: ``dispatch submit "$(dispatch find -0 cavity
+    | head -1)" --cores 20`` is a reasonable thing to type, and it only works if the
+    output is a bare path rather than a table.
+    """
+    payload = await client.call(
+        Method.PROJECTS_SEARCH, query=" ".join(args.name), limit=args.limit
+    )
+    if payload.get("error"):
+        console.print(f"[red]{payload['error']}[/red]")
+        return 1
+
+    results = payload.get("results") or []
+    if args.paths_only:
+        for entry in results:
+            print(entry["path"])
+        return 0 if results else 1
+
+    if not results:
+        console.print(f"[dim]No match under {payload['root']}.[/dim]")
+        return 1
+
+    from rich.table import Table
+
+    table = Table(box=None, padding=(0, 2, 0, 0), header_style="bold")
+    table.add_column("")
+    table.add_column("project")
+    table.add_column("path")
+    for entry in results:
+        table.add_row(
+            "[green]*[/green]" if entry.get("case") else " ",
+            entry.get("case") or "",
+            entry["path"],
+        )
+    console.print(table)
+    if payload.get("truncated"):
+        console.print("[dim]more matches exist; narrow the search[/dim]")
+    return 0
+
+
 async def _show(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
     from rich.table import Table
 
@@ -260,7 +343,7 @@ async def _show(client: DaemonClient, args: Any, console: Any, config: Config) -
     table.add_row("state", _state_markup(job["state"]))
     table.add_row("solver", f"{job['solver']} ({job['solver_binary'] or 'unknown'})")
     table.add_row("directory", job["workdir"])
-    table.add_row("cores", str(job["cores"]))
+    table.add_row("resources", _resources(job))
     if job["ram_estimate_mb"]:
         table.add_row("ram estimate", f"{job['ram_estimate_mb']} MB")
     table.add_row("priority", str(job["priority"]))
@@ -280,7 +363,10 @@ async def _show(client: DaemonClient, args: Any, console: Any, config: Config) -
         table.add_row("runtime", _duration(job["metrics"]["runtime_s"]))
     if job["metrics"]["peak_rss_mb"]:
         table.add_row("peak memory", f"{job['metrics']['peak_rss_mb']} MB")
-    if job["stdout_path"]:
+    if job.get("log_path"):
+        table.add_row("log", job["log_path"])
+    elif job["stdout_path"]:
+        # Pre-dates the working-directory convention; its output is where it was written.
         table.add_row("stdout", job["stdout_path"])
     console.print(table)
 
@@ -333,6 +419,11 @@ async def _status(client: DaemonClient, args: Any, console: Any, config: Config)
         f"{snapshot['free_cores']}/{snapshot['total_cores']} cores free  "
         f"(reserved {snapshot['reserved_cores']}, allocated {snapshot['allocated_cores']})"
     )
+    if snapshot.get("total_gpus"):
+        console.print(
+            f"[bold]gpus[/bold]  {snapshot['free_gpus']}/{snapshot['total_gpus']} free  "
+            f"(allocated {snapshot['allocated_gpus']})"
+        )
     console.print(
         f"cpu {snapshot['cpu_percent']:.0f}%   "
         f"ram {snapshot['used_ram_mb'] // 1024}/{snapshot['total_ram_mb'] // 1024} GB   "
@@ -408,7 +499,12 @@ async def _logs(client: DaemonClient, args: Any, console: Any, config: Config) -
     """
     detail = await client.call(Method.JOB_GET, id=args.id)
     job = detail["job"]
-    path_str = job["stderr_path"] if args.stderr else job["stdout_path"]
+    if args.steps:
+        path_str = str(config.paths.job_dir(job["id"]) / "steps.log")
+    elif args.stderr:
+        path_str = job["stderr_path"]
+    else:
+        path_str = job.get("log_path") or job["stdout_path"]
     if not path_str:
         console.print("[red]This job has no log file yet.[/red]")
         return 1
@@ -516,7 +612,7 @@ def _print_jobs(console: Any, jobs: list[dict[str, Any]]) -> None:
     table.add_column("id")
     table.add_column("name")
     table.add_column("state")
-    table.add_column("cores", justify="right")
+    table.add_column("res")
     table.add_column("solver")
     table.add_column("runtime", justify="right")
     table.add_column("tags")
@@ -528,12 +624,21 @@ def _print_jobs(console: Any, jobs: list[dict[str, Any]]) -> None:
             job["id"][:8],
             job["name"][:28],
             state,
-            str(job["cores"]),
+            _resource_cell(job),
             job["solver_binary"] or job["solver"],
             _duration(job["metrics"]["runtime_s"]) if job["metrics"]["runtime_s"] else "",
             " ".join(job["tags"][:3]),
         )
     console.print(table)
+
+
+def _resource_cell(job: dict[str, Any]) -> str:
+    """The compact form used in listings: ``20c`` or ``1G`` (with cores when they matter)."""
+    gpus = int(job.get("gpus") or 0)
+    cores = int(job.get("cores") or 0)
+    if not gpus:
+        return f"{cores}c"
+    return f"[cyan]{gpus}G[/cyan]" + (f"\u00b7{cores}c" if cores > 1 else "")
 
 
 def _print_findings(console: Any, validation: dict[str, Any] | None) -> None:
@@ -557,7 +662,9 @@ def _print_dry_run(console: Any, report: dict[str, Any]) -> None:
             f"  [bold]Detected[/bold]    {best['label']}  "
             f"[dim](confidence {best['confidence']:.2f})[/dim]"
         )
-    console.print(f"  [bold]Requested[/bold]   {report['cores']} cores")
+    console.print(f"  [bold]Requested[/bold]   {report.get('resources') or report['cores']}")
+    if report.get("log_path"):
+        console.print(f"  [bold]Log[/bold]         {report['log_path']}")
     console.print()
 
     validation = report["validation"]
@@ -589,6 +696,16 @@ def _print_dry_run(console: Any, report: dict[str, Any]) -> None:
             "[dim](suggested)[/dim]"
         )
     console.print("\n  [dim]Nothing was submitted.[/dim]")
+
+
+def _resources(job: dict[str, Any]) -> str:
+    """What a job holds, in one phrase: ``20 cores`` or ``1 GPU, 4 cores``."""
+    gpus = int(job.get("gpus") or 0)
+    cores = int(job.get("cores") or 0)
+    cores_text = f"{cores} core{'' if cores == 1 else 's'}"
+    if not gpus:
+        return cores_text
+    return f"{gpus} GPU{'' if gpus == 1 else 's'}, {cores_text}"
 
 
 def _state_markup(state: str) -> str:
@@ -646,6 +763,7 @@ _HANDLERS = {
     "ls": _ls,
     "show": _show,
     "search": _search,
+    "find": _find,
     "status": _status,
     "cancel": _cancel,
     "hold": _hold,

@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 
 from dispatch.core.errors import ValidationError
@@ -31,6 +32,7 @@ __all__ = [
     "JobSpec",
     "Note",
     "Page",
+    "ResourceKind",
     "ResourceRequest",
     "Sample",
     "SystemSnapshot",
@@ -50,26 +52,114 @@ def new_job_id() -> str:
     return str(uuid.uuid4())
 
 
+class ResourceKind(StrEnum):
+    """Which of the machine's two schedulable pools a job draws its work from.
+
+    Not a cosmetic label. CPU cores and GPUs are counted in separate ledgers (§4.3), so a
+    GPU job occupies GPUs and only the cores it actually asked for, and a CPU job can
+    never hold a GPU. The kind is what makes that guarantee checkable at the point a
+    request is built, rather than at the point a job mysteriously fails to start.
+
+    :class:`StrEnum` so the stored value is readable in a ``sqlite3`` session.
+    """
+
+    CPU = "cpu"
+    """Work that consumes cores. The default, and what every job predating this field was."""
+
+    GPU = "gpu"
+    """Work that consumes GPUs, plus however many cores it declares to drive them."""
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceRequest:
     """What a job asks the machine for.
 
     Attributes:
         cores: Logical CPU cores. Always required -- a job that does not know how parallel
-            it is cannot be scheduled safely.
+            it is cannot be scheduled safely. A GPU job still declares cores, because the
+            host process driving the GPU is real work; it simply usually declares one.
         ram_mb: Optional estimate. When given, it gates admission; when absent, the job is
             admitted on cores alone. This is what makes RAM-aware scheduling already
             present rather than merely possible (§4.3).
+        gpus: GPUs to reserve. Zero for CPU work.
+        kind: Which pool this request draws from. Constrained against ``gpus`` below so
+            the two can never disagree.
     """
 
     cores: int
     ram_mb: int | None = None
+    gpus: int = 0
+    kind: ResourceKind = ResourceKind.CPU
 
     def __post_init__(self) -> None:
         if self.cores < 1:
             raise ValidationError(f"A job must request at least one core, got {self.cores}")
         if self.ram_mb is not None and self.ram_mb <= 0:
             raise ValidationError(f"RAM estimate must be positive, got {self.ram_mb}")
+        if self.gpus < 0:
+            raise ValidationError(f"GPU count cannot be negative, got {self.gpus}")
+        # The two fields are kept consistent here rather than at each call site, so that
+        # "a CPU job cannot accidentally hold a GPU" is a property of the type instead of
+        # a convention every caller has to remember.
+        if self.kind is ResourceKind.CPU and self.gpus:
+            raise ValidationError(
+                f"A CPU job cannot request {self.gpus} GPU(s). "
+                "Submit it with --resource gpu if it is GPU work."
+            )
+        if self.kind is ResourceKind.GPU and self.gpus < 1:
+            raise ValidationError("A GPU job must request at least one GPU")
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        cores: int = 1,
+        ram_mb: int | None = None,
+        gpus: int | None = None,
+        resource: str | None = None,
+    ) -> ResourceRequest:
+        """Build a request from what a user typed, filling in the obvious.
+
+        The two flags overlap, so one may be omitted whenever the other settles the
+        question: ``--gpus 1`` is GPU work, ``--resource gpu`` wants at least one GPU. A
+        combination that genuinely contradicts itself -- ``--resource cpu --gpus 2`` -- is
+        an error rather than a silent reinterpretation of what was asked for.
+
+        Args:
+            cores: Requested cores.
+            ram_mb: Optional RAM estimate.
+            gpus: Requested GPUs, or ``None`` when the user did not say.
+            resource: ``"cpu"``, ``"gpu"``, or ``None`` when the user did not say.
+
+        Raises:
+            ValidationError: On an unknown resource name or a contradictory combination.
+        """
+        count = int(gpus or 0)
+        if resource is None:
+            chosen = ResourceKind.GPU if count > 0 else ResourceKind.CPU
+        else:
+            try:
+                chosen = ResourceKind(str(resource).strip().lower())
+            except ValueError as exc:
+                valid = ", ".join(k.value for k in ResourceKind)
+                raise ValidationError(
+                    f"Unknown resource type {resource!r}. Valid types: {valid}"
+                ) from exc
+        if chosen is ResourceKind.GPU and count == 0:
+            count = 1
+        return cls(cores=cores, ram_mb=ram_mb, gpus=count, kind=chosen)
+
+    @property
+    def is_gpu(self) -> bool:
+        """Whether this request draws on the GPU ledger."""
+        return self.kind is ResourceKind.GPU
+
+    def describe(self) -> str:
+        """A compact human summary, e.g. ``20 cores`` or ``1 GPU, 4 cores``."""
+        cores = f"{self.cores} core{'' if self.cores == 1 else 's'}"
+        if not self.gpus:
+            return cores
+        return f"{self.gpus} GPU{'' if self.gpus == 1 else 's'}, {cores}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +275,16 @@ class Job:
     the log said nothing an adapter could make sense of."""
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    log_path: Path | None = None
+    """The solver's output log, inside the job's own working directory (§6.4).
+
+    This is the file a human browsing the case will find -- ``log.foam`` beside the
+    ``system/`` directory rather than a UUID under ``~/.local/share``. ``None`` for jobs
+    written before the convention existed, and for jobs whose case directory turned out
+    not to be writable; :attr:`stdout_path` is the authority in both cases and is what
+    every reader already uses.
+    """
+
     pid: int | None = None
     pid_start_time: float | None = None
     tags: frozenset[str] = frozenset()
@@ -210,6 +310,26 @@ class Job:
     def ram_estimate_mb(self) -> int | None:
         """Requested RAM estimate, if any."""
         return self.resources.ram_mb
+
+    @property
+    def gpus(self) -> int:
+        """Requested GPU count. Zero for CPU work."""
+        return self.resources.gpus
+
+    @property
+    def resource_kind(self) -> ResourceKind:
+        """Which pool this job draws from."""
+        return self.resources.kind
+
+    @property
+    def output_path(self) -> Path | None:
+        """Where to read this job's solver output.
+
+        The working-directory log when there is one, falling back to the recorded stdout
+        path -- which is what every job predating the convention has, and is why history
+        stays readable across the change.
+        """
+        return self.log_path or self.stdout_path
 
     @property
     def is_terminal(self) -> bool:
@@ -304,10 +424,26 @@ class SystemSnapshot:
     load_average: tuple[float, float, float]
     uptime_s: float
 
+    total_gpus: int = 0
+    """GPUs the machine has, as the ledger counts them. Zero on most machines."""
+
+    allocated_gpus: int = 0
+    """GPUs handed out to PREPARING and RUNNING jobs."""
+
     @property
     def free_cores(self) -> int:
         """Cores available to new jobs: total, less reserved, less allocated."""
         return max(0, self.total_cores - self.reserved_cores - self.allocated_cores)
+
+    @property
+    def free_gpus(self) -> int:
+        """GPUs available to new jobs.
+
+        No reservation is subtracted: the responsiveness argument that holds a core back
+        for SSH (§4.3) has no GPU equivalent, and a machine with one GPU that permanently
+        reserved it would be a machine with no GPU.
+        """
+        return max(0, self.total_gpus - self.allocated_gpus)
 
     @property
     def ram_percent(self) -> float:

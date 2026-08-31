@@ -728,7 +728,7 @@ def test_calculix_metadata(tmp_path: Path) -> None:
 
 def test_every_builtin_adapter_registers() -> None:
     registry = build_default_registry({}, load_plugins=False)
-    assert set(registry.names) == {"openfoam", "su2", "basilisk", "calculix"}
+    assert set(registry.names) == {"openfoam", "su2", "basilisk", "calculix", "ml", "pinn"}
     assert registry.rejected == []
 
 

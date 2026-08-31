@@ -78,6 +78,7 @@ class CaseInspector:
         *,
         cores: int = 1,
         ram_mb: int | None = None,
+        gpus: int = 0,
         solver: str | None = None,
         entry: Path | None = None,
         job_name: str = "",
@@ -109,6 +110,7 @@ class CaseInspector:
             solver=chosen.solver,
             cores=cores,
             ram_mb=ram_mb,
+            gpus=gpus,
             entry=entry or chosen.entry,
             job_name=job_name,
         )
@@ -138,15 +140,23 @@ class CaseInspector:
         *,
         cores: int = 1,
         ram_mb: int | None = None,
+        gpus: int = 0,
+        resource: str | None = None,
         solver: str | None = None,
         entry: Path | None = None,
         job_name: str = "",
     ) -> DryRunReport:
         """Produce the full report ``--dry-run`` prints. Nothing is created or started."""
+        from dispatch.core.models import ResourceRequest
+
+        request = ResourceRequest.build(
+            cores=cores, ram_mb=ram_mb, gpus=gpus or None, resource=resource
+        )
         result = self.inspect(
             path,
             cores=cores,
             ram_mb=ram_mb,
+            gpus=request.gpus,
             solver=solver,
             entry=entry,
             job_name=job_name,
@@ -158,9 +168,6 @@ class CaseInspector:
         with contextlib.suppress(Exception):
             suggested = tuple(result.adapter.suggest_tags(result.context))
 
-        from dispatch.core.models import ResourceRequest
-
-        request = ResourceRequest(cores=cores, ram_mb=ram_mb)
         can, reason = self._resources.can_admit(request)
 
         return DryRunReport(
@@ -168,18 +175,35 @@ class CaseInspector:
             solver=result.detection.solver,
             solver_binary=result.detection.solver_binary,
             cores=cores,
+            resources=request,
             detections=result.detections,
             validation=result.report,
             plan=result.plan,
             suggested_tags=suggested,
+            log_path=self._log_path(result),
             projection=ResourceProjection(
                 cores_requested=cores,
                 cores_free=self._resources.free_cores,
                 cores_total=self._resources.total_cores,
+                gpus_requested=request.gpus,
+                gpus_free=self._resources.free_gpus,
+                gpus_total=self._resources.total_gpus,
                 would_start_immediately=can,
                 blocking_reason=reason,
             ),
         )
+
+    def _log_path(self, result: InspectionResult) -> Path | None:
+        """Where this job's output would be written, for the dry-run report.
+
+        Worth showing before submitting: the whole point of the working-directory log is
+        that the user can find it, and the moment to tell them where it will be is while
+        they are deciding whether to run at all.
+        """
+        if result.context is None:
+            return None
+        name = getattr(result.adapter, "log_name", None)
+        return result.context.workdir / name if name else None
 
     # -- internals ---------------------------------------------------------------------------
 
@@ -229,6 +253,7 @@ class CaseInspector:
         solver: str,
         cores: int,
         ram_mb: int | None,
+        gpus: int,
         entry: Path | None,
         job_name: str,
     ) -> CaseContext:
@@ -236,6 +261,7 @@ class CaseInspector:
             workdir,
             cores=cores,
             ram_mb=ram_mb,
+            gpus=gpus,
             entry=entry,
             env=dict(os.environ),
             adapter=solver,
@@ -250,6 +276,7 @@ class CaseInspector:
             workdir=base.workdir,
             cores=base.cores,
             ram_mb=base.ram_mb,
+            gpus=base.gpus,
             entry=base.entry,
             env=dict(env),
             settings=base.settings,
@@ -296,6 +323,7 @@ def _with_metadata(ctx: CaseContext, metadata: CaseMetadata) -> CaseContext:
         workdir=ctx.workdir,
         cores=ctx.cores,
         ram_mb=ctx.ram_mb,
+        gpus=ctx.gpus,
         entry=ctx.entry,
         env=ctx.env,
         settings=ctx.settings,

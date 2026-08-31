@@ -57,6 +57,7 @@ def run_checks(config: object | None = None) -> list[Check]:
         _python_check(),
         _sqlite_check(),
         _pidfd_check(),
+        _resource_check(),
         _linger_check(),
     ]
     if config is not None:
@@ -99,6 +100,28 @@ def _sqlite_check() -> Check:
             "-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1.",
         )
     return Check("sqlite", CheckStatus.OK, f"SQLite {sqlite3.sqlite_version} with FTS5 and JSON1")
+
+
+def _resource_check() -> Check:
+    """What Dispatch will schedule against.
+
+    Reported rather than judged. Zero GPUs is the correct and common answer, and the check
+    exists so that a user whose GPU job is refused can see immediately whether Dispatch
+    can see the card at all -- which is otherwise a confusing thing to have to guess.
+    """
+    from dispatch.core.config import installed_gpus, physical_cores
+
+    cores = physical_cores() or os.cpu_count() or 1
+    gpus = installed_gpus()
+    detail = f"{cores} physical cores, {gpus} GPU(s) detected"
+    if gpus:
+        return Check("resources", CheckStatus.OK, detail)
+    return Check(
+        "resources",
+        CheckStatus.OK,
+        detail,
+        remedy="Set [scheduler] total_gpus in the configuration if this machine has GPUs.",
+    )
 
 
 def _pidfd_check() -> Check:

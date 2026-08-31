@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
 
-from dispatch.adapters import mpi
+from dispatch.adapters import gpuenv, mpi
 from dispatch.adapters.base import BaseAdapter, CaseContext, Progress
 from dispatch.core.metadata import (
     CaseMetadata,
@@ -57,6 +57,8 @@ class BasiliskAdapter(BaseAdapter):
     name: ClassVar[str] = "basilisk"
     display_name: ClassVar[str] = "Basilisk"
     adapter_version: ClassVar[int] = 1
+    log_name: ClassVar[str] = "log.basilisk"
+    """The simulation's output log, beside its source file."""
 
     metadata_spec: ClassVar[MetadataSpec] = MetadataSpec(
         ref=SpecRef(adapter="basilisk", version=1),
@@ -164,7 +166,7 @@ class BasiliskAdapter(BaseAdapter):
             raise FileNotFoundError(f"No Basilisk source file in {ctx.workdir}")
 
         executable = source.stem
-        env = dict(ctx.env)
+        env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
         qcc = str(self.setting("qcc", "qcc"))
         parallel = ctx.cores > 1
 

@@ -31,6 +31,7 @@ class QueueScreen(DispatchScreen):
         Binding("plus,equals_sign,k", "raise_priority", "priority"),
         Binding("minus,underscore,j", "lower_priority", "", show=False),
         Binding("enter", "open", "logs"),
+        Binding("p", "plot", "plot"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -144,3 +145,9 @@ class QueueScreen(DispatchScreen):
         job = self._selected()
         if job is not None:
             self.dispatch_app.open_logs(job["id"])
+
+    def action_plot(self) -> None:
+        """Plot whatever numbers this job's adapter can find in its output."""
+        job = self._selected()
+        if job is not None:
+            self.dispatch_app.open_plot(job["id"])

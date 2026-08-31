@@ -1,8 +1,12 @@
 """The resource ledger.
 
+Two pools, one rule. Cores and GPUs are counted separately, so a GPU job holds GPUs and
+only the cores it actually declared, and a CPU job can never hold a GPU. Both are counted
+the same way, which is the point of this module:
+
 Admission is decided against a *ledger* -- the sum of what running jobs asked for -- and
-never against measured CPU load. This is the single most consequential scheduling decision
-in Dispatch, so it is worth restating why:
+never against measured CPU load, nor against measured GPU occupancy. This is the single
+most consequential scheduling decision in Dispatch, so it is worth restating why:
 
 A solver blocked on I/O reads as idle. Measurement-based admission would therefore
 oversubscribe the machine at exactly the moment it is already struggling, and the resulting
@@ -11,6 +15,10 @@ predictable, testable, and is what every real scheduler does.
 
 The consequence is that ``htop`` and Dispatch will sometimes disagree about how busy the
 machine is. That is correct, and the dashboard shows both numbers.
+
+The same reasoning applies to GPUs, more strongly. A device's utilisation reads near zero
+between training steps, so admitting on a measurement would put two jobs on one card and
+send both out of memory. The ledger says the card is taken, and it is right.
 """
 
 from __future__ import annotations
@@ -56,14 +64,21 @@ class Capacity:
 
     cores: int
     ram_mb: int | None = None
+    gpus: int = 0
 
     def fits(self, request: ResourceRequest) -> bool:
         """Whether ``request`` fits in this capacity.
 
         A job with no RAM estimate is admitted on cores alone -- which is what makes RAM
         awareness already present rather than merely possible.
+
+        GPUs are a separate dimension rather than a second name for cores. A one-GPU job
+        asking for one core does not stop a twenty-core CPU job from starting beside it,
+        and twenty free cores do not make a GPU appear.
         """
         if request.cores > self.cores:
+            return False
+        if request.gpus > self.gpus:
             return False
         if request.ram_mb is not None and self.ram_mb is not None:
             return request.ram_mb <= self.ram_mb
@@ -74,6 +89,7 @@ class Capacity:
         return Capacity(
             cores=max(0, self.cores - request.cores),
             ram_mb=(None if self.ram_mb is None else max(0, self.ram_mb - (request.ram_mb or 0))),
+            gpus=max(0, self.gpus - request.gpus),
         )
 
 
@@ -98,6 +114,9 @@ class ResourceModel:
         self._log_dir = log_dir
         self.total_cores = config.resolve_total_cores()
         self.reserved_cores = min(config.reserved_cores, max(0, self.total_cores - 1))
+        self.total_gpus = config.resolve_total_gpus()
+        """GPUs available to jobs. Nothing is held back: see :meth:`schedulable_gpus`."""
+
         self._allocations: dict[str, ResourceRequest] = {}
 
     # -- ledger -------------------------------------------------------------------------
@@ -111,6 +130,27 @@ class ResourceModel:
     def allocated_ram_mb(self) -> int:
         """Sum of RAM estimates for jobs that declared one."""
         return sum(request.ram_mb or 0 for request in self._allocations.values())
+
+    @property
+    def allocated_gpus(self) -> int:
+        """GPUs currently handed out to PREPARING and RUNNING jobs."""
+        return sum(request.gpus for request in self._allocations.values())
+
+    @property
+    def free_gpus(self) -> int:
+        """GPUs available to new jobs."""
+        return max(0, self.total_gpus - self.allocated_gpus)
+
+    @property
+    def schedulable_gpus(self) -> int:
+        """The largest GPU count any single job could ever be granted.
+
+        Every GPU the machine has. There is no equivalent of ``reserved_cores`` here: the
+        reservation exists to keep an SSH session responsive, and nothing about logging in
+        needs a GPU. A machine with one GPU that permanently reserved it would be a
+        machine with no GPU.
+        """
+        return self.total_gpus
 
     @property
     def free_cores(self) -> int:
@@ -132,7 +172,9 @@ class ResourceModel:
 
     def capacity(self) -> Capacity:
         """Current free capacity, for a scheduling policy."""
-        return Capacity(cores=self.free_cores, ram_mb=self.available_ram_mb())
+        return Capacity(
+            cores=self.free_cores, ram_mb=self.available_ram_mb(), gpus=self.free_gpus
+        )
 
     def available_ram_mb(self) -> int | None:
         """RAM available for new jobs, less the configured margin.
@@ -176,8 +218,20 @@ class ResourceModel:
                 f"requests {request.cores} cores but only {self.schedulable_cores} are "
                 f"schedulable ({self.total_cores} total, {self.reserved_cores} reserved)"
             )
+        if request.gpus > self.schedulable_gpus:
+            machine = (
+                f"only {self.schedulable_gpus} exist on this machine"
+                if self.schedulable_gpus
+                else "this machine has no GPUs Dispatch can see"
+            )
+            return False, (
+                f"requests {request.gpus} GPU(s) but {machine}. "
+                "Set scheduler.total_gpus if that is wrong."
+            )
         if request.cores > self.free_cores:
             return False, f"{self.free_cores} of {self.schedulable_cores} cores free"
+        if request.gpus > self.free_gpus:
+            return False, f"{self.free_gpus} of {self.total_gpus} GPUs free"
 
         available = self.available_ram_mb()
         if request.ram_mb is not None and available is not None and request.ram_mb > available:

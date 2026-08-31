@@ -42,16 +42,19 @@ you want the daemon started at boot.
 ```sh
 dispatch                                  # the interactive interface
 dispatch submit ~/cases/wing --cores 20   # queue a case
+dispatch submit ~/pinn --resource gpu --gpus 1      # queue GPU work
 dispatch submit ~/cases/wing --cores 20 --dry-run   # show what would happen; run nothing
 dispatch submit ~/cases/wake --cores 8 --after 3f2a  # start only once job 3f2a completes
-dispatch status                           # machine and queue
+dispatch find cavity                      # find a project directory under ~/projects
+dispatch status                           # machine and queue, cores and GPUs
 dispatch ls                               # active jobs
 dispatch logs <id> -f                     # follow a job's output
-dispatch search 'tag:paper cores>=16 endTime>500'
+dispatch logs <id> --steps                # the preparation transcript instead
+dispatch search 'tag:paper resource:gpu cores>=16 endTime>500'
 ```
 
-In the interface: `1` dashboard, `2` queue, `3` history, `n` new job, `?` help. It is
-entirely keyboard-driven.
+In the interface: `1` dashboard, `2` queue, `3` history, `n` new job, `p` plot a job's
+numbers, `?` help. It is entirely keyboard-driven.
 
 ## What it does
 
@@ -59,6 +62,24 @@ entirely keyboard-driven.
 decomposed for 8 and Dispatch reconstructs, removes the old processor directories,
 re-decomposes, and launches — after telling you that is what it is about to do. It does
 *not* reconstruct afterwards: the decomposed case is left exactly as the solver left it.
+
+**Puts the log where you would look for it.** A job writes `~/projects/cavity/log.foam`,
+beside `system/` and `constant/`, containing both stdout and stderr — not a UUID-named file
+under `~/.local/share`. Run the case again and the previous log is rotated to `log.foam.1`,
+with that job's history following it, so nothing is overwritten and no old run's record ever
+shows another run's output.
+
+**Knows the difference between cores and GPUs.** `--cores 20` and `--gpus 1` draw on separate
+ledgers, so a one-GPU training run does not tie up twenty cores and a twenty-core solve does
+not reserve the card. A job that asks for more GPUs than the machine has is refused at
+submission with a reason, rather than queued forever.
+
+**Plots residuals in your terminal.** Select a job, press `p`, choose what goes on each axis,
+and read the chart over SSH. No PNGs, no matplotlib window, no plotting dependency — the
+adapter says what its log contains and the numbers are drawn with Unicode.
+
+**Finds your cases.** `/` in the new-job screen, or `dispatch find cavity`, searches directory
+names under `~/projects` and hands the result to the submit wizard.
 
 **Never guesses.** No project-location heuristics: you browse to a case. Solver detection
 reads `system/controlDict`, SU2 config keys, Basilisk includes, or CalculiX deck keywords,
@@ -97,27 +118,42 @@ alternative* for each significant choice.
 
 ## Solvers
 
-| Adapter | Detects | Parallelism |
-|---|---|---|
-| OpenFOAM | `system/controlDict` | `mpirun`, with automatic decomposition management |
-| SU2 | `*.cfg` containing SU2 keys | `mpirun`; SU2 partitions internally |
-| Basilisk | `*.c` including Basilisk headers | `qcc -D_MPI=N`, compiled as a preparation step |
-| CalculiX | `*.inp` containing `*STEP` | `OMP_NUM_THREADS` |
+| Adapter | Detects | Parallelism | Log |
+|---|---|---|---|
+| OpenFOAM | `system/controlDict` | `mpirun`, with automatic decomposition management | `log.foam` |
+| SU2 | `*.cfg` containing SU2 keys | `mpirun`; SU2 partitions internally | `log.su2` |
+| Basilisk | `*.c` including Basilisk headers | `qcc -D_MPI=N`, compiled as a preparation step | `log.basilisk` |
+| CalculiX | `*.inp` containing `*STEP` | `OMP_NUM_THREADS` | `log.calculix` |
+| ML | `dispatch.toml`, or `train.py` in a Python project | GPUs, or cores | `log.ml` |
+| PINN | `dispatch.toml`, or a PINN library in the project | GPUs, or cores | `log.pinn` |
 
-Adding one means writing one adapter and nothing else. See
-[docs/adapters.md](docs/adapters.md).
+Detection is conservative on purpose: a directory with a `pyproject.toml` and a `main.py` is a
+Python project, not a training run, and neither Python adapter claims it. For anything
+ambiguous, say so once in a `dispatch.toml` beside the code:
+
+```toml
+[job]
+adapter    = "pinn"
+entrypoint = "train_burgers.py"
+args       = ["--config", "configs/burgers.yaml"]
+```
+
+Adding an adapter means writing one adapter and nothing else — the ML and PINN adapters
+required no scheduler change at all. See [docs/adapters.md](docs/adapters.md).
 
 ## Development
 
 ```sh
 uv sync --all-extras
-uv run pytest              # 483 tests, ~9s
+uv run pytest              # 727 tests, ~10s
 uv run ruff check .
 uv run mypy
 ```
 
-The test suite runs without any solver installed: adapters are tested by asserting on the
-command lists they produce, which is a direct consequence of plans being data.
+The test suite runs with no OpenFOAM, SU2, Basilisk, CalculiX, CUDA, PyTorch, TensorFlow, or
+JAX installed: adapters are tested by asserting on the command lists and environments they
+produce, GPUs are a configured integer, and solver logs are fixtures. That is a direct
+consequence of plans being data.
 
 ## Licence
 

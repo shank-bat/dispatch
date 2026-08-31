@@ -19,7 +19,15 @@ from pathlib import Path
 from typing import Any
 
 from dispatch.core.metadata import CaseMetadata
-from dispatch.core.models import Job, JobEvent, JobMetrics, Note, ResourceRequest, Sample
+from dispatch.core.models import (
+    Job,
+    JobEvent,
+    JobMetrics,
+    Note,
+    ResourceKind,
+    ResourceRequest,
+    Sample,
+)
 from dispatch.core.provenance import GitInfo, Provenance
 from dispatch.core.states import ExitReason, JobState
 
@@ -45,7 +53,7 @@ def job_from_row(row: sqlite3.Row, *, tags: frozenset[str] = frozenset()) -> Job
         workdir=Path(row["workdir"]),
         solver=row["solver"],
         solver_binary=row["solver_binary"],
-        resources=ResourceRequest(cores=row["cores"], ram_mb=row["ram_estimate_mb"]),
+        resources=_resources(row),
         state=JobState(row["state"]),
         priority=row["priority"],
         created_at=row["created_at"],
@@ -57,6 +65,7 @@ def job_from_row(row: sqlite3.Row, *, tags: frozenset[str] = frozenset()) -> Job
         exit_detail=row["exit_detail"],
         stdout_path=_optional_path(row["stdout_path"]),
         stderr_path=_optional_path(row["stderr_path"]),
+        log_path=_optional_path(row["log_path"]),
         pid=row["pid"],
         pid_start_time=row["pid_start_time"],
         depends_on_job_id=row["depends_on_job_id"],
@@ -139,6 +148,28 @@ def provenance_to_params(job_id: str, prov: Provenance) -> dict[str, Any]:
 
 
 # -- tolerant scalar parsers -------------------------------------------------------------
+
+
+def _resources(row: sqlite3.Row) -> ResourceRequest:
+    """Rebuild a resource request from a row, tolerating what history contains.
+
+    The constructor enforces that the kind and the GPU count agree. A row that somehow
+    disagrees -- hand-edited, or written by a future version with a kind this one does not
+    know -- is read as the CPU job it most likely was rather than making the job
+    unloadable. Refusing to show a job because one column is odd is exactly the failure
+    this module exists to avoid.
+    """
+    cores = row["cores"]
+    ram_mb = row["ram_estimate_mb"]
+    gpus = int(row["gpus"] or 0)
+    try:
+        kind = ResourceKind(str(row["resource_kind"] or ResourceKind.CPU))
+    except ValueError:
+        kind = ResourceKind.GPU if gpus else ResourceKind.CPU
+    try:
+        return ResourceRequest(cores=cores, ram_mb=ram_mb, gpus=gpus, kind=kind)
+    except Exception:
+        return ResourceRequest(cores=max(1, int(cores or 1)), ram_mb=ram_mb)
 
 
 def _optional_path(value: str | None) -> Path | None:

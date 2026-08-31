@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import ClassVar
 
-from dispatch.adapters import foamdict, mpi
+from dispatch.adapters import foamdict, foamlog, gpuenv, mpi
 from dispatch.adapters.base import (
     BaseAdapter,
     CaseContext,
@@ -36,6 +36,7 @@ from dispatch.core.metadata import (
 )
 from dispatch.core.models import Detection
 from dispatch.core.plan import CommandStep, ExecutionPlan, FailureAction, StepKind
+from dispatch.core.series import PlotData
 from dispatch.core.validation import ReportBuilder, ValidationReport
 
 __all__ = ["OpenFOAMAdapter"]
@@ -77,6 +78,12 @@ class OpenFOAMAdapter(BaseAdapter):
     name: ClassVar[str] = "openfoam"
     display_name: ClassVar[str] = "OpenFOAM"
     adapter_version: ClassVar[int] = 1
+    log_name: ClassVar[str] = "log.foam"
+    """The solver's output log, beside ``system/`` where a Foam user looks for it.
+
+    ``log.foam`` rather than ``log.interFoam``: the application can change between runs of
+    the same case, and a name that moves is a name nobody can tail from memory.
+    """
 
     metadata_spec: ClassVar[MetadataSpec] = MetadataSpec(
         ref=SpecRef(adapter="openfoam", version=1),
@@ -346,7 +353,7 @@ class OpenFOAMAdapter(BaseAdapter):
         # every run from then on would stop at its first time step.
         _restore_stop_at(case)
 
-        env = dict(ctx.env)
+        env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
         application = self._application(ctx) or "foamRun"
         existing = count_processor_dirs(case)
         wanted = max(1, ctx.cores)
@@ -478,6 +485,16 @@ class OpenFOAMAdapter(BaseAdapter):
 
         total = foamdict.read_float(ctx.workdir / "system" / "controlDict", "endTime")
         return Progress(current=current, total=total, label="Time")
+
+    def parse_series(self, text: str, ctx: CaseContext) -> PlotData:
+        """Extract residuals, Courant numbers, and timings from the solver's log.
+
+        Delegated to :mod:`~dispatch.adapters.foamlog` rather than written inline, because
+        this is the one part of the adapter that reads a format instead of describing a
+        command, and it is worth being able to test it against a page of real log text
+        with no adapter, no context, and no case directory in sight.
+        """
+        return foamlog.parse_foam_log(text)
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
         """Ask the solver to write and stop at the end of the current step.

@@ -16,12 +16,17 @@ import asyncio
 import contextlib
 import logging
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from dispatch.adapters.base import CaseContext, SolverAdapter, generic_failure_summary
+from dispatch.adapters.base import (
+    DEFAULT_LOG_NAME,
+    CaseContext,
+    SolverAdapter,
+    generic_failure_summary,
+)
 from dispatch.adapters.registry import AdapterRegistry
 from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.config import Config
@@ -30,6 +35,7 @@ from dispatch.core.models import Job
 from dispatch.core.plan import CommandStep, ExecutionPlan, StepOutcome
 from dispatch.core.states import ExitReason, JobState
 from dispatch.daemon.events import EventBus
+from dispatch.daemon.joblog import choose_log_path, rotate
 from dispatch.daemon.monitor import read_tail
 from dispatch.daemon.process import (
     ProcessHandle,
@@ -200,9 +206,7 @@ class JobExecutor:
                 # A preparation step is where the most explicable failures happen -- a
                 # decomposition that will not divide, a source file that will not compile.
                 # Its output went to the step transcript, not the solver's log.
-                reason_text = await asyncio.to_thread(
-                    self._explain_failure, job.id, entry, steps_log
-                )
+                reason_text = await self._explain_failure(entry, sources=[steps_log])
                 await self._finish(
                     job.id,
                     JobState.FAILED,
@@ -243,13 +247,11 @@ class JobExecutor:
             warn=lambda message: self._event(job.id, "warn", message),
         )
 
-        stdout = open(job.stdout_path or (log_dir / "stdout.log"), "ab", buffering=0)  # noqa: SIM115
-        stderr = open(job.stderr_path or (log_dir / "stderr.log"), "ab", buffering=0)  # noqa: SIM115
-        entry.log_files.extend([stdout, stderr])
+        output = self._open_output(job, adapter, log_dir, entry)
 
         try:
             handle = await self._processes.spawn(
-                step, stdout=stdout, stderr=stderr, exit_file=exit_file
+                step, stdout=output, stderr=output, exit_file=exit_file
             )
         except SpawnError as exc:
             self._event(job.id, "warn", str(exc))
@@ -275,6 +277,70 @@ class JobExecutor:
             await self._run_step(step, log_dir / "steps.log", entry)
 
         await self._conclude(job.id, entry, code, timed_out=timed_out)
+
+    def _open_output(
+        self, job: Job, adapter: SolverAdapter, log_dir: Path, entry: RunningJob
+    ) -> IO[bytes]:
+        """Open the file the solver's stdout and stderr will be written to.
+
+        **One file, not two.** A merged log is what a solver's own users produce by hand
+        (``<solver> > log.<name> 2>&1``) and what they read: a parallel launcher's
+        complaint on stderr belongs immediately after the last line of stdout that
+        preceded it, not in a second file whose timestamps have to be reconciled by eye.
+        Both descriptors are opened ``O_APPEND`` onto the same path, so the kernel orders
+        the writes and neither stream can overwrite the other.
+
+        The path was chosen at submission, so the user could see it in the dry run and in
+        the queue before the job started. It is re-checked here because two days may have
+        passed: a case directory can be unmounted, filled, or made read-only while a job
+        sits in the queue, and a job that cannot open its log must fall back rather than
+        fail.
+        """
+        destination = choose_log_path(
+            job.workdir, getattr(adapter, "log_name", DEFAULT_LOG_NAME), log_dir / "stdout.log"
+        )
+        target = job.log_path if job.log_path and destination.in_workdir else destination.path
+        if destination.reason:
+            self._event(job.id, "warn", f"writing the log to {target}: {destination.reason}")
+
+        try:
+            handle = self._open_append(job, target)
+        except OSError as exc:
+            # The last resort is the per-job directory, which Dispatch created itself and
+            # therefore knows it can write to. A job must not be lost because its case
+            # directory became unwritable between submission and launch.
+            self._event(job.id, "warn", f"could not open {target} ({exc}); using the job log dir")
+            target = log_dir / "stdout.log"
+            handle = self._open_append(job, target)
+
+        entry.log_files.append(handle)
+        self._record_log_paths(job, target, in_workdir=target != log_dir / "stdout.log")
+        return handle
+
+    def _open_append(self, job: Job, target: Path) -> IO[bytes]:
+        """Rotate any previous log aside, then open ``target`` for appending.
+
+        Rotation happens immediately before the open so the window in which the file does
+        not exist is as short as it can be, and the previous job's record is repointed at
+        the rotated name so its history keeps showing its own output.
+        """
+        rotated = rotate(target)
+        if rotated is not None:
+            moved = self._repo.repoint_logs(target, rotated)
+            self._event(job.id, "note", f"moved the previous {target.name} to {rotated.name}")
+            if moved:
+                log.info("Repointed %d job record(s) at %s", moved, rotated)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return open(target, "ab", buffering=0)
+
+    def _record_log_paths(self, job: Job, target: Path, *, in_workdir: bool) -> None:
+        """Store where the output actually went, if it moved since submission."""
+        if job.stdout_path == target and job.stderr_path == target:
+            return
+        with contextlib.suppress(DispatchError):
+            self._repo.set_log_paths(
+                job.id, stdout=target, stderr=target, log=target if in_workdir else None
+            )
 
     def _finalize(self, entry: RunningJob) -> None:
         """Let the adapter undo whatever it did to steer this run.
@@ -318,7 +384,7 @@ class JobExecutor:
 
         detail_text = None
         if state is JobState.FAILED:
-            detail_text = await asyncio.to_thread(self._explain_failure, job_id, entry)
+            detail_text = await self._explain_failure(entry, sources=self._failure_sources(job_id))
 
         await self._finish(
             job_id,
@@ -329,34 +395,54 @@ class JobExecutor:
             detail_text=detail_text,
         )
 
-    def _explain_failure(
-        self, job_id: str, entry: RunningJob, only: Path | None = None
-    ) -> str | None:
-        """Read the end of a failed job's logs and ask its adapter what went wrong.
+    def _failure_sources(self, job_id: str) -> list[Path]:
+        """Which files to read when explaining why a job failed.
 
-        stderr first: when a run dies before the solver starts -- a missing library, an MPI
-        launcher refusing the rank count -- stdout is empty and the whole explanation is on
-        stderr. Both are read because the reverse is also true, and solvers that write
-        their fatal errors to stdout are common.
+        stderr first: when a run dies before the solver starts -- a missing library, a
+        parallel launcher refusing the rank count -- stdout is empty and the whole
+        explanation is on stderr. Both are read because the reverse is also true, and
+        solvers that write their fatal errors to stdout are common. Since a job's two
+        streams now share one file (§6.4), that usually resolves to reading it once.
 
-        Args:
-            only: Read just this file. Used for a preparation failure, whose output is in
-                the step transcript and whose solver logs are empty and misleading.
+        Runs on the event loop, because it touches the database. See
+        :meth:`_explain_failure` for why that separation is load-bearing.
         """
         job = self._repo.get_optional(job_id)
         if job is None:
-            return None
-
+            return []
         log_dir = self._config.paths.job_dir(job.id)
-        sources = (
-            [only]
-            if only is not None
-            else [
-                job.stderr_path or (log_dir / "stderr.log"),
-                job.stdout_path or (log_dir / "stdout.log"),
-                log_dir / "steps.log",
-            ]
-        )
+        candidates = [
+            job.stderr_path or (log_dir / "stderr.log"),
+            job.stdout_path or (log_dir / "stdout.log"),
+            log_dir / "steps.log",
+        ]
+        return list(dict.fromkeys(candidates))
+
+    async def _explain_failure(self, entry: RunningJob, *, sources: Sequence[Path]) -> str | None:
+        """Read the end of a failed job's output and ask its adapter what went wrong.
+
+        Takes paths rather than a job id, and that is deliberate rather than cosmetic. The
+        reading happens in a worker thread -- a fatal error block can be sixteen kilobytes
+        into a multi-gigabyte log, and the event loop must not stall on the seek -- and a
+        thread must never touch the database. A cancelled task releases its thread to
+        finish on its own; if that thread were still running a query when shutdown closed
+        the connection, the daemon would not raise, it would segfault.
+
+        So everything the database knows is resolved on the loop, by
+        :meth:`_failure_sources`, and the thread is handed nothing but filenames.
+
+        Args:
+            entry: The in-flight job, for its adapter and case context.
+            sources: Files to read, most informative first. A preparation failure passes
+                only the step transcript, whose output is the explanation and whose solver
+                log is empty and misleading.
+        """
+        if not sources:
+            return None
+        return await asyncio.to_thread(self._read_explanation, entry, tuple(sources))
+
+    def _read_explanation(self, entry: RunningJob, sources: Sequence[Path]) -> str | None:
+        """The file-reading half of :meth:`_explain_failure`. Runs in a worker thread."""
         tail = "\n".join(
             part for part in (read_tail(path, FAILURE_TAIL_BYTES) for path in sources) if part
         )
@@ -369,7 +455,7 @@ class JobExecutor:
         try:
             return adapter.explain_failure(tail, ctx)
         except Exception as exc:
-            log.debug("Adapter %s could not explain the failure: %s", job.solver, exc)
+            log.debug("Adapter could not explain the failure: %s", exc)
             return generic_failure_summary(tail)
 
     # -- steps ------------------------------------------------------------------------------------

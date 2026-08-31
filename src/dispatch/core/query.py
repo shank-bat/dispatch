@@ -27,6 +27,7 @@ from enum import StrEnum
 from typing import Final
 
 from dispatch.core.errors import QueryError
+from dispatch.core.models import ResourceKind
 from dispatch.core.states import JobState
 from dispatch.core.tags import normalise_tag
 
@@ -87,6 +88,7 @@ class Comparison:
 # Job columns that accept comparisons, mapped to (SQL column, value interpretation).
 _COLUMNS: Final[dict[str, tuple[str, ValueKind]]] = {
     "cores": ("cores", ValueKind.NUMBER),
+    "gpus": ("gpus", ValueKind.NUMBER),
     "priority": ("priority", ValueKind.NUMBER),
     "ram": ("ram_estimate_mb", ValueKind.SIZE_MB),
     "runtime": ("runtime_s", ValueKind.DURATION),
@@ -110,6 +112,7 @@ _KEYWORDS: Final[frozenset[str]] = frozenset(
         "before",
         "dirty",
         "meta",
+        "resource",
     }
 )
 
@@ -133,6 +136,9 @@ class SearchQuery:
     states: frozenset[JobState] = frozenset()
     states_exclude: frozenset[JobState] = frozenset()
     solvers: frozenset[str] = frozenset()
+    resources: frozenset[str] = frozenset()
+    """Resource kinds -- ``cpu``, ``gpu``. Empty means both."""
+
     apps: frozenset[str] = frozenset()
     names: Sequence[str] = ()
     """Substring constraints on the job name."""
@@ -159,6 +165,7 @@ class SearchQuery:
                 self.states,
                 self.states_exclude,
                 self.solvers,
+                self.resources,
                 self.apps,
                 self.names,
                 self.dirs,
@@ -209,6 +216,7 @@ class _Accumulator:
         "ids",
         "names",
         "now",
+        "resources",
         "solvers",
         "states",
         "states_exclude",
@@ -225,6 +233,7 @@ class _Accumulator:
         self.states: set[JobState] = set()
         self.states_exclude: set[JobState] = set()
         self.solvers: set[str] = set()
+        self.resources: set[str] = set()
         self.apps: set[str] = set()
         self.names: list[str] = []
         self.dirs: list[str] = []
@@ -282,6 +291,9 @@ class _Accumulator:
             case "solver":
                 self._no_negation(negated, token)
                 self.solvers.add(value.lower())
+            case "resource":
+                self._no_negation(negated, token)
+                self.resources.add(_parse_resource(value))
             case "app":
                 self._no_negation(negated, token)
                 self.apps.add(value)
@@ -359,6 +371,7 @@ class _Accumulator:
             states=frozenset(self.states),
             states_exclude=frozenset(self.states_exclude),
             solvers=frozenset(self.solvers),
+            resources=frozenset(self.resources),
             apps=frozenset(self.apps),
             names=tuple(self.names),
             dirs=tuple(self.dirs),
@@ -379,6 +392,21 @@ def _parse_state(value: str) -> JobState:
     except ValueError as exc:
         valid = ", ".join(s.value.lower() for s in JobState)
         raise QueryError(f"Unknown job state {value!r}. Valid states: {valid}") from exc
+
+
+def _parse_resource(value: str) -> str:
+    """Validate a resource kind, listing the valid ones on a typo.
+
+    Same strictness as every other enumerated field here: ``resource:gpi`` returning every
+    CPU job would be a confidently wrong answer to "which of my runs used the GPU".
+    """
+    lowered = value.strip().lower()
+    valid = {kind.value for kind in ResourceKind}
+    if lowered not in valid:
+        raise QueryError(
+            f"Unknown resource kind {value!r}. Valid kinds: {', '.join(sorted(valid))}"
+        )
+    return lowered
 
 
 def _parse_bool(value: str) -> bool:

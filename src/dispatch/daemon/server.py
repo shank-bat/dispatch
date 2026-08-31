@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from dispatch.adapters.base import DEFAULT_LOG_NAME
 from dispatch.adapters.registry import AdapterRegistry
 from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.config import Config
@@ -30,7 +31,10 @@ from dispatch.core.states import JobState
 from dispatch.daemon.dryrun import CaseInspector
 from dispatch.daemon.events import EventBus, Subscription
 from dispatch.daemon.executor import JobExecutor
+from dispatch.daemon.joblog import assign_log_paths
 from dispatch.daemon.monitor import SystemMonitor
+from dispatch.daemon.plotdata import extract_series
+from dispatch.daemon.projects import search_projects
 from dispatch.daemon.resources import ResourceModel
 from dispatch.daemon.scheduler import Scheduler
 from dispatch.db.repository import JobRepository
@@ -47,6 +51,8 @@ from dispatch.ipc.protocol import (
     encode_metadata_spec,
     encode_note,
     encode_page,
+    encode_plot_data,
+    encode_project_hit,
     encode_provenance,
     encode_report,
     encode_sample,
@@ -273,12 +279,14 @@ class IpcServer:
             Method.JOB_NOTE: self._job_note,
             Method.JOB_TAG: self._job_tag,
             Method.JOB_PROVENANCE: self._job_provenance,
+            Method.JOB_SERIES: self._job_series,
             Method.TAGS_LIST: self._tags_list,
             Method.HISTORY_SEARCH: self._history_search,
             Method.CASE_DETECT: self._case_detect,
             Method.CASE_VALIDATE: self._case_validate,
             Method.CASE_DRYRUN: self._case_dryrun,
             Method.FS_LIST: self._fs_list,
+            Method.PROJECTS_SEARCH: self._projects_search,
             Method.SUBSCRIBE: self._subscribe,
             Method.UNSUBSCRIBE: self._unsubscribe,
         }
@@ -347,6 +355,14 @@ class IpcServer:
         cores = _as_int(params.get("cores"), default=1)
         ram_mb = params.get("ram_mb")
         force = bool(params.get("force"))
+        # Built here, once, so the CPU/GPU consistency rules are applied to every
+        # submission path -- the CLI, the wizard, and a hand-written socket client alike.
+        request = ResourceRequest.build(
+            cores=cores,
+            ram_mb=int(ram_mb) if ram_mb else None,
+            gpus=_as_optional_int(params.get("gpus")),
+            resource=params.get("resource"),
+        )
         # Optional, and absent from almost every submission. Resolved through the same
         # prefix expansion as every other job id the user types, so an unknown or
         # ambiguous one is refused here rather than becoming a job that waits forever.
@@ -356,7 +372,8 @@ class IpcServer:
         result = self._inspector.inspect(
             workdir,
             cores=cores,
-            ram_mb=int(ram_mb) if ram_mb else None,
+            ram_mb=request.ram_mb,
+            gpus=request.gpus,
             solver=params.get("solver"),
             job_name=str(params.get("name") or ""),
             build_plan=False,
@@ -382,7 +399,7 @@ class IpcServer:
             workdir=workdir,
             solver=result.detection.solver,
             solver_binary=result.detection.solver_binary,
-            resources=ResourceRequest(cores=cores, ram_mb=int(ram_mb) if ram_mb else None),
+            resources=request,
             name=str(params.get("name") or ""),
             priority=_as_int(params.get("priority"), default=0),
             tags=frozenset(params.get("tags") or ()),
@@ -392,24 +409,32 @@ class IpcServer:
         )
 
         can, reason = self._resources.can_admit(spec.resources)
-        if not can and cores > self._resources.schedulable_cores:
+        # A request larger than the machine can ever satisfy is refused now rather than
+        # queued forever. Checked for both pools: "20 cores on a 16-core box" and "2 GPUs
+        # on a machine with one" fail for the same reason and deserve the same answer.
+        impossible = (
+            cores > self._resources.schedulable_cores
+            or request.gpus > self._resources.schedulable_gpus
+        )
+        if not can and impossible:
             raise ValidationError(
-                f"This job asks for {cores} cores, which it can never get: {reason}",
-                detail={"schedulable_cores": self._resources.schedulable_cores},
+                f"This job asks for {request.describe()}, which it can never get: {reason}",
+                detail={
+                    "schedulable_cores": self._resources.schedulable_cores,
+                    "schedulable_gpus": self._resources.schedulable_gpus,
+                },
             )
 
         job = self._repo.create(spec, state=JobState.QUEUED)
         # Log paths derive from the job id, which does not exist until the row does, so
         # they are assigned immediately afterwards rather than passed in.
-        log_dir = self._config.paths.job_dir(job.id)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        job = self._repo.set_log_paths(
-            job.id, stdout=log_dir / "stdout.log", stderr=log_dir / "stderr.log"
+        job = assign_log_paths(
+            self._repo, self._config, job, getattr(result.adapter, "log_name", DEFAULT_LOG_NAME)
         )
 
         self._bus.publish(Event.JOB_STATE, encode_job(job))
         self._scheduler.nudge()
-        log.info("Queued job %s (%s, %d cores)", job.id[:8], job.name, job.cores)
+        log.info("Queued job %s (%s, %s)", job.id[:8], job.name, job.resources.describe())
         return {
             "job": encode_job(job, queue_position=self._repo.queue_positions().get(job.id)),
             "validation": encode_report(result.report),
@@ -522,6 +547,7 @@ class IpcServer:
         result = self._inspector.inspect(
             Path(str(params.get("path", ""))).expanduser(),
             cores=_as_int(params.get("cores"), default=1),
+            gpus=_as_int(params.get("gpus"), default=0),
             solver=params.get("solver"),
             build_plan=False,
         )
@@ -539,10 +565,73 @@ class IpcServer:
             Path(str(params.get("workdir") or params.get("path", ""))).expanduser(),
             cores=_as_int(params.get("cores"), default=1),
             ram_mb=int(ram) if ram else None,
+            gpus=_as_int(params.get("gpus"), default=0),
+            resource=params.get("resource"),
             solver=params.get("solver"),
             job_name=str(params.get("name") or ""),
         )
         return encode_dry_run(report)
+
+    async def _job_series(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Read a job's log and return what its adapter found worth plotting.
+
+        Off the event loop: parsing tens of megabytes of residuals is real work, and the
+        scheduler must not stop while somebody looks at a chart. This is also why the
+        method exists at all rather than the interface parsing the file itself -- the
+        parser belongs to the adapter, and the interface is not allowed to know adapters
+        exist (§3).
+        """
+        job = self._repo.get(self._resolve(params))
+        data = await asyncio.to_thread(
+            extract_series, job, registry=self._registry, config=self._config.plot
+        )
+        return {
+            "id": job.id,
+            "name": job.name,
+            "solver": job.solver,
+            "path": str(job.output_path) if job.output_path else None,
+            **encode_plot_data(data),
+        }
+
+    async def _projects_search(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Find project directories by name under the configured root.
+
+        Daemon-side for the same reason ``fs.list`` is: the results carry the "this looks
+        like a case" marks, and those come from the real adapters. Off the event loop
+        because a cold projects tree is a few thousand ``getdents`` calls.
+        """
+        query = str(params.get("query") or "").strip()
+        limit = _as_int(params.get("limit"), default=self._config.projects.limit)
+        result = await asyncio.to_thread(
+            search_projects, self._config.projects, query, limit=max(1, limit)
+        )
+
+        detect = bool(params.get("detect", True))
+        entries: list[dict[str, Any]] = []
+        for hit in result.hits:
+            encoded = encode_project_hit(hit)
+            detection = None
+            if detect:
+                # Only for the results actually being shown: detection is cheap per
+                # directory and ruinous across a whole tree.
+                with contextlib.suppress(Exception):
+                    detection = self._registry.best_detection(hit.path)
+            encoded["case"] = detection.solver if detection else None
+            encoded["label"] = detection.label if detection else None
+            entries.append(encoded)
+
+        return {
+            "root": str(result.root),
+            "query": result.query,
+            "results": entries,
+            "scanned": result.scanned,
+            "truncated": result.truncated,
+            "error": result.error,
+        }
 
     def _fs_list(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
         """List subdirectories, marking those that look like cases.
@@ -623,6 +712,20 @@ def _as_int(value: Any, *, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_optional_int(value: Any) -> int | None:
+    """Distinguish "the user said zero" from "the user did not say".
+
+    ``--gpus 0`` is a statement that this is CPU work; omitting the flag entirely leaves
+    the question to ``--resource``, and the two must not collapse into the same value.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _purge(directory: Path) -> None:

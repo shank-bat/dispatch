@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
 
-from dispatch.adapters import mpi
+from dispatch.adapters import gpuenv, mpi
 from dispatch.adapters.base import BaseAdapter, CaseContext, Progress
 from dispatch.core.metadata import (
     CaseMetadata,
@@ -53,6 +53,8 @@ class SU2Adapter(BaseAdapter):
     name: ClassVar[str] = "su2"
     display_name: ClassVar[str] = "SU2"
     adapter_version: ClassVar[int] = 1
+    log_name: ClassVar[str] = "log.su2"
+    """The solver's output log, in the case directory."""
 
     metadata_spec: ClassVar[MetadataSpec] = MetadataSpec(
         ref=SpecRef(adapter="su2", version=1),
@@ -186,7 +188,7 @@ class SU2Adapter(BaseAdapter):
         """One command. SU2 partitions internally, so there is nothing to prepare."""
         config = self._config(ctx)
         name = config.name if config else "config.cfg"
-        env = dict(ctx.env)
+        env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
 
         if ctx.cores > 1:
             argv = mpi.launch_argv(ctx.cores, "SU2_CFD", name)

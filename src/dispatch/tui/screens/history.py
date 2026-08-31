@@ -25,7 +25,7 @@ from dispatch.tui.widgets.jobtable import JobTable
 
 __all__ = ["HistoryScreen"]
 
-EXAMPLES = "tag:paper   solver:openfoam   state:failed   cores>=16   endTime>500   after:7d"
+EXAMPLES = "tag:paper   solver:openfoam   resource:gpu   cores>=16   endTime>500   after:7d"
 
 
 class HistoryScreen(DispatchScreen):
@@ -37,6 +37,7 @@ class HistoryScreen(DispatchScreen):
     BINDINGS = [
         Binding("slash", "focus_search", "search"),
         Binding("enter", "open", "logs"),
+        Binding("p", "plot", "plot"),
         Binding("t", "edit_tags", "tags"),
         Binding("n", "add_note", "note"),
         Binding("delete,d", "delete", "delete"),
@@ -157,6 +158,12 @@ class HistoryScreen(DispatchScreen):
         job = self._selected()
         if job is not None:
             self.dispatch_app.open_logs(job["id"])
+
+    def action_plot(self) -> None:
+        """Plot a finished run's residuals, months after it finished."""
+        job = self._selected()
+        if job is not None:
+            self.dispatch_app.open_plot(job["id"])
 
     def action_delete(self) -> None:
         job = self._selected()

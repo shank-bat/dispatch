@@ -32,6 +32,7 @@ class MySolverAdapter(BaseAdapter):
 
     name: ClassVar[str] = "mysolver"
     display_name: ClassVar[str] = "MySolver"
+    log_name: ClassVar[str] = "log.mysolver"
 
     @classmethod
     def detect(cls, path: Path) -> Detection | None:
@@ -72,6 +73,31 @@ Register it in `dispatch/adapters/registry.py`, or ship it as a package:
 [project.entry-points."dispatch.adapters"]
 mysolver = "dispatch_mysolver:MySolverAdapter"
 ```
+
+## Naming the log
+
+`log_name` is the file your solver's output goes into, **inside the case directory**:
+
+```
+~/projects/cavity/
+├── system/
+├── constant/
+└── log.foam        <- written by the kernel, straight from the solver
+```
+
+Follow the convention your solver's users already have — it has to be recognisable to somebody
+browsing the case who has never heard of Dispatch. `log.foam`, `log.su2`, `log.calculix`.
+
+Three things worth knowing:
+
+* **stdout and stderr both go there**, appended to one file, in order. That is what a user
+  produces by hand with `> log.foam 2>&1`, and it is what they read.
+* **The daemon opens it, not you.** You supply a string; the executor handles rotation, the
+  fallback when the case directory is unwritable, and the file descriptors.
+* **A second run rotates the first aside** to `log.foam.1`, and the earlier job's history follows
+  it. You do not have to make the name unique, and you should not try.
+
+Omit `log_name` and you get `log.job`. Adapters written before this existed keep working.
 
 ## Confidence
 
@@ -182,12 +208,107 @@ against the PATH the job will actually have.
 | Method | Why |
 |---|---|
 | `parse_progress(tail, ctx)` | Extract the current step from the log's last 8 KB. Returning `None` is fine — the interface shows elapsed time instead. |
+| `parse_series(text, ctx)` | Numerical series a user can plot, read from the job's output. See below. |
 | `stop_gracefully(ctx)` | A solver-native clean stop. OpenFOAM writes `stopAt writeNow;` so a cancelled run leaves a usable result rather than a truncated one. Return `False` for the signal ladder. |
 | `finalize(ctx)` | Undo case edits that steered *this* run. Pair it with `stop_gracefully` — see below. |
 | `explain_failure(tail, ctx)` | Turn the end of a failed job's output into the sentence a user actually wants. The default reads the last meaningful lines and is decent; override it if your solver has a recognisable error format. |
 | `solver_version(ctx)` | Recorded in every job's provenance. Cached per daemon lifetime. |
 | `suggest_tags(ctx)` | Offered at submission, never applied silently. |
 | `env_keys` | Environment variables worth recording verbatim in provenance. Everything else is reduced to a hash. |
+
+## Exposing plottable data
+
+`p` on a job asks the daemon for its numbers, and the daemon asks you. Return the series your
+log actually contains:
+
+```python
+from dispatch.core.series import PlotData, series_from_records
+
+def parse_series(self, text: str, ctx: CaseContext) -> PlotData:
+    records: list[dict[str, float]] = []
+    for line in text.splitlines():
+        if match := STEP_LINE.match(line):
+            records.append({"iteration": float(match["n"]), "residual": float(match["r"])})
+    return PlotData(
+        series=series_from_records(records, axes=["iteration"]),
+        samples=len(records),
+    )
+```
+
+`series_from_records` takes the shape every log parser naturally produces — one mapping per step,
+holding whatever that step printed — and turns it into columns, recording for each value *which
+step it came from*. That last part matters: a quantity printed on every step and one printed
+sporadically have different lengths, and the interface pairs them by sample index rather than
+zipping them, so a gap never plots one quantity against the wrong other one.
+
+Four rules:
+
+* **Emit only what appeared.** A 2-D case has no `Uz`, so it must produce no `residual(Uz)` — not
+  an empty one, and not one full of zeros. `PlotData.get` returning `None` is how "this log does
+  not have that" is expressed.
+* **Mark the axis-ish series.** `axes=[...]` flags quantities that increase monotonically —
+  iteration, time, wall-clock. It only orders the selector; the user may put anything on either
+  axis, and `execution_time` vs `iteration` is a plot people genuinely want.
+* **Never raise.** A log is the least trustworthy text in the system: truncated mid-line by a
+  kill, interleaved by `mpirun`, full of `nan` from a diverging run. Each of those must produce a
+  shorter series, never an exception. Drop non-finite values — they poison every axis calculation
+  downstream, and the divergence stays visible in the points before them.
+* **Return `PlotData()` when you have nothing.** It is a first-class answer, and the interface
+  says so rather than drawing an empty chart.
+
+You are handed the log's text, or its last `plot.max_log_bytes` when it is very large. This runs
+only when a user presses `p`, never on a timer, and **nothing about a job's state depends on what
+you return** — a misparsed line costs a wrong point on a chart and can never make a completed run
+look failed.
+
+`adapters/foamlog.py` is the reference implementation.
+
+## GPUs
+
+`ctx.gpus` is how many GPUs the scheduler reserved for this job. A count, not device indices.
+
+Use `adapters/gpuenv.py` rather than setting `CUDA_VISIBLE_DEVICES` yourself:
+
+```python
+env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
+```
+
+For a job granted no GPUs this sets every visibility variable empty, so CPU work cannot wander
+onto a device another job is using — which is what makes the ledger's promise true of the process
+too. For a job granted GPUs it passes the inherited environment through untouched. Every built-in
+adapter calls it, CFD ones included; the rule is machine-wide, not a property of the ML adapters.
+
+That module is the only place in Dispatch that knows how to hide a device, exactly as
+`config.installed_gpus()` is the only place that knows how to count one. Supporting another
+runtime means adding a variable name there, not editing an adapter.
+
+## Python projects: the `dispatch.toml` convention
+
+If your workload is "run this Python program", the `ml` and `pinn` adapters may already cover it,
+and both read an explicit declaration from the project directory:
+
+```toml
+# dispatch.toml
+[job]
+adapter    = "pinn"          # which adapter owns this directory
+entrypoint = "train.py"      # or a module, with module = true
+args       = ["--config", "configs/burgers.yaml"]
+venv       = ".venv"         # its bin/python wins over `python`
+python     = "python3.12"    # fallback interpreter
+framework  = "deepxde"       # recorded as metadata, suggested as a tag
+module     = false
+```
+
+Detection sees it at confidence 0.95 and every other adapter stays quiet: the user has already
+answered the question. Without it, `ml` needs `train.py` *and* a dependency manifest, and `pinn`
+needs an actual PINN library in the project's imports or requirements. Neither claims a directory
+on the strength of `pyproject.toml`, `main.py`, or `import torch`, and neither guesses from
+directory names.
+
+If you write an adapter for another declarative Python workload, reuse
+`pyjob.PythonJobAdapter`: you inherit entrypoint resolution, interpreter discovery, the
+one-command plan, GPU visibility, and training-curve parsing, and you write `detect` and a
+`log_name`.
 
 ## Rules
 
@@ -210,6 +331,9 @@ against the PATH the job will actually have.
   task that may already be cancelling.
 * **`finalize()` is not for cleaning up results.** A cancelled run's output belongs to the
   user. Deleting any of it is not your adapter's decision.
+* **Do not set `CUDA_VISIBLE_DEVICES` by hand.** Use `adapters/gpuenv.py`, for the same reason as
+  `mpi.py` below: it is a scheduler concern rather than a solver one, and every adapter would
+  otherwise get it wrong in the same way.
 * **Do not build `mpirun` argv by hand.** Use `adapters/mpi.py`. It reconciles the rank
   count with the launcher's slot count, which is not a solver concern and which every
   adapter would otherwise get wrong in the same way (§8.7 of ARCHITECTURE.md).

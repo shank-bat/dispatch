@@ -34,6 +34,7 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("k / up", "previous row"),
             ("g / G", "first / last row"),
             ("enter", "open the job's logs"),
+            ("p", "plot available job data"),
             ("escape", "go back"),
         ],
     ),
@@ -58,10 +59,12 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "Submitting",
         [
+            ("/", "search ~/projects by name"),
             ("enter", "open a directory"),
             ("backspace", "go up"),
             ("p", "type a path"),
             ("c", "set cores"),
+            ("g", "set GPUs"),
             ("t", "set tags"),
             ("a", "run after another job"),
             ("d", "preview the plan"),
@@ -73,11 +76,24 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "Log viewer",
         [
-            ("e", "stdout / stderr"),
+            ("e", "output / preparation steps"),
             ("/", "search the buffer"),
             ("n / N", "next / previous match"),
             ("G", "follow new output"),
             ("w", "toggle line wrapping"),
+            ("p", "plot this job's data"),
+        ],
+    ),
+    (
+        "Plots",
+        [
+            ("tab", "switch between the x and y lists"),
+            ("j / k", "choose a series"),
+            ("space", "overlay another y series"),
+            ("l", "linear / logarithmic y axis"),
+            ("m", "braille / block marks"),
+            ("r", "re-read the log"),
+            ("esc", "back"),
         ],
     ),
 ]
@@ -88,7 +104,9 @@ tag:paper  -tag:scratch  has, or lacks, a tag
 solver:openfoam          the adapter that ran it
 app:interFoam            the specific application
 state:failed             job state
-cores>=16  runtime>2h    numeric comparisons, with units
+resource:gpu             CPU or GPU work
+cores>=16  gpus>=1       numeric comparisons on what it asked for
+runtime>2h               and on what it used, with units
 endTime>500              any metadata field the adapter declared
 after:7d  before:2026-06 date ranges, absolute or relative
 dirty:true               launched from a repository with uncommitted changes

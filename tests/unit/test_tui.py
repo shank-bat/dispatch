@@ -384,7 +384,7 @@ async def test_the_screens_can_all_be_reached(offline_config: Config) -> None:
 
 @pytest.mark.parametrize(
     "screen_name",
-    ["DashboardScreen", "QueueScreen", "HistoryScreen", "HelpScreen", "LogScreen"],
+    ["DashboardScreen", "QueueScreen", "HistoryScreen", "HelpScreen", "LogScreen", "PlotScreen"],
 )
 async def test_every_screen_mounts_its_children(offline_config: Config, screen_name: str) -> None:
     """A screen that composes but never mounts renders as a blank page.
@@ -399,6 +399,7 @@ async def test_every_screen_mounts_its_children(offline_config: Config, screen_n
     from dispatch.tui.screens.help import HelpScreen
     from dispatch.tui.screens.history import HistoryScreen
     from dispatch.tui.screens.logs import LogScreen
+    from dispatch.tui.screens.plot import PlotScreen
     from dispatch.tui.screens.queue import QueueScreen
 
     lookup = {
@@ -407,6 +408,7 @@ async def test_every_screen_mounts_its_children(offline_config: Config, screen_n
         "HistoryScreen": lambda: HistoryScreen(),
         "HelpScreen": lambda: HelpScreen(),
         "LogScreen": lambda: LogScreen("some-job-id"),
+        "PlotScreen": lambda: PlotScreen("some-job-id"),
     }
     del screens
 
@@ -536,3 +538,131 @@ async def test_no_widget_shadows_a_textual_internal() -> None:
                         offenders.append(f"{module.name} sets self.{target.attr}")
 
     assert not offenders, "Attributes shadowing Textual internals:\n  " + "\n  ".join(offenders)
+
+
+# -- the new surface ---------------------------------------------------------------------
+
+
+def test_the_job_table_shows_what_kind_of_work_a_job_is() -> None:
+    """"Is the GPU busy" and "are the cores busy" are different questions."""
+    from dispatch.tui.widgets.jobtable import resource_text
+
+    assert resource_text({"resource_kind": "cpu", "cores": 20, "gpus": 0}).plain == "CPU 20c"
+    assert resource_text({"resource_kind": "gpu", "cores": 1, "gpus": 1}).plain == "GPU 1G"
+    assert resource_text({"resource_kind": "gpu", "cores": 4, "gpus": 2}).plain == "GPU 2G·4c"
+
+
+def test_a_job_from_before_the_resource_column_still_renders() -> None:
+    """History written by an older Dispatch has neither field."""
+    from dispatch.tui.widgets.jobtable import resource_text
+
+    assert resource_text({"cores": 8}).plain == "CPU 8c"
+
+
+def rendered(widget) -> str:
+    """A widget's rendered text, as plain characters."""
+    from rich.text import Text
+
+    output = widget.render()
+    assert isinstance(output, Text)
+    return output.plain
+
+
+def test_the_meters_show_gpus_only_on_a_machine_that_has_them() -> None:
+    """A permanent "gpu 0/0" on most workstations is a column reporting an absence."""
+    from dispatch.tui.widgets.meters import ResourceMeters
+
+    meters = ResourceMeters()
+    meters.snapshot = {
+        "total_cores": 8, "allocated_cores": 0, "free_cores": 8, "cpu_percent": 5.0,
+        "used_ram_mb": 4000, "total_ram_mb": 32000, "load_average": [0.1],
+        "total_gpus": 0, "allocated_gpus": 0, "free_gpus": 0,
+    }
+    assert "gpu" not in rendered(meters)
+
+    meters.snapshot = {**meters.snapshot, "total_gpus": 2, "allocated_gpus": 1, "free_gpus": 1}
+    assert "gpu" in rendered(meters)
+
+
+async def test_the_plot_screen_opens_offline_without_crashing(offline_config: Config) -> None:
+    """`p` must not be able to take the interface down when the daemon is unreachable."""
+    from dispatch.tui.app import DispatchApp
+    from dispatch.tui.screens.plot import PlotScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(PlotScreen("nobody"))
+        await pilot.pause()
+        assert app.is_running
+        assert isinstance(app.screen, PlotScreen)
+        assert app.screen.error is not None
+
+
+async def test_the_project_search_modal_mounts(offline_config: Config) -> None:
+    from dispatch.tui.app import DispatchApp
+    from dispatch.tui.screens.projects import ProjectSearchScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ProjectSearchScreen())
+        await pilot.pause()
+        assert app.is_running
+        assert app.screen.query("#project-query"), "the search box did not mount"
+
+
+def test_a_plot_selection_defaults_to_something_worth_looking_at() -> None:
+    """Opening the screen should show a chart, not an empty pair of lists."""
+    from dispatch.core.series import PlotData, Series
+    from dispatch.tui.screens.plot import PlotScreen
+
+    screen = PlotScreen("job")
+    screen.data = PlotData(
+        series=(
+            Series("iteration", "Iteration", (1.0, 2.0), (0, 1), axis=True),
+            Series("residual(Ux)", "residual(Ux)", (0.1, 0.01), (0, 1)),
+        ),
+        samples=2,
+    )
+    screen._choose_defaults()
+
+    assert screen._x_key == "iteration"
+    assert screen._y_keys == ["residual(Ux)"]
+    assert screen._style.log_y is False, "two points spanning one decade do not need a log axis"
+
+
+def test_a_plot_of_residuals_defaults_to_a_log_axis() -> None:
+    """Four decades on a linear axis collapse onto the bottom row."""
+    from dispatch.core.series import PlotData, Series
+    from dispatch.tui.screens.plot import PlotScreen
+
+    values = tuple(10.0**-exponent for exponent in range(1, 6))
+    screen = PlotScreen("job")
+    screen.data = PlotData(
+        series=(
+            Series("iteration", "Iteration", tuple(float(i) for i in range(5)), tuple(range(5)),
+                   axis=True),
+            Series("residual(p)", "residual(p)", values, tuple(range(5))),
+        ),
+        samples=5,
+    )
+    screen._choose_defaults()
+    assert screen._style.log_y is True
+
+
+def test_decoding_skips_a_series_it_cannot_understand() -> None:
+    """The interface renders data written by other versions; one bad entry is not fatal."""
+    from dispatch.tui.screens.plot import _decode
+
+    data = _decode(
+        {
+            "series": [
+                {"key": "good", "label": "good", "values": [1.0], "samples": [0]},
+                {"key": "bad", "label": "bad", "values": ["not-a-number"], "samples": [0]},
+                {"key": "short", "label": "short"},
+            ],
+            "samples": 1,
+        }
+    )
+    assert [item.key for item in data.series] == ["good"]

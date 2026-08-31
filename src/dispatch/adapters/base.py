@@ -26,10 +26,12 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 from dispatch.core.metadata import EMPTY_SPEC, CaseMetadata, MetadataSpec
 from dispatch.core.models import Detection
 from dispatch.core.plan import ExecutionPlan
+from dispatch.core.series import PlotData
 from dispatch.core.validation import ValidationReport
 
 __all__ = [
     "ADAPTER_API_VERSION",
+    "DEFAULT_LOG_NAME",
     "BaseAdapter",
     "CaseContext",
     "Progress",
@@ -38,6 +40,15 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+DEFAULT_LOG_NAME = "log.job"
+"""What an adapter's output log is called when the adapter does not say.
+
+The name of a job's log is a solver convention -- ``log.foam`` beside a ``system/``
+directory is instantly recognisable to somebody who has never heard of Dispatch -- so the
+adapter chooses it and the executor merely opens it. That is also what keeps the daemon
+free of solver names: grep it for ``foam`` and there is nothing to find (§1.1).
+"""
 
 ADAPTER_API_VERSION = 1
 """The adapter contract version.
@@ -49,7 +60,10 @@ Covers the method set below and the meaning of :class:`CaseContext`,
 :class:`~dispatch.core.metadata.CaseMetadata`.
 
 Additive changes -- a new optional method with a default -- do not bump it. Removing
-anything, or changing what it means, does. An adapter declaring a different version is
+anything, or changing what it means, does. ``log_name``, :meth:`SolverAdapter.parse_series`
+and :attr:`CaseContext.gpus` were all added this way: an adapter written against the
+original version keeps working, with a generic log name, no plottable series, and a GPU
+count it does not read. An adapter declaring a different version is
 refused at registration with a message naming both, while the daemon starts normally with
 the remaining adapters: one stale third-party plugin must not take three months of queued
 work down with it.
@@ -84,6 +98,14 @@ class CaseContext:
     settings: Mapping[str, Any] = field(default_factory=dict)
     job_name: str = ""
     metadata: CaseMetadata | None = None
+    gpus: int = 0
+    """GPUs the scheduler has reserved for this job. Zero for CPU work.
+
+    A count, not a set of device indices. Handing out specific devices is deliberately
+    deferred (§13.24); what an adapter does with this is decide whether to ask its
+    framework for a GPU at all -- and, for CPU work, to say so explicitly rather than
+    letting a library help itself to whatever it finds.
+    """
 
     def path(self, *parts: str) -> Path:
         """A path inside the case directory."""
@@ -92,6 +114,11 @@ class CaseContext:
     def exists(self, *parts: str) -> bool:
         """Whether a path inside the case directory exists."""
         return self.path(*parts).exists()
+
+    @property
+    def uses_gpu(self) -> bool:
+        """Whether the scheduler reserved any GPU for this job."""
+        return self.gpus > 0
 
     def which(self, program: str) -> str | None:
         """Locate ``program`` on the PATH this job will actually use.
@@ -143,6 +170,7 @@ class SolverAdapter(Protocol):
     adapter_version: ClassVar[int]
     metadata_spec: ClassVar[MetadataSpec]
     env_keys: ClassVar[Sequence[str]]
+    log_name: ClassVar[str]
 
     @classmethod
     def detect(cls, path: Path) -> Detection | None:
@@ -175,6 +203,10 @@ class SolverAdapter(Protocol):
 
     def parse_progress(self, tail: str, ctx: CaseContext) -> Progress | None:
         """Read progress out of the last chunk of a job's log."""
+        ...
+
+    def parse_series(self, text: str, ctx: CaseContext) -> PlotData:
+        """Extract plottable numerical series from a job's output."""
         ...
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
@@ -257,6 +289,13 @@ class BaseAdapter(ABC):
     adapter_version: ClassVar[int] = 1
     metadata_spec: ClassVar[MetadataSpec] = EMPTY_SPEC
     env_keys: ClassVar[Sequence[str]] = ()
+    log_name: ClassVar[str] = DEFAULT_LOG_NAME
+    """Filename for this solver's output log inside the case directory.
+
+    Follow the convention the solver's own users already have: ``log.foam``,
+    ``log.su2``. It has to be recognisable to somebody browsing the directory who has
+    never heard of Dispatch.
+    """
 
     def __init__(self, settings: Mapping[str, Any] | None = None) -> None:
         """Args:
@@ -304,6 +343,28 @@ class BaseAdapter(ABC):
     def parse_progress(self, tail: str, ctx: CaseContext) -> Progress | None:
         """Read progress from a log tail. Defaults to none, which is a valid answer."""
         return None
+
+    def parse_series(self, text: str, ctx: CaseContext) -> PlotData:
+        """Extract plottable numerical series from a job's output.
+
+        Called with the job's log -- the whole of it, or its end when it is very large --
+        only when a user asks to plot the job. Never on the hot path, never by the
+        scheduler, and never automatically: nothing about a run's *state* depends on what
+        this returns, so a parser that misreads a line cannot make a completed job look
+        failed.
+
+        Defaults to nothing, which is a valid and common answer: the interface then says
+        this job has no plottable data rather than inventing some.
+
+        Args:
+            text: The job's output, or its last portion.
+            ctx: The case, for anything the log does not say -- a target end time, say.
+
+        Returns:
+            The series this log actually contains. Emit only quantities that appeared:
+            a log with no ``Uy`` residual must not offer an empty ``residual(Uy)``.
+        """
+        return PlotData()
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
         """Attempt a clean solver-native stop.

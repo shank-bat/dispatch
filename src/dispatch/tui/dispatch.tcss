@@ -355,11 +355,79 @@ HelpScreen #help-body {
     scrollbar-size-vertical: 1;
 }
 
+/* ------------------------------------------------------------------ plot */
+
+/* Series lists on the left, chart on the right, with the same vertical rule the submit
+ * screen uses to separate a chooser from what it is choosing. The lists are narrow and
+ * fixed: series names are short, and the chart wants every column it can get. */
+PlotScreen #plot-panes {
+    height: 1fr;
+    margin-top: 1;
+}
+
+PlotScreen #plot-axes {
+    width: 32;
+    height: 1fr;
+    background: $background;
+}
+
+PlotScreen #plot-canvas {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 1;
+    border-left: solid $border;
+    background: $background;
+}
+
+/* Bounded so a log with thirty series scrolls its list rather than squeezing the chart
+ * out of the screen. */
+PlotScreen #x-list,
+PlotScreen #y-list {
+    height: 1fr;
+    max-height: 14;
+    background: $background;
+}
+
+PlotScreen #plot-status {
+    height: 1;
+    padding: 0 2;
+    background: $surface;
+    color: $text-muted;
+}
+
 /* ------------------------------------------------------------------ modals */
 
-ConfirmScreen, RunAfterScreen {
+ConfirmScreen, RunAfterScreen, ProjectSearchScreen {
     align: center middle;
     background: $background 60%;
+}
+
+/* Wider than the confirmation dialogs: these rows are file paths, and truncating the part
+ * that distinguishes two results would defeat the search. */
+ProjectSearchScreen #project-search {
+    width: 76;
+    height: auto;
+    max-height: 24;
+    padding: 1 3;
+    background: $surface-lighten-1;
+    border: round $border;
+}
+
+ProjectSearchScreen ListView {
+    height: auto;
+    max-height: 14;
+    margin-top: 1;
+    background: $surface-lighten-1;
+}
+
+ProjectSearchScreen ListItem {
+    background: $surface-lighten-1;
+}
+
+ProjectSearchScreen #project-status {
+    height: 1;
+    margin-top: 1;
+    color: $text-disabled;
 }
 
 /* Elevated surface and a thin border, the way a VS Code dialog reads: floating above the

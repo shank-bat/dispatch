@@ -30,6 +30,7 @@ from dispatch.tui.screens.dashboard import DashboardScreen
 from dispatch.tui.screens.help import HelpScreen
 from dispatch.tui.screens.history import HistoryScreen
 from dispatch.tui.screens.logs import LogScreen
+from dispatch.tui.screens.plot import PlotScreen
 from dispatch.tui.screens.queue import QueueScreen
 from dispatch.tui.screens.submit import SubmitScreen
 from dispatch.tui.state import AppState
@@ -220,6 +221,14 @@ class DispatchApp(App[None]):
     def open_logs(self, job_id: str) -> None:
         """Open the live log viewer for a job."""
         self.push_screen(LogScreen(job_id))
+
+    def open_plot(self, job_id: str) -> None:
+        """Open the plot view for a job.
+
+        On the app rather than on each screen because ``p`` means the same thing from the
+        dashboard, the queue, and the history, and three copies of one push would drift.
+        """
+        self.push_screen(PlotScreen(job_id))
 
     # -- actions --------------------------------------------------------------------------------
 

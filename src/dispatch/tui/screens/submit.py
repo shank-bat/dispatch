@@ -25,6 +25,7 @@ from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from dispatch.ipc.protocol import Method
 from dispatch.tui.screens.base import DispatchScreen
+from dispatch.tui.screens.projects import ProjectSearchScreen
 from dispatch.tui.theme import Palette, severity_style
 
 __all__ = ["SubmitScreen"]
@@ -42,7 +43,9 @@ class SubmitScreen(DispatchScreen):
         Binding("d", "dry_run", "plan"),
         Binding("s", "submit", "submit"),
         Binding("f", "force_submit", "force"),
+        Binding("slash", "find_project", "find"),
         Binding("c", "edit_cores", "cores"),
+        Binding("g", "edit_gpus", "gpus"),
         Binding("t", "edit_tags", "tags"),
         Binding("a", "run_after", "run after"),
         Binding("p", "edit_path", "go to path"),
@@ -54,6 +57,9 @@ class SubmitScreen(DispatchScreen):
         self.path = (start or Path.home()).expanduser().resolve()
         self.entries: list[dict[str, Any]] = []
         self.cores = 1
+        self.gpus = 0
+        """GPUs to request. Zero means CPU work, which is what almost every job is."""
+
         self.tags: list[str] = []
         self.run_after: dict[str, Any] | None = None
         """The job this one should wait for. ``None`` -- the default -- means none."""
@@ -119,7 +125,7 @@ class SubmitScreen(DispatchScreen):
             return
         try:
             self._inspection = await self.dispatch_app.call(
-                Method.CASE_VALIDATE, path=str(self.path), cores=self.cores
+                Method.CASE_VALIDATE, path=str(self.path), cores=self.cores, gpus=self.gpus
             )
         except Exception as exc:
             self._inspection = {"error": str(exc)}
@@ -140,7 +146,11 @@ class SubmitScreen(DispatchScreen):
             text.append(
                 "Browse into a directory containing a case.\n\n", style=Palette.FAINT
             )
-            text.append(_keyline(("enter", "open"), ("backspace", "up"), ("p", "path")))
+            text.append(
+                _keyline(
+                    ("enter", "open"), ("backspace", "up"), ("/", "find"), ("p", "path")
+                )
+            )
             self.query_one("#detail-text", Static).update(text)
             return
 
@@ -162,6 +172,16 @@ class SubmitScreen(DispatchScreen):
             str(self.cores),
             note=f"{free} free" if free is not None else "",
         )
+        total_gpus = int(self.app_state.snapshot.get("total_gpus", 0) or 0)
+        if self.gpus or total_gpus:
+            free_gpus = self.app_state.snapshot.get("free_gpus")
+            _row(
+                text,
+                "gpus",
+                str(self.gpus),
+                note=f"{free_gpus} free" if free_gpus is not None else "",
+                style=Palette.ACCENT if self.gpus else Palette.MUTED,
+            )
         if self.tags:
             _row(text, "tags", " ".join(self.tags))
         # Always shown, including its default, so that "this job starts when it fits" is
@@ -203,12 +223,17 @@ class SubmitScreen(DispatchScreen):
         if validation["passed"]:
             text.append(
                 _keyline(
-                    ("s", "submit"), ("d", "plan"), ("c", "cores"), ("t", "tags"), ("a", "after")
+                    ("s", "submit"),
+                    ("d", "plan"),
+                    ("c", "cores"),
+                    ("g", "gpus"),
+                    ("t", "tags"),
+                    ("a", "after"),
                 )
             )
         else:
             text.append(
-                _keyline(("f", "submit anyway"), ("d", "plan"), ("c", "cores"))
+                _keyline(("f", "submit anyway"), ("d", "plan"), ("c", "cores"), ("g", "gpus"))
             )
 
         self.query_one("#detail-text", Static).update(text)
@@ -264,6 +289,21 @@ class SubmitScreen(DispatchScreen):
     def action_edit_cores(self) -> None:
         self._open_prompt("cores", f"cores (currently {self.cores}): ")
 
+    def action_edit_gpus(self) -> None:
+        """Ask for GPUs. Setting a non-zero count is what makes this a GPU job."""
+        self._open_prompt("gpus", f"gpus (currently {self.gpus}): ")
+
+    def action_find_project(self) -> None:
+        """Search for a case by name instead of browsing to it."""
+
+        def _chosen(path: str | None) -> None:
+            if path is None:
+                return
+            self.path = Path(path)
+            self.app.call_later(self.load)
+
+        self.app.push_screen(ProjectSearchScreen(), _chosen)
+
     def action_edit_tags(self) -> None:
         self._open_prompt("tags", "tags, space separated: ")
 
@@ -310,6 +350,13 @@ class SubmitScreen(DispatchScreen):
                 self.notify_error(f"{value!r} is not a number")
                 return
             await self.inspect(self._inspection.get("solver") if self._inspection else None)
+        elif self._prompt_mode == "gpus" and value:
+            try:
+                self.gpus = max(0, int(value))
+            except ValueError:
+                self.notify_error(f"{value!r} is not a number")
+                return
+            await self.inspect(self._inspection.get("solver") if self._inspection else None)
         elif self._prompt_mode == "tags":
             self.tags = value.split()
             self._render_detail()
@@ -330,7 +377,7 @@ class SubmitScreen(DispatchScreen):
             return
         try:
             report = await self.dispatch_app.call(
-                Method.CASE_DRYRUN, workdir=str(self.path), cores=self.cores
+                Method.CASE_DRYRUN, workdir=str(self.path), cores=self.cores, gpus=self.gpus
             )
         except Exception as exc:
             self.notify_error(str(exc))
@@ -356,6 +403,7 @@ class SubmitScreen(DispatchScreen):
                 Method.JOB_SUBMIT,
                 workdir=str(self.path),
                 cores=self.cores,
+                gpus=self.gpus,
                 tags=self.tags,
                 force=force,
                 depends_on_job_id=self.run_after["id"] if self.run_after else None,
@@ -458,7 +506,11 @@ class PlanScreen(DispatchScreen):
                 note=f"confidence {best['confidence']:.2f}",
                 width=12,
             )
-        _row(text, "cores", str(report["cores"]), width=12)
+        _row(text, "resources", str(report.get("resources") or report["cores"]), width=12)
+        if report.get("log_path"):
+            # Where the output will appear, said before anything is submitted: the whole
+            # point of the working-directory log is that it can be found without asking.
+            _row(text, "log", str(report["log_path"]), width=12)
 
         validation = report["validation"]
         _row(
