@@ -21,7 +21,7 @@ Needs Python 3.13 and Linux. On a fresh Debian 13 machine:
 
 ```sh
 sudo apt install python3.13 python3.13-venv   # or: uv python install 3.13
-git clone <repo> dispatch && cd dispatch
+git clone https://github.com/shank-bat/dispatch dispatch && cd dispatch
 
 uv sync                      # create the environment from uv.lock
 uv pip install -e .          # install `dispatch` and `dispatchd`
