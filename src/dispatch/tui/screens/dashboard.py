@@ -18,6 +18,7 @@ from textual.containers import Vertical
 from textual.widgets import Static
 
 from dispatch.tui.screens.base import DispatchScreen
+from dispatch.tui.state import sweep_summary
 from dispatch.tui.theme import Palette
 from dispatch.tui.widgets.jobtable import JobTable
 from dispatch.tui.widgets.meters import ResourceMeters
@@ -45,6 +46,7 @@ class DashboardScreen(DispatchScreen):
             yield Static(_section("active"), classes="section")
             yield JobTable(id="running")
             yield Static("", id="next-up")
+            yield Static("", id="sweeps")
             yield Static(_section("recent"), classes="section")
             yield JobTable(id="recent", show_progress=False)
         yield from self.compose_footer()
@@ -65,6 +67,7 @@ class DashboardScreen(DispatchScreen):
         self.query_one("#running", JobTable).show(state.running, state.progress)
         self.query_one("#recent", JobTable).show(state.finished[:8])
         self.query_one("#next-up", Static).update(self._next_up())
+        self.query_one("#sweeps", Static).update(self._sweeps())
         self.update_status()
 
     def _selected(self) -> str | None:
@@ -89,6 +92,32 @@ class DashboardScreen(DispatchScreen):
         job_id = self._selected()
         if job_id:
             self.dispatch_app.open_plot(job_id)
+
+    def _sweeps(self) -> Text:
+        """A line per active sweep, or nothing at all when none are running.
+
+        The dashboard's job is what the machine is doing right now, and a sweep running two
+        of eight cases is a fact about the machine that the rows alone do not convey: the
+        row marker says a job belongs to a sweep, this says why the other six are not
+        moving.
+        """
+        state = self.app_state
+        unfinished = {
+            job.get("sweep_id")
+            for job in state.jobs.values()
+            if job.get("sweep_id")
+            and job["state"] in ("QUEUED", "HELD", "PREPARING", "RUNNING")
+        }
+        active = [sweep for sweep in state.sweeps.values() if sweep["id"] in unfinished]
+        if not active:
+            return Text("")
+
+        text = Text()
+        for index, sweep in enumerate(active):
+            if index:
+                text.append("\n")
+            text.append(sweep_summary(state, sweep), style=Palette.ACCENT)
+        return text
 
     def _next_up(self) -> Text:
         """One line describing what runs next, and why it has not started."""

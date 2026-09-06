@@ -14,6 +14,7 @@ losing the plugin.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
@@ -24,7 +25,35 @@ from dispatch.adapters.base import ADAPTER_API_VERSION, CaseContext, SolverAdapt
 from dispatch.core.errors import AdapterError
 from dispatch.core.models import Detection
 
-__all__ = ["AdapterRegistry", "RejectedAdapter", "build_default_registry"]
+
+@dataclass(frozen=True, slots=True)
+class SweepDetection:
+    """A directory of same-solver cases, offered as one sweep."""
+
+    root: Path
+    solver: str
+    cases: Sequence[Path]
+    """The case directories, in the order they will be queued."""
+
+    @property
+    def count(self) -> int:
+        """How many cases the sweep contains."""
+        return len(self.cases)
+
+
+def _natural_key(path: Path) -> tuple[Any, ...]:
+    """Sort ``case_2`` before ``case_10`` while staying deterministic everywhere else.
+
+    Digit runs compare numerically and everything else compares as lowercased text, so the
+    ordering the user sees in their file manager is the ordering the sweep runs in. Purely
+    lexical sorting would put ``case_10`` second, which is not wrong so much as certain to
+    be read as a bug the first time a sweep has ten members.
+    """
+    parts = re.split(r"(\d+)", path.name)
+    return tuple((1, int(p)) if p.isdigit() else (0, p.lower()) for p in parts)
+
+
+__all__ = ["AdapterRegistry", "RejectedAdapter", "SweepDetection", "build_default_registry"]
 
 log = logging.getLogger(__name__)
 
@@ -185,6 +214,58 @@ class AdapterRegistry:
         if detections[0].confidence - detections[1].confidence >= margin:
             return detections[0]
         return None
+
+    def detect_sweep(self, path: Path, *, minimum: int = 2) -> SweepDetection | None:
+        """Recognise a directory whose children are all cases of the same solver.
+
+        Deliberately conservative, because the cost of the two mistakes is not symmetric:
+        failing to spot a sweep leaves the user submitting cases one at a time, which is
+        merely what they did before, while calling an ordinary project directory a sweep
+        queues a pile of jobs nobody asked for. Every condition below therefore has to
+        hold:
+
+        * ``path`` is not itself a case. A case containing cases is a case; submitting the
+          parent as a sweep would run the children instead of the thing the user pointed at.
+        * At least ``minimum`` immediate subdirectories are recognised cases.
+        * They all detect as the **same** adapter. A folder of mixed solvers is a project,
+          not a sweep.
+        * Every visible subdirectory is one of them. One unrecognised directory means this
+          is a working directory that happens to contain cases -- ``mesh/``, ``scripts/``,
+          ``results/`` -- and guessing wrong there submits somebody's archive.
+
+        Each child is identified with :meth:`best_detection`, so a directory that two
+        adapters both claim counts as unrecognised rather than being assigned a solver on a
+        coin toss.
+
+        Returns:
+            The detection, with cases in sorted order, or ``None`` if this is not a sweep.
+        """
+        if self.best_detection(path) is not None:
+            return None
+        try:
+            children = sorted(
+                (child for child in path.iterdir() if child.is_dir()),
+                key=_natural_key,
+            )
+        except OSError:
+            return None
+
+        visible = [child for child in children if not child.name.startswith(".")]
+        if len(visible) < minimum:
+            return None
+
+        cases: list[Path] = []
+        solvers: set[str] = set()
+        for child in visible:
+            detection = self.best_detection(child)
+            if detection is None:
+                return None  # a non-case sibling: this is a project directory, not a sweep
+            cases.append(child)
+            solvers.add(detection.solver)
+
+        if len(solvers) != 1:
+            return None
+        return SweepDetection(root=path, solver=solvers.pop(), cases=tuple(cases))
 
     def context(
         self,

@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["AppState"]
+__all__ = ["AppState", "sweep_summary"]
 
 ACTIVE_STATES = ("QUEUED", "HELD", "PREPARING", "RUNNING")
 TERMINAL_STATES = ("COMPLETED", "FAILED", "CANCELLED", "REJECTED", "UNKNOWN")
@@ -30,6 +30,13 @@ class AppState:
     snapshot: dict[str, Any] = field(default_factory=dict)
     jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     progress: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sweeps: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Sweeps by id, as the daemon last reported them.
+
+    Keyed by id and refreshed wholesale rather than event-driven: a sweep's configuration
+    never changes after submission, and its live counts are re-derived from the jobs
+    already cached here.
+    """
     error: str | None = None
 
     def replace_jobs(self, jobs: Sequence[dict[str, Any]]) -> None:
@@ -94,6 +101,27 @@ class AppState:
         """One job by id."""
         return self.jobs.get(job_id)
 
+    def replace_sweeps(self, sweeps: Sequence[dict[str, Any]]) -> None:
+        """Replace the sweep cache. Used when the queue view opens or the queue changes."""
+        self.sweeps = {sweep["id"]: sweep for sweep in sweeps}
+
+    def sweep_for(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        """The sweep a job belongs to, if any."""
+        sweep_id = job.get("sweep_id")
+        return self.sweeps.get(sweep_id) if sweep_id else None
+
+    def sweep_running(self, sweep_id: str) -> int:
+        """How many of a sweep's members are running, counted from the cached jobs.
+
+        Derived rather than read from the sweep record so the number tracks the job events
+        the interface is already receiving, instead of going stale between refreshes.
+        """
+        return sum(
+            1
+            for job in self.jobs.values()
+            if job.get("sweep_id") == sweep_id and job["state"] in ("PREPARING", "RUNNING")
+        )
+
     def progress_for(self, job_id: str) -> dict[str, Any] | None:
         """The latest progress sample for a job, if any."""
         return self.progress.get(job_id)
@@ -114,4 +142,20 @@ def _queue_order(job: dict[str, Any]) -> tuple[int, int, int]:
         position if position is not None else 10**6,
         -int(job.get("priority", 0)),
         int(job.get("seq", 0)),
+    )
+
+
+def sweep_summary(state: AppState, sweep: dict[str, Any]) -> str:
+    """One line describing a sweep's progress and the limit it is running under.
+
+    Both numbers, always. The progress alone leaves the reader wondering why only two of
+    eight are moving; the cap alone does not say how far along it is. Shared by the queue
+    and the dashboard so the two cannot word it differently.
+    """
+    running = state.sweep_running(sweep["id"])
+    done = int(sweep.get("finished", 0))
+    total = int(sweep.get("total", 0))
+    return (
+        f"sweep {sweep['name']}  {running} running, {done}/{total} done"
+        f"  (max {sweep['concurrency']})"
     )

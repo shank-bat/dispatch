@@ -27,6 +27,14 @@ from dispatch.version import __version__
 __all__ = ["main"]
 
 
+MAX_SWEEP_LINES = 10
+"""How many sweep members to list back on submission.
+
+A sweep is routinely forty cases; printing all of them buries the sweep id and the
+concurrency setting, which are the two things the user actually needs from this output.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dispatch",
@@ -67,6 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--after",
         metavar="ID",
         help="run only once this job has completed (id, or a unique prefix of one)",
+    )
+    submit.add_argument(
+        "--sweep",
+        action="store_true",
+        help="submit a directory of same-solver cases as one sweep",
+    )
+    submit.add_argument(
+        "--concurrent",
+        type=int,
+        default=1,
+        metavar="N",
+        help="sweep only: how many of its jobs may run at once (default 1)",
     )
     submit.add_argument("--note", help="a note to attach")
     submit.add_argument(
@@ -240,6 +260,9 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
         _print_dry_run(console, report)
         return 0 if report["would_submit"] else 1
 
+    if args.sweep:
+        return await _submit_sweep(client, args, console, path)
+
     result = await client.call(
         Method.JOB_SUBMIT,
         workdir=str(path),
@@ -266,6 +289,40 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
     if job.get("log_path"):
         # The single most useful line of the output: where to look while it runs.
         console.print(f"  log {job['log_path']}")
+    return 0
+
+
+async def _submit_sweep(client: DaemonClient, args: Any, console: Any, path: Path) -> int:
+    """Queue a directory of same-solver cases as one sweep.
+
+    Every case becomes an ordinary job asking for ``--cores`` cores; the sweep only limits
+    how many of them run at once. Printing that limit back is the point of the summary --
+    it is the setting most likely to be mistyped, and the one whose effect is otherwise
+    invisible until the queue does not do what was expected.
+    """
+    result = await client.call(
+        Method.SWEEP_SUBMIT,
+        root=str(path),
+        cores_per_job=args.cores,
+        concurrency=args.concurrent,
+        gpus=args.gpus,
+        resource=args.resource,
+        ram_mb=args.ram,
+        name=args.name or "",
+        priority=args.priority,
+        tags=args.tag,
+    )
+    sweep = result["sweep"]
+    jobs = result["jobs"]
+    console.print(
+        f"[green]Queued sweep[/green] {sweep['name']} ({sweep['solver']}, {len(jobs)} cases, "
+        f"{sweep['cores_per_job']} cores each, {sweep['concurrency']} at a time)"
+    )
+    console.print(f"  id {sweep['id']}")
+    for job in jobs[:MAX_SWEEP_LINES]:
+        console.print(f"  [dim]{job['sweep_position'] + 1:>3}[/dim] {job['name']}")
+    if len(jobs) > MAX_SWEEP_LINES:
+        console.print(f"  [dim]... and {len(jobs) - MAX_SWEEP_LINES} more[/dim]")
     return 0
 
 

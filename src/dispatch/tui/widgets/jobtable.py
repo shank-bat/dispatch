@@ -22,6 +22,9 @@ from dispatch.tui.theme import Palette, state_style
 
 __all__ = ["JobTable", "format_duration", "resource_text", "state_text"]
 
+NAME_WIDTH = 26
+"""The job column's width, shared by the plain and sweep-marked renderings."""
+
 PROGRESS_WIDTH = 10
 PROGRESS_FULL = "━"
 PROGRESS_EMPTY = "─"
@@ -94,7 +97,7 @@ class JobTable(DataTable[Any]):
         position = job.get("queue_position")
         cells: list[Any] = [
             Text(str(position) if position else "", style=Palette.FAINT),
-            Text(_ellipsise(job["name"], 26), style=Palette.TEXT),
+            _name_text(job),
             state_text(job["state"]),
             resource_text(job),
             Text(
@@ -112,6 +115,28 @@ class JobTable(DataTable[Any]):
             ]
         )
         return cells
+
+
+def _name_text(job: dict[str, Any]) -> Text:
+    """The job's name, marked when it belongs to a sweep.
+
+    A sweep's members are ordinary jobs sitting among unrelated ones, and nothing else in
+    the row says they were submitted together. The marker is a position rather than a
+    badge, because the position is the part that is not otherwise recoverable: which of the
+    sweep's cases this is, and therefore where it sits in the order they will run.
+
+    Kept inside the existing name column on purpose. A dedicated sweep column would be
+    empty for almost every row on a machine that mostly runs single jobs.
+    """
+    position = job.get("sweep_position")
+    if position is None:
+        return Text(_ellipsise(job["name"], NAME_WIDTH), style=Palette.TEXT)
+
+    marker = f" ·{int(position) + 1}"
+    text = Text()
+    text.append(_ellipsise(job["name"], NAME_WIDTH - len(marker)), style=Palette.TEXT)
+    text.append(marker, style=Palette.ACCENT)
+    return text
 
 
 def resource_text(job: dict[str, Any]) -> Text:

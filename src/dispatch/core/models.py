@@ -35,6 +35,8 @@ __all__ = [
     "ResourceKind",
     "ResourceRequest",
     "Sample",
+    "Sweep",
+    "SweepSpec",
     "SystemSnapshot",
     "new_job_id",
 ]
@@ -215,6 +217,12 @@ class JobSpec:
     """Run only after this job has completed. ``None`` -- the default -- means the job is
     scheduled as soon as it fits, which is how every job behaves unless asked otherwise."""
 
+    sweep_id: str | None = None
+    """The sweep this case belongs to. ``None`` for an ordinary standalone submission."""
+
+    sweep_position: int | None = None
+    """Index within the sweep, from zero. ``None`` when the job is not part of one."""
+
     def __post_init__(self) -> None:
         if not self.solver:
             raise ValidationError("A job spec must name a solver")
@@ -297,6 +305,40 @@ class Job:
     ``None`` for every job that did not ask, which is the default and the overwhelming
     majority: such a job is scheduled purely on resources, exactly as before this field
     existed.
+    """
+
+    sweep_id: str | None = None
+    """The sweep this job belongs to, if any (§6.12).
+
+    ``None`` for every ordinary job, which is what makes sweeps additive: the scheduler's
+    sweep rule reads this field, finds nothing, and leaves such a job exactly as
+    opportunistic as it has always been.
+    """
+
+    sweep_position: int | None = None
+    """This job's index within its sweep, from zero, in the order the cases were found.
+
+    Stored rather than derived so the sweep's order is a fact about the submission and not
+    a re-reading of a directory that may have changed since. Queue order still comes from
+    ``seq``; this is what lets the interface say "case 3 of 40" and mean it.
+    """
+
+    boot_time: float | None = None
+    """Which boot of this machine the job started on, as the kernel's ``btime`` (§6.7).
+
+    Recorded when the job starts and compared against the machine's current boot identity
+    at the next daemon startup. That comparison -- boot against boot, from one source -- is
+    what distinguishes a reboot from a daemon restart without assuming anything about
+    clocks. ``None`` for jobs that never started, and on machines that cannot report it.
+    """
+
+    resume_requested: bool = False
+    """Whether this job must restart from the simulation's own last saved state (§6.7).
+
+    Set only by reboot recovery, and cleared once the job starts. The flag says *that* a
+    resume is wanted; **where** to resume from is never stored here -- it is read from the
+    case by the adapter at plan time, because the simulation's files are the only honest
+    authority on what it actually finished writing.
     """
 
     # -- convenience -----------------------------------------------------------------
@@ -473,3 +515,70 @@ class Page[T]:
     def has_more(self) -> bool:
         """Whether further pages exist after this one."""
         return self.offset + len(self.items) < self.total
+
+
+@dataclass(frozen=True, slots=True)
+class SweepSpec:
+    """A request to submit a directory of cases as one sweep, before it exists."""
+
+    root: Path
+    solver: str
+    cases: Sequence[Path]
+    cores_per_job: int
+    concurrency: int
+    name: str = ""
+    sweep_id: str = field(default_factory=new_job_id)
+    """Generated up front so member specs can name the sweep before it is inserted."""
+
+    def __post_init__(self) -> None:
+        if not self.cases:
+            raise ValidationError("A sweep must contain at least one case")
+        if self.cores_per_job < 1:
+            raise ValidationError(
+                f"A sweep needs at least one core per job, got {self.cores_per_job}"
+            )
+        if self.concurrency < 1:
+            raise ValidationError(
+                f"A sweep must be allowed to run at least one job at a time, got "
+                f"{self.concurrency}"
+            )
+        object.__setattr__(self, "root", Path(self.root).expanduser())
+        if not self.name:
+            object.__setattr__(self, "name", self.root.name or str(self.root))
+
+
+@dataclass(frozen=True, slots=True)
+class Sweep:
+    """A group of independent cases submitted together, scheduled under one limit.
+
+    A sweep is emphatically **not** a job. Every case in it is an ordinary job holding its
+    own ordinary allocation, and the sweep contributes exactly one extra scheduling rule:
+    no more than :attr:`concurrency` of its members may run at once. Modelling it as one
+    large job would reserve ``cores_per_job * concurrency`` cores as a block, which is both
+    a lie to the ledger and the opposite of what the setting is for -- the whole point is
+    that the cores a sweep is *not* using stay available to unrelated work.
+
+    See ``docs/ARCHITECTURE.md`` §6.12.
+    """
+
+    id: str
+    name: str
+    root: Path
+    solver: str
+    cores_per_job: int
+    concurrency: int
+    """Hard cap on simultaneously running members. Free cores never override it."""
+
+    created_at: float
+    total: int = 0
+    """How many cases were submitted as part of this sweep."""
+
+    running: int = 0
+    """How many members are currently PREPARING or RUNNING. Derived, not stored."""
+
+    finished: int = 0
+    """How many members have reached a terminal state. Derived, not stored."""
+
+    def describe(self) -> str:
+        """A short progress line for the queue view, e.g. ``2/8 running``."""
+        return f"{self.running}/{self.total} running"

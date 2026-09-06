@@ -25,7 +25,7 @@ from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.config import Config
 from dispatch.core.errors import DispatchError, ValidationError
 from dispatch.core.metadata import CaseMetadata
-from dispatch.core.models import JobSpec, ResourceRequest
+from dispatch.core.models import JobSpec, ResourceRequest, SweepSpec
 from dispatch.core.query import parse_query
 from dispatch.core.states import JobState
 from dispatch.daemon.dryrun import CaseInspector
@@ -57,6 +57,7 @@ from dispatch.ipc.protocol import (
     encode_report,
     encode_sample,
     encode_snapshot,
+    encode_sweep,
 )
 from dispatch.ipc.socketpath import start_unix_server
 from dispatch.version import __version__
@@ -269,6 +270,8 @@ class IpcServer:
             Method.DAEMON_SHUTDOWN: self._daemon_shutdown,
             Method.SYSTEM_SNAPSHOT: self._system_snapshot,
             Method.JOB_SUBMIT: self._job_submit,
+            Method.SWEEP_SUBMIT: self._sweep_submit,
+            Method.SWEEP_LIST: self._sweep_list,
             Method.JOB_LIST: self._job_list,
             Method.JOB_GET: self._job_get,
             Method.JOB_CANCEL: self._job_cancel,
@@ -633,6 +636,117 @@ class IpcServer:
             "error": result.error,
         }
 
+    def _sweep_submit(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
+        """Queue a directory of same-solver cases as one sweep.
+
+        The cases are re-detected here rather than taken from the client, so a sweep is
+        always built from what the daemon can currently see on disk -- the same rule that
+        makes ``fs.list`` authoritative about what is a case.
+
+        Every member is an ordinary job. The sweep contributes the per-job core count and
+        the concurrency cap, and nothing else: no member is special, none of them is a
+        parent, and each is admitted, supervised, cancelled and recorded exactly like a
+        job submitted on its own.
+        """
+        root = Path(str(params.get("root") or params.get("workdir") or "")).expanduser()
+        cores = _as_int(params.get("cores_per_job"), default=1)
+        concurrency = _as_int(params.get("concurrency"), default=1)
+
+        detection = self._registry.detect_sweep(root)
+        if detection is None:
+            raise ValidationError(
+                f"{root} is not a sweep folder: a sweep is a directory whose "
+                "subdirectories are all cases of the same solver."
+            )
+
+        request = ResourceRequest.build(
+            cores=cores,
+            ram_mb=_as_optional_int(params.get("ram_mb")),
+            gpus=_as_optional_int(params.get("gpus")),
+            resource=params.get("resource"),
+        )
+        # Refused now rather than queued forever, exactly as a single oversized job is.
+        # For a sweep this matters more, not less: without it a mistyped core count queues
+        # forty jobs that can never start instead of one.
+        if (
+            request.cores > self._resources.schedulable_cores
+            or request.gpus > self._resources.schedulable_gpus
+        ):
+            raise ValidationError(
+                f"Each job in this sweep asks for {request.describe()}, which it can never "
+                f"get on this machine ({self._resources.schedulable_cores} cores "
+                f"schedulable)."
+            )
+
+        spec = SweepSpec(
+            root=root,
+            solver=detection.solver,
+            cases=detection.cases,
+            cores_per_job=request.cores,
+            concurrency=concurrency,
+            name=str(params.get("name") or ""),
+        )
+
+        members: list[JobSpec] = []
+        for position, case in enumerate(spec.cases):
+            result = self._inspector.inspect(
+                case,
+                cores=request.cores,
+                ram_mb=request.ram_mb,
+                gpus=request.gpus,
+                solver=detection.solver,
+                build_plan=False,
+            )
+            metadata = result.metadata or CaseMetadata.empty(detection.solver)
+            if result.detection is not None and result.detection.entry is not None:
+                metadata = CaseMetadata(
+                    spec=metadata.spec,
+                    case=metadata.case,
+                    extra={**metadata.extra, "entry": str(result.detection.entry)},
+                )
+            members.append(
+                JobSpec(
+                    workdir=case,
+                    solver=detection.solver,
+                    solver_binary=(
+                        result.detection.solver_binary if result.detection is not None else None
+                    ),
+                    resources=request,
+                    name=case.name,
+                    priority=_as_int(params.get("priority"), default=0),
+                    tags=frozenset(params.get("tags") or ()),
+                    metadata=metadata,
+                    sweep_id=spec.sweep_id,
+                    sweep_position=position,
+                )
+            )
+
+        sweep, jobs = self._repo.create_sweep(spec, members)
+        jobs = [
+            assign_log_paths(self._repo, self._config, job, DEFAULT_LOG_NAME) for job in jobs
+        ]
+
+        for job in jobs:
+            self._bus.publish(Event.JOB_STATE, encode_job(job))
+        self._scheduler.nudge()
+        log.info(
+            "Queued sweep %s (%s, %d cases, %d cores each, %d at a time)",
+            sweep.id[:8],
+            sweep.name,
+            len(jobs),
+            sweep.cores_per_job,
+            sweep.concurrency,
+        )
+        positions = self._repo.queue_positions()
+        return {
+            "sweep": encode_sweep(sweep),
+            "jobs": [encode_job(job, queue_position=positions.get(job.id)) for job in jobs],
+        }
+
+    def _sweep_list(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
+        """Every sweep with its live member counts, for the queue view."""
+        return {"sweeps": [encode_sweep(sweep) for sweep in self._repo.sweeps()]}
+
     def _fs_list(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
         """List subdirectories, marking those that look like cases.
 
@@ -675,11 +789,24 @@ class IpcServer:
             )
 
         here = self._registry.best_detection(resolved) if detect else None
+        # Only asked when the directory is not itself a case, which is also the first thing
+        # detect_sweep checks. The answer rides along with the listing the browser already
+        # makes, so noticing a sweep costs the TUI no extra round trip.
+        sweep = self._registry.detect_sweep(resolved) if detect and here is None else None
         return {
             "path": str(resolved),
             "parent": str(resolved.parent) if resolved.parent != resolved else None,
             "entries": entries,
             "case": here.solver if here else None,
+            "sweep": (
+                {
+                    "solver": sweep.solver,
+                    "count": sweep.count,
+                    "cases": [c.name for c in sweep.cases],
+                }
+                if sweep is not None
+                else None
+            ),
         }
 
     # -- subscriptions -----------------------------------------------------------------------------

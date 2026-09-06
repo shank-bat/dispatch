@@ -26,6 +26,7 @@ from dispatch.core.models import (
     Page,
     ResourceKind,
     Sample,
+    Sweep,
     SystemSnapshot,
 )
 from dispatch.core.plan import DryRunReport, ExecutionPlan
@@ -42,6 +43,7 @@ __all__ = [
     "Topic",
     "encode_job",
     "encode_snapshot",
+    "encode_sweep",
 ]
 
 PROTOCOL_VERSION: Final = 1
@@ -80,6 +82,12 @@ class Method(StrEnum):
 
     TAGS_LIST = "tags.list"
     HISTORY_SEARCH = "history.search"
+
+    SWEEP_SUBMIT = "sweep.submit"
+    """Queue a directory of same-solver cases as one sweep (§6.12)."""
+
+    SWEEP_LIST = "sweep.list"
+    """List sweeps with their live member counts, for the queue view."""
 
     CASE_DETECT = "case.detect"
     CASE_VALIDATE = "case.validate"
@@ -204,6 +212,9 @@ def encode_job(job: Job, *, queue_position: int | None = None) -> dict[str, Any]
         "state": job.state.value,
         "queue_position": queue_position,
         "depends_on_job_id": job.depends_on_job_id,
+        "sweep_id": job.sweep_id,
+        "sweep_position": job.sweep_position,
+        "resume_requested": job.resume_requested,
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
@@ -420,4 +431,20 @@ def encode_metadata_spec(spec: MetadataSpec) -> dict[str, Any]:
             }
             for item in spec.ordered
         ],
+    }
+
+
+def encode_sweep(sweep: Sweep) -> dict[str, Any]:
+    """Render a sweep for the wire, including its live member counts."""
+    return {
+        "id": sweep.id,
+        "name": sweep.name,
+        "root": str(sweep.root),
+        "solver": sweep.solver,
+        "cores_per_job": sweep.cores_per_job,
+        "concurrency": sweep.concurrency,
+        "created_at": sweep.created_at,
+        "total": sweep.total,
+        "running": sweep.running,
+        "finished": sweep.finished,
     }

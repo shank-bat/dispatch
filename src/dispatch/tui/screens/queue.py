@@ -12,6 +12,7 @@ from textual.widgets import Static
 
 from dispatch.ipc.protocol import Method
 from dispatch.tui.screens.base import DispatchScreen, run_when_confirmed
+from dispatch.tui.state import sweep_summary
 from dispatch.tui.theme import Palette
 from dispatch.tui.widgets.jobtable import JobTable
 
@@ -70,7 +71,22 @@ class QueueScreen(DispatchScreen):
         if held:
             text.append("   ")
             text.append(f"{held} held", style=Palette.WARNING)
+
+        # One line per active sweep would be a dashboard; the count of them plus the one
+        # that is actually running is what makes the queue legible.
+        for sweep in self._active_sweeps():
+            text.append("   ")
+            text.append(sweep_summary(self.app_state, sweep), style=Palette.ACCENT)
         return text
+
+    def _active_sweeps(self) -> list[dict[str, Any]]:
+        """Sweeps with at least one member still to run, newest first."""
+        unfinished = {
+            job.get("sweep_id")
+            for job in self.app_state.jobs.values()
+            if job.get("sweep_id") and job["state"] in ("QUEUED", "HELD", "PREPARING", "RUNNING")
+        }
+        return [s for s in self.app_state.sweeps.values() if s["id"] in unfinished]
 
     def _explanation(self) -> Text:
         """Why the selected job is not running.
@@ -92,6 +108,15 @@ class QueueScreen(DispatchScreen):
             if parent is None or parent["state"] != "COMPLETED":
                 name = parent["name"] if parent else parent_id[:8]
                 return Text(f"waiting for {name}", style=Palette.WARNING)
+
+        sweep = self.app_state.sweep_for(job)
+        if sweep is not None:
+            running = self.app_state.sweep_running(sweep["id"])
+            if running >= sweep["concurrency"]:
+                return Text(
+                    f"waiting for its sweep ({running}/{sweep['concurrency']} running)",
+                    style=Palette.WARNING,
+                )
 
         free = int(self.app_state.snapshot.get("free_cores", 0))
         if job["cores"] > free:

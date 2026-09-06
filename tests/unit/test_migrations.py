@@ -239,3 +239,93 @@ def test_a_row_with_nonsensical_resources_still_loads() -> None:
     assert job.resource_kind is ResourceKind.CPU
     assert job.gpus == 0, "read as the CPU job it most likely was"
     conn.close()
+
+
+# -- sweeps and resume (005) ------------------------------------------------------------------
+
+
+def queued_legacy_job(
+    conn: sqlite3.Connection, job_id: str, *, name: str, cores: int, seq: int, after: str | None
+) -> None:
+    """A queued job as a v4 Dispatch would have written it, naming no v5 column."""
+    conn.execute(
+        """
+        INSERT INTO jobs (id, seq, name, workdir, solver, cores, priority, state,
+                          created_at, metadata, depends_on_job_id)
+        VALUES (?, ?, ?, ?, 'openfoam', ?, 0, 'QUEUED', ?, '{}', ?)
+        """,
+        (job_id, seq, name, f"/cases/{name}", cores, float(seq), after),
+    )
+    conn.commit()
+
+
+def test_the_sweeps_table_is_created(tmp_path: Path) -> None:
+    conn = at_version(tmp_path / "s.db", 4)
+    assert not _has_table(conn, "sweeps")
+
+    migrate(conn)
+    assert _has_table(conn, "sweeps")
+    conn.close()
+
+
+def test_queued_jobs_keep_their_order_and_cores_across_the_migration(tmp_path: Path) -> None:
+    """A pending queue is scheduling intent, and an upgrade must not restate it."""
+    conn = at_version(tmp_path / "q.db", 4)
+    queued_legacy_job(conn, "a", name="first", cores=7, seq=1, after=None)
+    queued_legacy_job(conn, "b", name="second", cores=3, seq=2, after=None)
+    queued_legacy_job(conn, "c", name="third", cores=5, seq=3, after=None)
+
+    migrate(conn)
+    repo = JobRepository(conn)
+
+    assert [job.name for job in repo.queued()] == ["first", "second", "third"]
+    assert [job.cores for job in repo.queued()] == [7, 3, 5]
+    conn.close()
+
+
+def test_an_existing_dependency_survives_the_migration(tmp_path: Path) -> None:
+    conn = at_version(tmp_path / "d.db", 4)
+    queued_legacy_job(conn, "parent", name="parent", cores=1, seq=1, after=None)
+    queued_legacy_job(conn, "child", name="child", cores=1, seq=2, after="parent")
+
+    migrate(conn)
+    repo = JobRepository(conn)
+
+    assert repo.get("child").depends_on_job_id == "parent"
+    conn.close()
+
+
+def test_migrated_jobs_belong_to_no_sweep_and_ask_for_no_resume(tmp_path: Path) -> None:
+    """The defaults that make both features additive for every row already on disk."""
+    conn = at_version(tmp_path / "n.db", 4)
+    legacy_job(conn, "old", name="cavity", cores=4)
+
+    migrate(conn)
+    job = JobRepository(conn).get("old")
+
+    assert job.sweep_id is None
+    assert job.sweep_position is None
+    assert job.resume_requested is False
+    assert job.boot_time is None
+    conn.close()
+
+
+def test_a_sweep_cannot_be_written_with_a_useless_concurrency(tmp_path: Path) -> None:
+    """A sweep allowed to run nothing would sit in the queue forever."""
+    conn = at_version(tmp_path / "c.db", SCHEMA_VERSION)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO sweeps (id, name, root, solver, cores_per_job, concurrency, created_at)
+            VALUES ('s', 's', '/cases', 'openfoam', 1, 0, 1.0)
+            """
+        )
+    conn.close()
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+    )

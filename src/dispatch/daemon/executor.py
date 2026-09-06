@@ -44,6 +44,7 @@ from dispatch.daemon.process import (
     describe_exit,
     is_alive,
     matches_start_time,
+    system_boot_time,
 )
 from dispatch.daemon.provenance import ProvenanceCollector
 from dispatch.daemon.resources import ResourceModel
@@ -182,6 +183,9 @@ class JobExecutor:
         ctx = self._build_context(job, adapter)
         entry.context = ctx
 
+        if job.resume_requested:
+            await self._record_resume_point(job, adapter, ctx)
+
         plan = await asyncio.to_thread(adapter.plan, ctx)
         if not isinstance(plan, ExecutionPlan):  # pragma: no cover - adapter contract
             raise AdapterError(f"Adapter {job.solver!r} did not return an execution plan")
@@ -260,7 +264,14 @@ class JobExecutor:
 
         entry.handle = handle
         self._repo.save_provenance(job.id, record)
-        self._repo.mark_started(job.id, pid=handle.pid, pid_start_time=handle.start_time)
+        # The boot identity is recorded with the process so that a later startup can tell
+        # a reboot from a daemon restart without guessing (§6.7).
+        self._repo.mark_started(
+            job.id,
+            pid=handle.pid,
+            pid_start_time=handle.start_time,
+            boot_time=system_boot_time(),
+        )
         self._publish(job.id)
         log.info("Job %s started: %s (pid %d)", job.id[:8], step.render(), handle.pid)
 
@@ -635,7 +646,38 @@ class JobExecutor:
             settings=base.settings,
             job_name=base.job_name,
             metadata=job.metadata,
+            resume=job.resume_requested,
         )
+
+    async def _record_resume_point(
+        self, job: Job, adapter: SolverAdapter, ctx: CaseContext
+    ) -> None:
+        """Note where a restarted job is actually picking up from, and clear the request.
+
+        The adapter reads the answer out of the case, so what lands in the audit trail is
+        what the simulation genuinely finished writing -- or an explicit statement that it
+        wrote nothing, which is the honest record for a run that died before its first
+        save. Dispatch never supplies a number of its own here.
+
+        The flag is cleared once the context carrying it has been built, so the restart
+        happens exactly once: a resume request that survived its own restart would ask for
+        another one every time the job was scheduled.
+        """
+        try:
+            point = await asyncio.to_thread(adapter.resume_point, ctx)
+        except Exception as exc:
+            log.warning("Adapter %s could not read a resume point: %s", job.solver, exc)
+            point = None
+
+        self._event(
+            job.id,
+            "state",
+            f"restarting from the last saved state ({point})"
+            if point
+            else "restarting from the beginning: the case has no saved state to resume from",
+        )
+        with contextlib.suppress(DispatchError):
+            self._repo.clear_resume_request(job.id)
 
     def _log_dir(self, job: Job) -> Path:
         directory = self._config.paths.job_dir(job.id)

@@ -822,3 +822,157 @@ def test_every_adapter_declares_a_metadata_spec() -> None:
         spec = adapter.metadata_spec
         assert spec.ref.adapter == adapter.name
         assert spec.fields, f"{adapter.name} declares no metadata fields"
+
+
+# -- sweep folders ---------------------------------------------------------------------------
+#
+# Detection has to be conservative: missing a sweep costs the user the convenience they had
+# before it existed, while inventing one queues a pile of jobs nobody asked for.
+
+
+def sweep_root(tmp_path: Path, *names: str) -> Path:
+    """A directory containing OpenFOAM cases under the given names."""
+    root = tmp_path / "sweep"
+    root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        foam_case(root / name, application="icoFoam")
+    return root
+
+
+def test_a_folder_of_same_solver_cases_is_a_sweep(tmp_path: Path) -> None:
+    registry = build_default_registry()
+    detection = registry.detect_sweep(sweep_root(tmp_path, "case_001", "case_002", "case_003"))
+
+    assert detection is not None
+    assert detection.solver == "openfoam"
+    assert detection.count == 3
+
+
+def test_sweep_cases_are_ordered_naturally(tmp_path: Path) -> None:
+    """``case_10`` sorts after ``case_9``, not between ``case_1`` and ``case_2``.
+
+    Purely lexical ordering is deterministic but reads as a bug the first time a sweep has
+    ten members, and the order cases run in is the order the user will compare results in.
+    """
+    root = sweep_root(tmp_path, "case_1", "case_2", "case_9", "case_10", "case_20")
+    detection = build_default_registry().detect_sweep(root)
+
+    assert detection is not None
+    assert [c.name for c in detection.cases] == [
+        "case_1",
+        "case_2",
+        "case_9",
+        "case_10",
+        "case_20",
+    ]
+
+
+def test_a_directory_that_is_itself_a_case_is_not_a_sweep(tmp_path: Path) -> None:
+    """A case containing cases is a case. Submitting the parent must run the parent."""
+    root = sweep_root(tmp_path, "case_001", "case_002")
+    foam_case(root, application="interFoam")  # make the parent a case too
+
+    assert build_default_registry().detect_sweep(root) is None
+
+
+def test_one_unrecognised_sibling_disqualifies_a_sweep(tmp_path: Path) -> None:
+    """The conservative rule that stops a project directory being submitted wholesale."""
+    root = sweep_root(tmp_path, "case_001", "case_002")
+    (root / "scripts").mkdir()
+
+    assert build_default_registry().detect_sweep(root) is None
+
+
+def test_a_mixed_solver_folder_is_not_a_sweep(tmp_path: Path) -> None:
+    """Two solvers is a project, not a sweep: there is no single cores-per-job to set."""
+    root = sweep_root(tmp_path, "case_001")
+    su2_case(root / "case_002")
+
+    assert build_default_registry().detect_sweep(root) is None
+
+
+def test_a_single_case_is_not_a_sweep(tmp_path: Path) -> None:
+    """A sweep of one is a job. Offering the sweep flow for it is noise."""
+    assert build_default_registry().detect_sweep(sweep_root(tmp_path, "only")) is None
+
+
+def test_an_empty_directory_is_not_a_sweep(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert build_default_registry().detect_sweep(empty) is None
+
+
+# -- resuming from a case's own saved state ----------------------------------------------------
+
+
+def test_a_case_that_has_written_nothing_has_no_resume_point(tmp_path: Path) -> None:
+    """A run interrupted before its first write resumes from the beginning, and says so."""
+    case = foam_case(tmp_path / "fresh", application="interFoam")
+    assert OpenFOAMAdapter({}).resume_point(ctx_for(case)) is None
+
+
+def test_the_resume_point_is_read_from_the_cases_written_times(tmp_path: Path) -> None:
+    """The restart point comes off the disk, never from anything Dispatch recorded."""
+    case = foam_case(tmp_path / "written", application="interFoam")
+    for time_dir in ("0.5", "7500", "250"):
+        (case / time_dir).mkdir()
+
+    assert OpenFOAMAdapter({}).resume_point(ctx_for(case)) == "t = 7500"
+
+
+def test_a_decomposed_case_resumes_from_its_processor_times(tmp_path: Path) -> None:
+    """A parallel run writes inside ``processorN``, which is where a real sweep job resumes."""
+    case = foam_case(tmp_path / "parallel", application="interFoam", processors=4)
+    (case / "processor0" / "1200").mkdir(parents=True)
+    (case / "processor1" / "1200").mkdir(parents=True)
+
+    assert OpenFOAMAdapter({}).resume_point(ctx_for(case)) == "t = 1200"
+
+
+def test_the_initial_condition_is_not_a_resume_point(tmp_path: Path) -> None:
+    """``0`` is where the case starts, so reporting it would claim preserved work."""
+    case = foam_case(tmp_path / "zero-only", application="interFoam")
+    (case / "0").mkdir(exist_ok=True)
+
+    assert OpenFOAMAdapter({}).resume_point(ctx_for(case)) is None
+
+
+def test_resuming_points_the_case_at_its_latest_time(tmp_path: Path) -> None:
+    """OpenFOAM's own restart mechanism, driven by the flag rather than reinvented."""
+    case = foam_case(tmp_path / "resume", application="interFoam")
+    (case / "300").mkdir()
+    control = case / "system" / "controlDict"
+    foamdict.set_value(control, "startFrom", "startTime")
+
+    adapter = OpenFOAMAdapter({})
+    adapter.plan(ctx_for(case, cores=1, resume=True))
+
+    assert foamdict.read_value(control, "startFrom") == "latestTime"
+
+
+def test_the_resume_edit_does_not_outlive_the_run(tmp_path: Path) -> None:
+    """A `startFrom` left behind would silently change where every later run begins."""
+    case = foam_case(tmp_path / "restored", application="interFoam")
+    (case / "300").mkdir()
+    control = case / "system" / "controlDict"
+    foamdict.set_value(control, "startFrom", "startTime")
+
+    adapter = OpenFOAMAdapter({})
+    ctx = ctx_for(case, cores=1, resume=True)
+    adapter.plan(ctx)
+    adapter.finalize(ctx)
+
+    assert foamdict.read_value(control, "startFrom") == "startTime"
+
+
+def test_an_ordinary_run_never_touches_start_from(tmp_path: Path) -> None:
+    """The whole mechanism is inert unless a resume was actually asked for."""
+    case = foam_case(tmp_path / "ordinary", application="interFoam")
+    control = case / "system" / "controlDict"
+    foamdict.set_value(control, "startFrom", "startTime")
+
+    adapter = OpenFOAMAdapter({})
+    adapter.plan(ctx_for(case, cores=1))
+
+    assert foamdict.read_value(control, "startFrom") == "startTime"
+    assert not (case / "system" / ".dispatch-startFrom").exists()

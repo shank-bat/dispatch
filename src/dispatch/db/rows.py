@@ -69,6 +69,10 @@ def job_from_row(row: sqlite3.Row, *, tags: frozenset[str] = frozenset()) -> Job
         pid=row["pid"],
         pid_start_time=row["pid_start_time"],
         depends_on_job_id=row["depends_on_job_id"],
+        sweep_id=_optional_column(row, "sweep_id"),
+        sweep_position=_optional_column(row, "sweep_position"),
+        resume_requested=bool(_optional_column(row, "resume_requested")),
+        boot_time=_optional_column(row, "boot_time"),
         tags=tags,
         metadata=_metadata(row["metadata"]),
         metrics=JobMetrics(
@@ -210,3 +214,18 @@ def _json_array(raw: str | None) -> list[Any]:
     except (TypeError, ValueError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _optional_column(row: sqlite3.Row, name: str) -> Any:
+    """Read a column that may not be present, returning ``None`` when it is not.
+
+    Reading is deliberately tolerant of the shape of the row it is handed: a projection
+    that selects a subset of columns, or a row assembled by a differently-versioned
+    Dispatch, must still render as a job rather than raising. Every column read this way is
+    additive and has a meaning when absent -- no sweep, no resume request -- which is
+    exactly what the pre-migration rows meant.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None

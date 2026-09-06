@@ -129,11 +129,16 @@ class DispatchApp(App[None]):
         try:
             snapshot = await self.client.call(Method.SYSTEM_SNAPSHOT)
             page = await self.client.call(Method.JOB_LIST, limit=500)
+            # Fetched here rather than by the screens that render sweeps, so the queue and
+            # the dashboard read the same cache, and so it refreshes on QUEUE_CHANGED --
+            # which is exactly when a sweep's counts move.
+            sweeps = await self.client.call(Method.SWEEP_LIST)
         except DispatchError as exc:
             self.state.error = str(exc)
             return
         self.state.snapshot = snapshot
         self.state.replace_jobs(page["items"])
+        self.state.replace_sweeps(sweeps.get("sweeps") or [])
         self.state.error = None
         self._refresh_screen()
 

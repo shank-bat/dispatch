@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from dispatch.core.config import Config, DaemonConfig, PathsConfig
+from dispatch.ipc.protocol import Method
+from dispatch.tui.app import DispatchApp
+from dispatch.tui.screens.submit import PlanScreen, SubmitScreen
 from dispatch.tui.state import AppState
 from dispatch.tui.tailer import AsyncTailer, read_last_lines
 from dispatch.tui.widgets.jobtable import format_duration, state_text, step_label
@@ -666,3 +670,324 @@ def test_decoding_skips_a_series_it_cannot_understand() -> None:
         }
     )
     assert [item.key for item in data.series] == ["good"]
+
+
+# -- submitting a folder of cases as a sweep -----------------------------------------------
+#
+# The submit screen is the only place a sweep can be configured, so these drive the real
+# screen rather than the helpers underneath it. What they check is that the screen routes
+# to the existing sweep endpoint with the settings the user chose -- not that it schedules
+# anything, which is the daemon's business and is tested there.
+
+
+def recording_app(config: Config, replies: dict[str, Any]) -> DispatchApp:
+    """A real DispatchApp whose daemon calls are recorded and answered from a script.
+
+    The recorder is attached to the instance rather than added by a subclass: Textual
+    resolves ``CSS_PATH`` relative to the module a class is *defined* in, so an App
+    subclass declared in a test file goes looking for a stylesheet beside the test.
+    """
+    app = DispatchApp(config=config, autostart=False)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _call(method: str, **params: Any) -> Any:
+        calls.append((method, params))
+        reply = replies.get(method)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    app.call = _call  # type: ignore[method-assign]
+    app.calls = calls  # type: ignore[attr-defined]
+    app.calls_to = lambda method: [  # type: ignore[attr-defined]
+        params for name, params in calls if name == method
+    ]
+    return app
+
+
+CAVITY_SWEEP = {
+    "solver": "openfoam",
+    "count": 5,
+    "cases": ["Re100", "Re200", "Re400", "Re800", "Re1600"],
+}
+
+
+def sweep_replies(**extra: Any) -> dict[str, Any]:
+    """Daemon answers for a directory the daemon has recognised as a sweep."""
+    replies: dict[str, Any] = {
+        Method.FS_LIST: {
+            "path": "/cases/cavity",
+            "parent": "/cases",
+            "entries": [],
+            "case": None,
+            "sweep": CAVITY_SWEEP,
+        },
+        Method.SWEEP_SUBMIT: {
+            "sweep": {
+                "id": "s1",
+                "name": "cavity",
+                "total": 5,
+                "cores_per_job": 3,
+                "concurrency": 2,
+            },
+            "jobs": [],
+        },
+    }
+    replies.update(extra)
+    return replies
+
+
+def dry_run_report(**extra: Any) -> dict[str, Any]:
+    """A dry-run report shaped like the daemon's, for driving the plan screen."""
+    report: dict[str, Any] = {
+        "workdir": "/cases/cavity/Re100",
+        "cores": 3,
+        "resources": "3 cores",
+        "detections": [],
+        "validation": {"summary": "ok", "passed": True, "findings": []},
+        "plan": None,
+        "suggested_tags": [],
+        "projection": None,
+        "log_path": None,
+    }
+    report.update(extra)
+    return report
+
+
+async def open_submit(app: DispatchApp, pilot: Any, path: Path) -> SubmitScreen:
+    """Push the submit screen and let its initial listing settle."""
+    screen = SubmitScreen(start=path)
+    await app.push_screen(screen)
+    for _ in range(20):
+        await pilot.pause()
+        if screen.sweep is not None or screen._inspection is not None:
+            break
+    return screen
+
+
+async def test_a_folder_of_cases_is_recognised_as_a_sweep_in_the_wizard(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """Step 2 of the flow: the browser learns it from the listing it already fetches."""
+    app = recording_app(offline_config, sweep_replies())
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        assert screen.sweep == CAVITY_SWEEP
+
+
+async def test_the_sweep_pane_shows_the_cases_in_execution_order(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """Step 3: the order is a property of the submission, so it is shown before committing."""
+    app = recording_app(offline_config, sweep_replies())
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        pane = str(screen._sweep_detail())
+
+    for position, name in enumerate(CAVITY_SWEEP["cases"], start=1):
+        assert f"{position:>3} {name}" in pane
+
+
+def test_the_sweep_pane_separates_every_label_from_its_value() -> None:
+    """``concurrent`` is exactly as wide as the default label column, and ran into it."""
+    from dispatch.tui.screens.submit import SWEEP_LABEL_WIDTH
+
+    assert len("concurrent") < SWEEP_LABEL_WIDTH
+
+
+async def test_reviewing_a_sweep_shows_every_case_and_the_cap(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """Step 5: the review lists the whole sweep, not the pane's preview of it."""
+    plan_report = dry_run_report()
+    app = recording_app(offline_config, sweep_replies(**{Method.CASE_DRYRUN: plan_report}))
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        screen.cores, screen.concurrency = 3, 2
+        await screen.action_dry_run()
+        await pilot.pause()
+
+        assert isinstance(app.screen, PlanScreen)
+        body = str(app.screen._body())
+
+    assert "a hard cap" in body
+    assert "at most 6 cores in use" in body
+    for name in CAVITY_SWEEP["cases"]:
+        assert name in body
+
+
+async def test_reviewing_a_sweep_asks_for_a_real_case_plan(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """The plan comes from the ordinary dry-run endpoint, so it cannot drift from reality."""
+    plan_report = dry_run_report()
+    app = recording_app(offline_config, sweep_replies(**{Method.CASE_DRYRUN: plan_report}))
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        screen.cores = 3
+        await screen.action_dry_run()
+        await pilot.pause()
+
+    dry_runs = app.calls_to(Method.CASE_DRYRUN)
+    assert len(dry_runs) == 1
+    assert dry_runs[0]["workdir"].endswith("Re100")  # the first case, standing in for all
+    assert dry_runs[0]["cores"] == 3
+
+
+async def test_submitting_a_sweep_uses_the_sweep_endpoint(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """Step 6: one call to the existing sweep path, carrying the settings the user chose."""
+    app = recording_app(offline_config, sweep_replies())
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        screen.cores, screen.concurrency, screen.gpus = 3, 2, 1
+        screen.tags = ["study"]
+        await screen.action_submit()
+        await pilot.pause()
+
+    submissions = app.calls_to(Method.SWEEP_SUBMIT)
+    assert len(submissions) == 1
+    assert submissions[0]["cores_per_job"] == 3
+    assert submissions[0]["concurrency"] == 2
+    assert submissions[0]["gpus"] == 1, "a GPU count set in the wizard must not be dropped"
+    assert submissions[0]["tags"] == ["study"]
+    assert app.calls_to(Method.JOB_SUBMIT) == []
+
+
+async def test_an_ordinary_case_still_submits_as_a_single_job(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """The path that must not change: a case directory is unaffected by any of this."""
+    replies = {
+        Method.FS_LIST: {
+            "path": "/cases/cavity",
+            "parent": "/cases",
+            "entries": [],
+            "case": "openfoam",
+            "sweep": None,
+        },
+        Method.CASE_VALIDATE: {
+            "solver": "openfoam",
+            "solver_binary": "icoFoam",
+            "validation": {"summary": "ok", "passed": True, "findings": []},
+            "case": {},
+        },
+        Method.JOB_SUBMIT: {"job": {"id": "j1", "name": "cavity", "cores": 4}},
+    }
+    app = recording_app(offline_config, replies)
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        assert screen.sweep is None
+        await screen.action_submit()
+        await pilot.pause()
+
+    assert len(app.calls_to(Method.JOB_SUBMIT)) == 1
+    assert app.calls_to(Method.SWEEP_SUBMIT) == []
+
+
+async def test_the_concurrency_key_does_not_shadow_row_navigation(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """``j`` is documented globally as "next row", so it cannot also mean "set the cap".
+
+    A vim-ish interface trains the reflex everywhere else; a screen where ``j`` opens a
+    prompt instead of moving the cursor is a trap rather than a shortcut.
+    """
+    from dispatch.tui.screens.submit import SubmitScreen as Screen
+
+    keys = {binding.key for binding in Screen.BINDINGS}
+    assert "j" not in keys
+    assert "m" in keys
+
+
+async def test_setting_concurrency_outside_a_sweep_is_refused(
+    offline_config: Config, tmp_path: Path
+) -> None:
+    """The key exists on every directory; it only means something on a sweep folder."""
+    replies = {
+        Method.FS_LIST: {
+            "path": "/x",
+            "parent": None,
+            "entries": [],
+            "case": None,
+            "sweep": None,
+        }
+    }
+    app = recording_app(offline_config, replies)
+    async with app.run_test() as pilot:
+        screen = await open_submit(app, pilot, tmp_path)
+        screen.action_edit_concurrency()
+        await pilot.pause()
+        assert screen.concurrency == 1
+
+
+# -- sweep membership in the queue and the dashboard -------------------------------------------
+
+
+def test_a_sweep_members_row_is_marked_with_its_position() -> None:
+    """Nothing else in the row says these jobs were submitted together."""
+    from dispatch.tui.widgets.jobtable import _name_text
+
+    member = job("a", name="Re400", state="RUNNING")
+    member["sweep_id"], member["sweep_position"] = "s1", 2
+
+    assert str(_name_text(member)) == "Re400 ·3"
+
+
+def test_an_ordinary_jobs_row_is_unchanged() -> None:
+    from dispatch.tui.widgets.jobtable import _name_text
+
+    assert str(_name_text(job("a", name="cavity"))) == "cavity"
+
+
+def test_the_sweep_summary_states_progress_and_the_cap() -> None:
+    """Progress alone reads as a stall; the cap alone does not say how far along it is."""
+    from dispatch.tui.state import sweep_summary
+
+    state = AppState()
+    state.replace_jobs(
+        [
+            {**job("a", state="RUNNING"), "sweep_id": "s1"},
+            {**job("b", state="RUNNING"), "sweep_id": "s1"},
+            {**job("c", state="QUEUED"), "sweep_id": "s1"},
+        ]
+    )
+    line = sweep_summary(
+        state, {"id": "s1", "name": "cavity", "total": 5, "finished": 2, "concurrency": 2}
+    )
+
+    assert line == "sweep cavity  2 running, 2/5 done  (max 2)"
+
+
+async def test_the_dashboard_shows_an_active_sweep(offline_config: Config) -> None:
+    """Step 7, on the screen that answers "what is the machine doing right now"."""
+    from dispatch.tui.screens.dashboard import DashboardScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        app.state.replace_jobs([{**job("a", state="RUNNING"), "sweep_id": "s1"}])
+        app.state.replace_sweeps(
+            [{"id": "s1", "name": "cavity", "total": 5, "finished": 0, "concurrency": 2}]
+        )
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        screen.refresh_view()
+        await pilot.pause()
+        assert "sweep cavity" in str(screen._sweeps())
+
+
+async def test_the_dashboard_says_nothing_when_no_sweep_is_active(
+    offline_config: Config,
+) -> None:
+    """A machine running ordinary jobs must not grow an empty sweep section."""
+    from dispatch.tui.screens.dashboard import DashboardScreen
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        app.state.replace_jobs([job("a", state="RUNNING")])
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        screen.refresh_view()
+        await pilot.pause()
+        assert str(screen._sweeps()) == ""

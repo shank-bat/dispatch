@@ -466,3 +466,140 @@ async def test_a_selected_project_can_be_submitted_directly(
     job = await submit(client, Path(chosen), cores=1)
     await await_state(client, job["id"], JobState.COMPLETED.value)
     assert (case / "log.fake").read_text().strip() == "running"
+
+
+# -- sweep folders, end to end ---------------------------------------------------------------
+
+
+def sweep_folder(root: Path, count: int, *, script: str = "exit 0") -> Path:
+    """A directory of identically-shaped cases, all detected as the same adapter."""
+    root.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        make_case(root / f"case_{index + 1:03d}", script=script)
+    return root
+
+
+async def test_a_folder_of_cases_is_offered_as_a_sweep(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """The browser learns about the sweep from the listing it already fetches."""
+    root = sweep_folder(tmp_path / "study", 4)
+    listing = await client.call(Method.FS_LIST, path=str(root.parent))
+
+    assert listing["sweep"] is None  # the parent holds one directory, not four cases
+
+    inside = await client.call(Method.FS_LIST, path=str(root))
+    assert inside["sweep"] is not None
+    assert inside["sweep"]["count"] == 4
+    assert inside["sweep"]["cases"] == [f"case_{i:03d}" for i in range(1, 5)]
+
+
+async def test_submitting_a_sweep_queues_every_case_in_order(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    root = sweep_folder(tmp_path / "aoa", 5, script="sleep 5")
+    result = await client.call(
+        Method.SWEEP_SUBMIT, root=str(root), cores_per_job=2, concurrency=2
+    )
+
+    assert result["sweep"]["total"] == 5
+    assert result["sweep"]["cores_per_job"] == 2
+    assert result["sweep"]["concurrency"] == 2
+    assert [job["name"] for job in result["jobs"]] == [
+        f"case_{i:03d}" for i in range(1, 6)
+    ]
+    assert [job["sweep_position"] for job in result["jobs"]] == [0, 1, 2, 3, 4]
+    assert all(job["cores"] == 2 for job in result["jobs"])
+
+
+async def test_a_sweep_runs_only_its_configured_number_at_once(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """The hard cap, through the real daemon rather than a hand-driven pass.
+
+    Eight cores are free and each case wants one, so a scheduler that treated the limit as
+    advice would start all five.
+    """
+    root = sweep_folder(tmp_path / "capped", 5, script="sleep 5")
+    await client.call(Method.SWEEP_SUBMIT, root=str(root), cores_per_job=1, concurrency=2)
+
+    await asyncio.sleep(1.0)
+    page = await client.call(Method.JOB_LIST, states=["RUNNING", "PREPARING"], limit=50)
+
+    assert len(page["items"]) == 2
+    assert {job["name"] for job in page["items"]} == {"case_001", "case_002"}
+
+
+async def test_a_normal_job_still_starts_beside_a_capped_sweep(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """The cores a sweep is not using stay available to unrelated work."""
+    root = sweep_folder(tmp_path / "sharing", 5, script="sleep 5")
+    await client.call(Method.SWEEP_SUBMIT, root=str(root), cores_per_job=1, concurrency=2)
+    other = await submit(client, make_case(tmp_path / "other", script="sleep 5"), cores=4)
+
+    await await_state(client, other["id"], "RUNNING")
+
+    page = await client.call(Method.JOB_LIST, states=["RUNNING", "PREPARING"], limit=50)
+    names = {job["name"] for job in page["items"]}
+    assert names == {"case_001", "case_002", "other"}
+
+
+async def test_the_next_case_starts_when_one_finishes(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    root = sweep_folder(tmp_path / "rolling", 4, script="exit 0")
+    result = await client.call(
+        Method.SWEEP_SUBMIT, root=str(root), cores_per_job=1, concurrency=2
+    )
+
+    for job in result["jobs"]:
+        await await_state(client, job["id"], "COMPLETED")
+
+    listed = await client.call(Method.SWEEP_LIST)
+    sweep = listed["sweeps"][0]
+    assert sweep["finished"] == 4
+    assert sweep["running"] == 0
+
+
+async def test_a_directory_that_is_not_a_sweep_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Conservative detection, enforced at the point of submission too."""
+    root = sweep_folder(tmp_path / "mixed", 2)
+    (root / "notes").mkdir()
+
+    with pytest.raises(RemoteError, match="not a sweep folder"):
+        await client.call(
+            Method.SWEEP_SUBMIT, root=str(root), cores_per_job=1, concurrency=1
+        )
+
+
+async def test_a_sweep_asking_for_impossible_cores_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Refused once, rather than queueing forty jobs that can never start."""
+    root = sweep_folder(tmp_path / "toobig", 3)
+
+    with pytest.raises(RemoteError, match="can never get"):
+        await client.call(
+            Method.SWEEP_SUBMIT, root=str(root), cores_per_job=999, concurrency=1
+        )
+
+
+async def test_a_sweep_and_its_order_survive_a_daemon_restart(
+    daemon, client: DaemonClient, tmp_path: Path
+) -> None:
+    """Reopening the database is enough: nothing about a sweep lives in memory."""
+    root = sweep_folder(tmp_path / "durable", 4, script="sleep 5")
+    result = await client.call(
+        Method.SWEEP_SUBMIT, root=str(root), cores_per_job=1, concurrency=2
+    )
+    sweep_id = result["sweep"]["id"]
+
+    restored = daemon.repo.get_sweep(sweep_id)
+    assert restored is not None
+    assert (restored.cores_per_job, restored.concurrency, restored.total) == (1, 2, 4)
+    assert [job.name for job in daemon.repo.sweep_members(sweep_id)] == [
+        f"case_{i:03d}" for i in range(1, 5)
+    ]

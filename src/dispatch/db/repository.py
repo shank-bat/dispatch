@@ -24,7 +24,17 @@ from typing import Any, Final
 from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.errors import IllegalTransition, JobNotFound, ValidationError
 from dispatch.core.metadata import CaseMetadata, MetadataSpec
-from dispatch.core.models import Job, JobEvent, JobSpec, Note, Page, Sample, new_job_id
+from dispatch.core.models import (
+    Job,
+    JobEvent,
+    JobSpec,
+    Note,
+    Page,
+    Sample,
+    Sweep,
+    SweepSpec,
+    new_job_id,
+)
 from dispatch.core.provenance import Provenance
 from dispatch.core.query import SearchQuery
 from dispatch.core.states import TERMINAL_STATES, ExitReason, JobState, can_transition
@@ -49,7 +59,8 @@ _JOB_COLUMNS: Final = """
     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb, priority,
     state, created_at, started_at, finished_at, exit_code, exit_reason, exit_signal,
     exit_detail, stdout_path, stderr_path, log_path, pid, pid_start_time, metadata,
-    runtime_s, peak_rss_mb, mean_cpu_pct, depends_on_job_id, resource_kind, gpus
+    runtime_s, peak_rss_mb, mean_cpu_pct, depends_on_job_id, resource_kind, gpus,
+    sweep_id, sweep_position, resume_requested, boot_time
 """
 
 # Columns a transition is permitted to set. An allowlist rather than "whatever the caller
@@ -68,6 +79,11 @@ _TRANSITION_FIELDS: Final = frozenset(
         "peak_rss_mb",
         "mean_cpu_pct",
         "solver_binary",
+        # Set when reboot recovery returns a job to the queue, and cleared in the same
+        # statement that starts it again -- so the flag cannot outlive the restart it asked
+        # for and cause a second one.
+        "resume_requested",
+        "boot_time",
     }
 )
 
@@ -153,11 +169,13 @@ class JobRepository:
                 INSERT INTO jobs (
                     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb,
                     priority, state, created_at, stdout_path, stderr_path, log_path,
-                    metadata, depends_on_job_id, resource_kind, gpus
+                    metadata, depends_on_job_id, resource_kind, gpus,
+                    sweep_id, sweep_position
                 ) VALUES (
                     :id, :seq, :name, :workdir, :solver, :solver_binary, :cores, :ram,
                     :priority, :state, :created_at, :stdout, :stderr, :log,
-                    :metadata, :depends_on, :resource_kind, :gpus
+                    :metadata, :depends_on, :resource_kind, :gpus,
+                    :sweep_id, :sweep_position
                 )
                 """,
                 {
@@ -179,6 +197,8 @@ class JobRepository:
                     "gpus": spec.resources.gpus,
                     "metadata": _dumps(metadata.to_json()),
                     "depends_on": spec.depends_on_job_id,
+                    "sweep_id": spec.sweep_id,
+                    "sweep_position": spec.sweep_position,
                 },
             )
             self._write_tags(job_id, spec.tags)
@@ -301,6 +321,136 @@ class JobRepository:
         ).fetchall()
         return Page(items=self._hydrate(rows), total=total, offset=max(0, offset))
 
+    # -- sweeps ---------------------------------------------------------------------------
+
+    def create_sweep(self, spec: SweepSpec, jobs: Sequence[JobSpec]) -> tuple[Sweep, list[Job]]:
+        """Insert a sweep and its member jobs, in order, as one transaction.
+
+        The members are created inside the same transaction as the sweep row, so a sweep
+        can never exist with half its cases -- and, more importantly, the `seq` values they
+        receive are consecutive. That is what makes the sweep's queue order identical to
+        its on-disk order without storing a second ordering anywhere: the scheduler's
+        existing `ORDER BY priority DESC, seq ASC` already produces it.
+
+        Args:
+            spec: The sweep's configuration.
+            jobs: Member specs, already in the order the cases should run. Each must carry
+                the sweep's id and its own position.
+
+        Returns:
+            The stored sweep and its member jobs, in order.
+        """
+        now = self._clock.now()
+        with transaction(self._conn):
+            self._conn.execute(
+                """
+                INSERT INTO sweeps (
+                    id, name, root, solver, cores_per_job, concurrency, created_at
+                ) VALUES (:id, :name, :root, :solver, :cores, :concurrency, :created_at)
+                """,
+                {
+                    "id": spec.sweep_id,
+                    "name": spec.name,
+                    "root": str(spec.root),
+                    "solver": spec.solver,
+                    "cores": spec.cores_per_job,
+                    "concurrency": spec.concurrency,
+                    "created_at": now,
+                },
+            )
+        created = [self.create(job) for job in jobs]
+        sweep = self.get_sweep(spec.sweep_id)
+        assert sweep is not None
+        return sweep, created
+
+    def get_sweep(self, sweep_id: str) -> Sweep | None:
+        """One sweep by id, with its live member counts, or ``None``."""
+        row = self._conn.execute(
+            """
+            SELECT id, name, root, solver, cores_per_job, concurrency, created_at
+            FROM sweeps WHERE id = ?
+            """,
+            (sweep_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._sweep_from_row(row)
+
+    def sweeps(self) -> Sequence[Sweep]:
+        """Every sweep, newest first, with live member counts."""
+        rows = self._conn.execute(
+            """
+            SELECT id, name, root, solver, cores_per_job, concurrency, created_at
+            FROM sweeps ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return tuple(self._sweep_from_row(row) for row in rows)
+
+    def sweep_members(self, sweep_id: str) -> Sequence[Job]:
+        """A sweep's jobs in sweep order, which is the order they were submitted in."""
+        rows = self._conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS} FROM jobs
+            WHERE sweep_id = ?
+            ORDER BY sweep_position ASC, seq ASC
+            """,
+            (sweep_id,),
+        ).fetchall()
+        return self._hydrate(rows)
+
+    def active_members_by_sweep(self) -> dict[str, set[str]]:
+        """The ids of each sweep's currently active members, keyed by sweep.
+
+        Ids rather than counts, because the scheduler has to union this with the jobs it
+        has just admitted -- which are not active in the database yet -- and adding two
+        counts would double-count any job that appears in both. Sets make the overlap
+        harmless.
+
+        One query for every sweep at once: this runs on every admission pass, and it is
+        bounded by the number of running jobs rather than by history.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, sweep_id FROM jobs
+            WHERE sweep_id IS NOT NULL AND state IN ('PREPARING', 'RUNNING')
+            """
+        ).fetchall()
+        active: dict[str, set[str]] = {}
+        for row in rows:
+            active.setdefault(str(row["sweep_id"]), set()).add(str(row["id"]))
+        return active
+
+    def _sweep_from_row(self, row: sqlite3.Row) -> Sweep:
+        """Build a sweep, counting its members as they stand right now.
+
+        The counts are derived on read rather than maintained as columns: a stored counter
+        has to be updated from every path that changes a job's state, and the first one
+        that forgets leaves a sweep permanently believing it has a job running.
+        """
+        counts = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(state IN ('PREPARING', 'RUNNING')) AS running,
+                SUM(state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'REJECTED', 'UNKNOWN'))
+                    AS finished
+            FROM jobs WHERE sweep_id = ?
+            """,
+            (row["id"],),
+        ).fetchone()
+        return Sweep(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            root=Path(str(row["root"])),
+            solver=str(row["solver"]),
+            cores_per_job=int(row["cores_per_job"]),
+            concurrency=int(row["concurrency"]),
+            created_at=float(row["created_at"]),
+            total=int(counts["total"] or 0),
+            running=int(counts["running"] or 0),
+            finished=int(counts["finished"] or 0),
+        )
+
     def queue_positions(self) -> dict[str, int]:
         """Map queued job ids to their 1-based position.
 
@@ -421,20 +571,64 @@ class JobRepository:
         """
         return self.transition(job_id, JobState.PREPARING, detail="preparing case")
 
-    def mark_started(self, job_id: str, *, pid: int, pid_start_time: float) -> Job:
+    def mark_started(
+        self, job_id: str, *, pid: int, pid_start_time: float, boot_time: float | None = None
+    ) -> Job:
         """Move PREPARING -> RUNNING, recording the supervised process.
 
         ``pid_start_time`` is stored alongside the pid because a pid alone is not a stable
         identity: after a daemon restart, that number may belong to something else
         entirely. The pair is what makes re-adoption safe (§6.7).
+
+        ``boot_time`` identifies which boot of the machine the job started on, so that a
+        later startup can tell "the machine rebooted under this job" from "something killed
+        it". ``None`` when the machine cannot report one, which recovery reads as no
+        evidence of a reboot rather than as one.
         """
         return self.transition(
             job_id,
             JobState.RUNNING,
             pid=pid,
             pid_start_time=pid_start_time,
+            boot_time=boot_time,
             detail=f"solver started, pid {pid}",
         )
+
+    def requeue_for_resume(self, job_id: str, *, detail: str) -> Job:
+        """Return an interrupted job to the queue, to be restarted from its own last state.
+
+        Used by startup recovery for a job that was running when the machine rebooted. The
+        job keeps its ``seq``, and therefore its exact place in the queue: a reboot must
+        not reorder the work that was waiting, and a job that was running before the
+        reboot was ahead of everything queued behind it.
+
+        ``started_at``, ``pid`` and ``pid_start_time`` are cleared because they describe a
+        process that no longer exists on a machine that no longer exists. Leaving them
+        would make the job report a runtime measured across the downtime, and would leave a
+        pid that now belongs to something else for the next cancel to signal.
+        """
+        return self.transition(
+            job_id,
+            JobState.QUEUED,
+            detail=detail,
+            resume_requested=1,
+            started_at=None,
+            pid=None,
+            pid_start_time=None,
+        )
+
+    def clear_resume_request(self, job_id: str) -> None:
+        """Forget that a job asked to resume, once it has been restarted.
+
+        Separate from the transition that starts it so that the flag is cleared exactly
+        once the plan has been built with it -- a flag that outlived its restart would ask
+        for another one on the job's next pass through the executor.
+        """
+        with transaction(self._conn):
+            self._conn.execute(
+                "UPDATE jobs SET resume_requested = 0 WHERE id = ?",
+                (job_id,),
+            )
 
     def mark_finished(
         self,

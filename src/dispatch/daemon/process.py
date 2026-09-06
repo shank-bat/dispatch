@@ -36,7 +36,7 @@ from typing import IO, Any
 from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.plan import CommandStep
 
-__all__ = ["ProcessHandle", "ProcessManager", "SpawnError"]
+__all__ = ["ProcessHandle", "ProcessManager", "SpawnError", "system_boot_time"]
 
 log = logging.getLogger(__name__)
 
@@ -354,3 +354,24 @@ def describe_exit(code: int | None) -> tuple[int | None, str | None]:
 def render_command(argv: list[str] | tuple[str, ...]) -> str:
     """Shell-quote a command for logs. Display only; nothing runs through a shell."""
     return shlex.join(argv)
+
+
+def system_boot_time() -> float | None:
+    """This machine's boot identity: the kernel's ``btime``, in seconds since the epoch.
+
+    Read from ``/proc/stat`` rather than derived from ``/proc/uptime``, because ``btime`` is
+    a fixed integer the kernel reports identically on every read, while ``now - uptime``
+    drifts by a fraction of a second each time it is computed. The value is compared
+    against a copy of itself recorded hours or days earlier, so a stable reading matters
+    more than a precise one.
+
+    ``None`` when it cannot be read, which callers treat as no evidence of a reboot.
+    """
+    try:
+        with Path("/proc/stat").open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):  # pragma: no cover - environmental
+        return None
+    return None

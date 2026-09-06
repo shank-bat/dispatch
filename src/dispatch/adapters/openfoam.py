@@ -352,6 +352,17 @@ class OpenFOAMAdapter(BaseAdapter):
         # between the two would otherwise leave `stopAt writeNow` in place forever, and
         # every run from then on would stop at its first time step.
         _restore_stop_at(case)
+        _restore_start_from(case)
+
+        if ctx.resume:
+            # Restarting after the machine went down under this run. OpenFOAM's own restart
+            # mechanism is `startFrom latestTime`, which makes the solver pick up the
+            # highest time it finds written in the case -- so the restart point comes from
+            # the case's files, not from anything Dispatch believes about it. The previous
+            # value is parked first and put back by `finalize`, exactly as the graceful-stop
+            # edit is: it steers this run only, and a `startFrom` left behind would silently
+            # change where every later run of the case begins.
+            _request_latest_time(case)
 
         env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
         application = self._application(ctx) or "foamRun"
@@ -531,6 +542,22 @@ class OpenFOAMAdapter(BaseAdapter):
         owner wrote it.
         """
         _restore_stop_at(ctx.workdir)
+        _restore_start_from(ctx.workdir)
+
+    def resume_point(self, ctx: CaseContext) -> str | None:
+        """The latest time this case has actually written, or ``None`` if it wrote none.
+
+        Read off the disk, because the disk is the only thing that knows. A decomposed run
+        writes its times inside ``processorN/``, and a serial one writes them beside
+        ``system/``, so both are consulted -- the decomposed copy first, since that is
+        where a parallel run (the case worth resuming) puts them.
+
+        The ``0`` directory is deliberately not a resume point: it is the initial
+        condition, so "resuming" from it is starting again, and reporting it as a saved
+        state would tell the user work had been preserved when none had.
+        """
+        latest = latest_written_time(ctx.workdir)
+        return None if latest is None else f"t = {latest:g}"
 
     def explain_failure(self, tail: str, ctx: CaseContext) -> str | None:
         """Extract the reason an OpenFOAM run failed.
@@ -623,6 +650,97 @@ def _restore_stop_at(case: Path) -> bool:
         log.info("Restored stopAt %s in %s after cancellation", value, control)
     backup.unlink(missing_ok=True)
     return True
+
+
+START_FROM_BACKUP = "system/.dispatch-startFrom"
+"""Where the pre-resume ``startFrom`` is parked while a restarted run is in flight.
+
+Beside :data:`STOP_AT_BACKUP`, and for the same reason: the edit steers one run, adapter
+instances are shared between concurrent jobs, and the value has to survive a daemon
+restart -- which, for a resume after a reboot, is precisely the situation.
+"""
+
+
+def _request_latest_time(case: Path) -> bool:
+    """Point ``controlDict`` at the case's latest written time. Returns whether it did.
+
+    Idempotent by way of the backup file: if a resume is already in force the original
+    value has been saved once, and saving the current ``latestTime`` over it would lose
+    what the user actually wrote.
+    """
+    control = case / "system" / "controlDict"
+    if not control.is_file():
+        return False
+    if (case / START_FROM_BACKUP).exists():
+        return True
+
+    previous = foamdict.read_value(control, "startFrom") or "startTime"
+    if previous.strip() == "latestTime":
+        # Already what the user asked for. Nothing to change, and nothing to restore --
+        # writing a backup here would make finalize "restore" a value it never replaced.
+        return True
+    if not foamdict.set_value(control, "startFrom", "latestTime"):
+        return False
+
+    try:
+        (case / START_FROM_BACKUP).write_text(previous.strip(), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - unwritable case directory
+        log.warning("Could not save the original startFrom for %s: %s", case, exc)
+    log.info("Set startFrom latestTime in %s (was %s) to resume", control, previous)
+    return True
+
+
+def _restore_start_from(case: Path) -> bool:
+    """Put back the ``startFrom`` a resume replaced. Returns whether it did.
+
+    A no-op when there is no backup, which is every run that was not a resume.
+    """
+    backup = case / START_FROM_BACKUP
+    try:
+        value = backup.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+
+    control = case / "system" / "controlDict"
+    if value and control.is_file():
+        foamdict.set_value(control, "startFrom", value)
+        log.info("Restored startFrom %s in %s after a resume", value, control)
+    backup.unlink(missing_ok=True)
+    return True
+
+
+def latest_written_time(case: Path) -> float | None:
+    """The highest time this case has written, decomposed or serial.
+
+    Returns ``None`` when nothing beyond the initial condition has been written, which is
+    what a run interrupted before its first write looks like. ``0`` is excluded on purpose:
+    it is the initial condition, not a saved state, and treating it as one would report
+    preserved progress where there is none.
+    """
+    for root in (case / "processor0", case):
+        latest = _max_time_dir(root)
+        if latest is not None:
+            return latest
+    return None
+
+
+def _max_time_dir(root: Path) -> float | None:
+    """The largest positive numeric directory name directly under ``root``."""
+    best: float | None = None
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if not child.is_dir():
+            continue
+        try:
+            value = float(child.name)
+        except ValueError:
+            continue
+        if value > 0 and (best is None or value > best):
+            best = value
+    return best
 
 
 def count_processor_dirs(case: Path) -> int:

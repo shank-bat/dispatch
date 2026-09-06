@@ -666,3 +666,216 @@ async def _wait_for_state(
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"job never reached {state}; it is {repo.get(job_id).state}")
+
+
+# -- reboot recovery -----------------------------------------------------------------------
+#
+# A daemon restart and a machine reboot look identical in the database and are completely
+# different in fact: after a restart the simulation is still running and must be left
+# alone, after a reboot it is gone and its work should be picked up from whatever the
+# simulation itself managed to write.
+
+
+def running_before_a_reboot(
+    repo: JobRepository, config: Config, case: Path, *, boot: float
+) -> object:
+    """A job recorded as RUNNING on a boot of the machine that has since ended."""
+    job = submit(repo, config, case)
+    repo.mark_preparing(job.id)
+    # A pid that is not alive, so recovery cannot re-adopt it -- which is the situation a
+    # reboot leaves behind.
+    return repo.mark_started(
+        job.id, pid=999_999_996, pid_start_time=1.0, boot_time=boot
+    )
+
+
+async def test_a_reboot_requeues_the_job_instead_of_losing_it(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """The headline of the feature: interrupted work is recovered, not written off."""
+    case = make_case(tmp_path / "rebooted", script="sleep 1")
+    job = running_before_a_reboot(repo, dispatch_config, case, boot=1000.0)
+
+    report = recover(
+        repo=repo,
+        resources=resources,
+        executor=executor,
+        config=dispatch_config,
+        boot_time=2000.0,  # the machine has booted again since
+    )
+
+    assert report.requeued == [job.id]
+    assert report.lost == []
+    recovered = repo.get(job.id)
+    assert recovered.state is JobState.QUEUED
+    assert recovered.resume_requested is True
+
+
+async def test_a_requeued_job_keeps_its_place_in_the_queue(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """A reboot must not reorder the queue that was waiting behind the running job."""
+    running_before_a_reboot(
+        repo, dispatch_config, make_case(tmp_path / "a", script="sleep 1"), boot=1000.0
+    )
+    behind = [
+        submit(repo, dispatch_config, make_case(tmp_path / name, script="exit 0"))
+        for name in ("b", "c", "d")
+    ]
+
+    recover(
+        repo=repo,
+        resources=resources,
+        executor=executor,
+        config=dispatch_config,
+        boot_time=2000.0,
+    )
+
+    order = [job.name for job in repo.queued()]
+    assert order == ["a", *[job.name for job in behind]]
+
+
+async def test_a_process_that_vanished_without_a_reboot_is_still_lost(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """Same boot, no process, no sentinel: something killed it, and that is not resumable.
+
+    Restarting here would be a guess. The pre-existing UNKNOWN answer is kept precisely
+    because it is the honest one.
+    """
+    case = make_case(tmp_path / "killed", script="sleep 1")
+    job = running_before_a_reboot(repo, dispatch_config, case, boot=1000.0)
+
+    report = recover(
+        repo=repo,
+        resources=resources,
+        executor=executor,
+        config=dispatch_config,
+        boot_time=1000.0,  # the machine has not rebooted
+    )
+
+    assert report.lost == [job.id]
+    assert report.requeued == []
+    assert repo.get(job.id).state is JobState.UNKNOWN
+
+
+async def test_a_job_with_no_recorded_boot_is_not_assumed_to_have_rebooted(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """Rows written before this feature keep their previous outcome exactly."""
+    case = make_case(tmp_path / "legacy", script="sleep 1")
+    job = submit(repo, dispatch_config, case)
+    repo.mark_preparing(job.id)
+    repo.mark_started(job.id, pid=999_999_995, pid_start_time=1.0)  # no boot recorded
+
+    report = recover(
+        repo=repo,
+        resources=resources,
+        executor=executor,
+        config=dispatch_config,
+        boot_time=2000.0,
+    )
+
+    assert report.lost == [job.id]
+    assert repo.get(job.id).state is JobState.UNKNOWN
+
+
+async def test_a_surviving_process_is_readopted_not_restarted(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """A daemon restart is not a reboot, and must not restart a running simulation.
+
+    The boot time is deliberately made to look like a reboot as well, so the test proves
+    re-adoption is checked *first* rather than merely that the two paths differ.
+    """
+    case = make_case(tmp_path / "survivor", script="sleep 30")
+    process = await asyncio.create_subprocess_exec(
+        "sleep", "30", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
+    try:
+        job = submit(repo, dispatch_config, case)
+        repo.mark_preparing(job.id)
+        repo.mark_started(
+            job.id,
+            pid=process.pid,
+            pid_start_time=process_start_time(process.pid) or 0.0,
+            boot_time=1000.0,
+        )
+
+        report = recover(
+            repo=repo,
+            resources=resources,
+            executor=executor,
+            config=dispatch_config,
+            boot_time=2000.0,
+        )
+
+        assert report.readopted == [job.id]
+        assert report.requeued == []
+        assert repo.get(job.id).state is JobState.RUNNING
+        assert repo.get(job.id).resume_requested is False
+        assert resources.allocated_cores == job.cores
+    finally:
+        process.kill()
+        await process.wait()
+        await executor.shutdown()
+
+
+async def test_a_recovered_job_resumes_from_the_cases_own_saved_state(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """End to end: requeued, rescheduled, and told to resume -- with the flag cleared.
+
+    The restart point itself is the adapter's business and is asserted against a real case
+    in the adapter tests; what is checked here is that the executor asks for one and does
+    not ask twice.
+    """
+    case = make_case(tmp_path / "resumed", script="exit 0")
+    job = running_before_a_reboot(repo, dispatch_config, case, boot=1000.0)
+
+    recover(
+        repo=repo,
+        resources=resources,
+        executor=executor,
+        config=dispatch_config,
+        boot_time=2000.0,
+    )
+    assert repo.get(job.id).resume_requested is True
+
+    await run_to_completion(executor, repo.get(job.id))
+
+    finished = repo.get(job.id)
+    assert finished.state is JobState.COMPLETED
+    assert finished.resume_requested is False, "the flag must not survive its own restart"
+
+    details = [event.detail for event in repo.events(job.id)]
+    assert any("restarting from" in detail for detail in details)
+
+
+async def test_queued_jobs_are_untouched_by_recovery(
+    repo, resources, executor, dispatch_config, tmp_path
+) -> None:
+    """Queued work survives a reboot with its cores and dependencies exactly as submitted."""
+    parent = submit(repo, dispatch_config, make_case(tmp_path / "parent", script="exit 0"))
+    child = repo.create(
+        JobSpec(
+            workdir=make_case(tmp_path / "child", script="exit 0"),
+            solver="fake",
+            resources=ResourceRequest(cores=3),
+            name="child",
+            depends_on_job_id=parent.id,
+        )
+    )
+
+    recover(
+        repo=repo,
+        resources=resources,
+        executor=executor,
+        config=dispatch_config,
+        boot_time=2000.0,
+    )
+
+    restored = repo.get(child.id)
+    assert restored.state is JobState.QUEUED
+    assert restored.cores == 3
+    assert restored.depends_on_job_id == parent.id

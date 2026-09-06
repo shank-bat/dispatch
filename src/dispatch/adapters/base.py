@@ -98,6 +98,19 @@ class CaseContext:
     settings: Mapping[str, Any] = field(default_factory=dict)
     job_name: str = ""
     metadata: CaseMetadata | None = None
+    resume: bool = False
+    """Restart from whatever state the simulation itself last wrote, rather than afresh.
+
+    Set only when startup recovery found this job running before the machine last booted
+    (§6.7). An adapter that can resume should plan the steps that make its solver continue
+    from its own latest saved output; one that cannot may ignore this entirely and start
+    the case again, which is the honest fallback and what the default does.
+
+    Dispatch never says *where* to resume from. It cannot know: only the case's own files
+    record what the solver finished writing. This flag asks the question; the adapter reads
+    the answer off the disk.
+    """
+
     gpus: int = 0
     """GPUs the scheduler has reserved for this job. Zero for CPU work.
 
@@ -219,6 +232,10 @@ class SolverAdapter(Protocol):
 
     def explain_failure(self, tail: str, ctx: CaseContext) -> str | None:
         """Summarise why a run failed, from the end of its output."""
+        ...
+
+    def resume_point(self, ctx: CaseContext) -> str | None:
+        """The latest saved state this case could restart from, read from the case."""
         ...
 
 
@@ -404,6 +421,26 @@ class BaseAdapter(ABC):
             where the solver has a recognisable error format.
         """
         return generic_failure_summary(tail)
+
+    def resume_point(self, ctx: CaseContext) -> str | None:
+        """Describe the latest saved state this case could be restarted from.
+
+        Read from the case's own files -- a written time directory, a restart file, a
+        checkpoint -- and never from anything Dispatch recorded. Dispatch knows that a job
+        was running; it does not know what the solver had finished writing when the power
+        went, and the difference between those two is exactly the gap this method exists
+        not to paper over.
+
+        Returns:
+            A short human-readable description of the restart point (``"t = 7500"``), or
+            ``None`` when there is no saved state to resume from -- which is a perfectly
+            ordinary answer for a run interrupted before its first write, and means the
+            case starts again from the beginning.
+
+        The default returns ``None``: an adapter whose solver has no restart mechanism
+        should not pretend otherwise.
+        """
+        return None
 
     def setting(self, key: str, default: Any = None) -> Any:
         """Read one value from this adapter's configuration section."""

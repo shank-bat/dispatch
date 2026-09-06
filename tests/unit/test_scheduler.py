@@ -14,7 +14,7 @@ import pytest
 
 from dispatch.core.config import SchedulerConfig
 from dispatch.core.errors import ConfigError
-from dispatch.core.models import Job, JobSpec, ResourceRequest
+from dispatch.core.models import Job, JobSpec, ResourceRequest, Sweep, SweepSpec
 from dispatch.core.states import ExitReason, JobState
 from dispatch.daemon.events import EventBus
 from dispatch.daemon.policies import (
@@ -26,6 +26,7 @@ from dispatch.daemon.policies import (
 )
 from dispatch.daemon.resources import Capacity, ResourceModel
 from dispatch.daemon.scheduler import Scheduler
+from dispatch.db.connection import connect, migrate
 from dispatch.db.repository import JobRepository
 
 
@@ -570,3 +571,261 @@ async def test_a_dependency_on_a_job_that_no_longer_exists_blocks_rather_than_st
     assert not scheduler._dependency_satisfied(dangling)
     reason = scheduler.explain(dangling)
     assert reason is not None and "no longer exists" in reason
+
+
+def open_repo(database: Path) -> JobRepository:
+    """A repository on a migrated, file-backed database.
+
+    File-backed on purpose: the restart tests reopen it, and an in-memory database cannot
+    be -- which is exactly the property they exist to check.
+    """
+    connection = connect(database)
+    migrate(connection)
+    return JobRepository(connection)
+
+
+# -- sweeps ---------------------------------------------------------------------------------
+#
+# A sweep adds exactly one rule to admission: no more than `concurrency` of its own members
+# may run at once. These check that the rule is a hard cap, that it applies to nothing else,
+# and that the ordinary opportunistic behaviour of every other job is untouched by it.
+
+
+def sweep_of(
+    repo: JobRepository,
+    tmp_path: Path,
+    *,
+    cases: int,
+    cores: int,
+    concurrency: int,
+    name: str = "sweep",
+) -> tuple[Sweep, list[Job]]:
+    """Create a sweep of ``cases`` identical cases, as the submit handler would."""
+    root = tmp_path / name
+    root.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index in range(cases):
+        case = root / f"case_{index + 1:03d}"
+        case.mkdir(exist_ok=True)
+        paths.append(case)
+
+    spec = SweepSpec(
+        root=root,
+        solver="fake",
+        cases=paths,
+        cores_per_job=cores,
+        concurrency=concurrency,
+        name=name,
+    )
+    members = [
+        JobSpec(
+            workdir=case,
+            solver="fake",
+            resources=ResourceRequest(cores=cores),
+            name=case.name,
+            sweep_id=spec.sweep_id,
+            sweep_position=position,
+        )
+        for position, case in enumerate(paths)
+    ]
+    return repo.create_sweep(spec, members)
+
+
+async def test_an_ordinary_job_is_untouched_by_sweep_support(
+    scheduler: Scheduler, repo: JobRepository, tmp_path: Path, executor: FakeExecutor
+) -> None:
+    """The first thing to protect: jobs with no sweep schedule exactly as before.
+
+    Four two-core jobs on eight cores all start in one pass, which is the opportunistic
+    behaviour that existed before sweeps and must survive them.
+    """
+    queue(repo, tmp_path, ("a", 2, 0), ("b", 2, 0), ("c", 2, 0), ("d", 2, 0))
+    started = await scheduler.run_once()
+
+    assert len(started) == 4
+    assert all(job.sweep_id is None for job in started)
+
+
+async def test_sweep_members_receive_the_configured_cores(
+    repo: JobRepository, tmp_path: Path
+) -> None:
+    _, jobs = sweep_of(repo, tmp_path, cases=4, cores=3, concurrency=2)
+    assert [job.cores for job in jobs] == [3, 3, 3, 3]
+
+
+async def test_sweep_ordering_is_deterministic(repo: JobRepository, tmp_path: Path) -> None:
+    """Case order is the submission order, and the queue order agrees with it."""
+    _, jobs = sweep_of(repo, tmp_path, cases=5, cores=1, concurrency=1)
+
+    assert [job.name for job in jobs] == [f"case_{i:03d}" for i in range(1, 6)]
+    assert [job.sweep_position for job in jobs] == [0, 1, 2, 3, 4]
+    # `seq` is what the scheduler orders by, so it has to agree with the sweep's own order.
+    assert [job.seq for job in jobs] == sorted(job.seq for job in jobs)
+
+
+async def test_concurrency_is_a_hard_cap_not_a_core_budget(
+    scheduler: Scheduler, repo: JobRepository, tmp_path: Path
+) -> None:
+    """The headline requirement, in the exact shape it was specified.
+
+    Twelve schedulable cores, three cores per job, two at a time: two jobs run and six
+    cores sit idle. A scheduler that treated the limit as advice would start four.
+    """
+    scheduler._resources = ResourceModel(
+        SchedulerConfig(total_cores=12, reserved_cores=0), memory_probe=lambda: 64_000
+    )
+    sweep_of(repo, tmp_path, cases=5, cores=3, concurrency=2)
+
+    started = await scheduler.run_once()
+
+    assert len(started) == 2, "free cores must not override the sweep's concurrency limit"
+    assert [job.name for job in started] == ["case_001", "case_002"]
+    assert scheduler._resources.free_cores == 6
+
+
+async def test_the_cap_holds_within_a_single_pass(
+    scheduler: Scheduler, repo: JobRepository, tmp_path: Path
+) -> None:
+    """Nothing is running yet, so the cap can only come from the pass counting itself.
+
+    Enforcing it purely from the database would let the very first pass after a submission
+    start the whole sweep at once, because at that instant none of its members are running.
+    """
+    sweep_of(repo, tmp_path, cases=8, cores=1, concurrency=3)
+    started = await scheduler.run_once()
+    assert len(started) == 3
+
+
+async def test_the_next_case_becomes_eligible_when_one_finishes(
+    scheduler: Scheduler, repo: JobRepository, resources: ResourceModel, tmp_path: Path
+) -> None:
+    sweep, _jobs = sweep_of(repo, tmp_path, cases=4, cores=2, concurrency=2)
+
+    started = await scheduler.run_once()
+    assert [job.name for job in started] == ["case_001", "case_002"]
+
+    # The fake executor records launches but writes no transitions, so the lifecycle the
+    # real one would drive is applied here.
+    for job in started:
+        repo.mark_preparing(job.id)
+        repo.mark_started(job.id, pid=4242, pid_start_time=1.0)
+
+    # Nothing new may start while both slots are occupied.
+    assert await scheduler.run_once() == []
+
+    complete(repo, resources, started[0])
+    resumed = await scheduler.run_once()
+
+    assert [job.name for job in resumed] == ["case_003"]
+    # One slot freed, one slot refilled -- and only one. The fourth case stays queued.
+    assert await scheduler.run_once() == []
+    restored = repo.get_sweep(sweep.id)
+    assert (restored.total, restored.finished) == (4, 1)
+
+
+async def test_cores_a_sweep_is_not_using_stay_available_to_other_work(
+    scheduler: Scheduler, repo: JobRepository, tmp_path: Path
+) -> None:
+    """The other half of the point: the limit constrains the sweep, not the machine."""
+    scheduler._resources = ResourceModel(
+        SchedulerConfig(total_cores=12, reserved_cores=0), memory_probe=lambda: 64_000
+    )
+    sweep_of(repo, tmp_path, cases=5, cores=3, concurrency=2)
+    queue(repo, tmp_path, ("unrelated", 6, 0))
+
+    started = await scheduler.run_once()
+    names = [job.name for job in started]
+
+    assert names == ["case_001", "case_002", "unrelated"]
+    assert scheduler._resources.free_cores == 0
+
+
+async def test_a_sweep_does_not_constrain_a_different_sweep(
+    scheduler: Scheduler, repo: JobRepository, tmp_path: Path
+) -> None:
+    """Each sweep's limit is its own; two sweeps of one run two jobs, not one."""
+    sweep_of(repo, tmp_path, cases=3, cores=1, concurrency=1, name="alpha")
+    sweep_of(repo, tmp_path, cases=3, cores=1, concurrency=1, name="beta")
+
+    started = await scheduler.run_once()
+    assert len(started) == 2
+    assert {job.name for job in started} == {"case_001"}
+    assert len({job.sweep_id for job in started}) == 2
+
+
+async def test_a_sweep_member_still_waits_for_its_run_after_dependency(
+    scheduler: Scheduler, repo: JobRepository, resources: ResourceModel, tmp_path: Path
+) -> None:
+    """`--after` stays authoritative: sweep room and free cores do not override it."""
+    parent = queue(repo, tmp_path, ("parent", 1, 0))[0]
+    _sweep, jobs = sweep_of(repo, tmp_path, cases=2, cores=1, concurrency=2)
+
+    dependent = jobs[0]
+    repo.transition(dependent.id, JobState.HELD, detail="parked to attach a dependency")
+    repo._conn.execute(
+        "UPDATE jobs SET depends_on_job_id = ? WHERE id = ?", (parent.id, dependent.id)
+    )
+    repo._conn.commit()
+    repo.transition(dependent.id, JobState.QUEUED, detail="released")
+
+    started = await scheduler.run_once()
+    assert dependent.id not in {job.id for job in started}
+
+    complete(repo, resources, start_running(repo, resources, repo.get(parent.id)))
+    after = await scheduler.run_once()
+    assert dependent.id in {job.id for job in after}
+
+
+async def test_a_sweep_survives_a_daemon_restart(tmp_path: Path) -> None:
+    """Configuration, membership and order all come back from the database.
+
+    A restart re-reads rows; nothing about a sweep lives in the scheduler's memory, which
+    is what makes this true rather than merely tested. Uses a file-backed database on
+    purpose -- an in-memory one cannot be reopened, which is exactly the thing under test.
+    """
+    database = tmp_path / "restart.db"
+    first = open_repo(database)
+    sweep, jobs = sweep_of(first, tmp_path, cases=4, cores=3, concurrency=2)
+    sweep_id = sweep.id
+    original = [job.name for job in jobs]
+
+    reopened = open_repo(database)
+    try:
+        restored = reopened.get_sweep(sweep_id)
+        assert restored is not None
+        assert restored.cores_per_job == 3
+        assert restored.concurrency == 2
+        assert restored.total == 4
+
+        members = reopened.sweep_members(sweep_id)
+        assert [job.name for job in members] == original
+        assert [job.sweep_position for job in members] == [0, 1, 2, 3]
+        assert all(job.cores == 3 for job in members)
+    finally:
+        reopened._conn.close()
+        first._conn.close()
+
+
+async def test_the_cap_still_applies_after_a_restart(
+    resources: ResourceModel, tmp_path: Path, executor: FakeExecutor
+) -> None:
+    """A sweep must not come back as a pile of ordinary independent jobs."""
+    database = tmp_path / "cap.db"
+    first = open_repo(database)
+    sweep_of(first, tmp_path, cases=5, cores=1, concurrency=2)
+
+    reopened = open_repo(database)
+    try:
+        fresh = Scheduler(
+            repo=reopened,
+            resources=resources,
+            executor=executor,  # type: ignore[arg-type]
+            policy=PriorityFifoBackfill(),
+            config=SchedulerConfig(total_cores=8, reserved_cores=0),
+            bus=EventBus(),
+        )
+        started = await fresh.run_once()
+        assert len(started) == 2
+    finally:
+        reopened._conn.close()
+        first._conn.close()

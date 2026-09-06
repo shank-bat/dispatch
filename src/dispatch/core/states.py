@@ -92,12 +92,20 @@ _TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     ),
     JobState.HELD: frozenset({JobState.QUEUED, JobState.CANCELLED}),
     # PREPARING may reach RUNNING (normal), FAILED (a PREPARE step aborted),
-    # CANCELLED (user), or UNKNOWN (daemon died mid-preparation).
+    # CANCELLED (user), UNKNOWN (daemon died mid-preparation), or QUEUED -- see below.
     JobState.PREPARING: frozenset(
-        {JobState.RUNNING, JobState.FAILED, JobState.CANCELLED, JobState.UNKNOWN}
+        {JobState.RUNNING, JobState.FAILED, JobState.CANCELLED, JobState.UNKNOWN, JobState.QUEUED}
     ),
+    # RUNNING may return to QUEUED in exactly one situation: the machine rebooted under
+    # the job, so the process it names cannot exist and there is nothing to adopt or wait
+    # for. The job goes back to the queue -- keeping its `seq`, and therefore its place --
+    # to be restarted from whatever state the simulation itself last wrote (§6.7).
+    #
+    # This is not a general "un-run" edge. Nothing else may take it: every other way a run
+    # ends is terminal, because re-running a case is a new job with a new id and history
+    # stays immutable.
     JobState.RUNNING: frozenset(
-        {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED, JobState.UNKNOWN}
+        {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED, JobState.UNKNOWN, JobState.QUEUED}
     ),
     # Terminal states have no outgoing edges. Re-running a case creates a new job with a
     # new id, which keeps history immutable and makes "which run produced this?" answerable.

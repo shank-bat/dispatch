@@ -74,6 +74,16 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ],
     ),
     (
+        "Sweeps",
+        [
+            ("", "a folder whose subdirectories are all cases of one solver"),
+            ("c", "cores for every job in the sweep"),
+            ("m", "max running at once — a hard cap, not a target"),
+            ("d", "review every case, in order, before submitting"),
+            ("s", "submit the folder as one sweep"),
+        ],
+    ),
+    (
         "Log viewer",
         [
             ("e", "output / preparation steps"),

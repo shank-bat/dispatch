@@ -69,6 +69,14 @@ class Scheduler:
         self._bus = bus
         self._clock = clock or SystemClock()
 
+        self._admitted_sweep_slots: dict[str, str] = {}
+        """Sweep members admitted but not yet visible as active, as ``job id -> sweep id``.
+
+        ``executor.launch`` returns before the job's transition to PREPARING is written, so
+        for a moment a member occupies a slot that no query can see. Bounded by the number
+        of in-flight admissions and pruned against the ledger on every pass.
+        """
+
         self._wake = asyncio.Event()
         self._stopping = False
         self._paused = False
@@ -157,6 +165,13 @@ class Scheduler:
         # the rest of the queue is offered the same capacity it would have been offered
         # anyway, so nothing else waits and no core sits idle on its account.
         eligible = [job for job in queued if self._dependency_satisfied(job)]
+
+        # A sweep caps how many of *its own* members may run at once. Applied here, after
+        # dependencies and before the policy, for the same reason dependencies are: the
+        # policy is offered only jobs that may actually start, so the cap cannot be
+        # undone by a policy that sees spare capacity, and jobs outside the sweep are
+        # offered exactly the capacity they would have been offered anyway.
+        eligible = self._within_sweep_limits(eligible)
         if not eligible:
             return []
 
@@ -180,6 +195,88 @@ class Scheduler:
                 {"started": [job.id for job in started], "queued": len(queued) - len(started)},
             )
         return started
+
+    def _within_sweep_limits(self, eligible: list[Job]) -> list[Job]:
+        """Drop sweep members that would exceed their sweep's concurrency limit.
+
+        The limit is a hard cap on running members, never a target and never a hint: free
+        cores do not override it. A sweep configured for two concurrent jobs on a machine
+        with ten spare cores runs two, and the rest of the machine stays available to
+        unrelated work -- which is the entire reason the setting exists.
+
+        Three sets of members occupy a slot, and all three have to be counted:
+
+        * those already PREPARING or RUNNING in the database;
+        * those admitted on an earlier pass whose transition has not landed yet --
+          ``launch`` returns before the executor writes it, so there is a real window in
+          which a running job is invisible to a query;
+        * those admitted **earlier in this same pass**.
+
+        They are unioned as ids rather than added as counts, because the first two sets
+        overlap as a job's transition lands and adding them would double-count it.
+
+        Jobs with no sweep are returned untouched, which is every ordinary job.
+        """
+        occupied = self._occupied_slots()
+        allowed: list[Job] = []
+
+        for job in eligible:
+            if job.sweep_id is None:
+                allowed.append(job)
+                continue
+
+            sweep = self._repo.get_sweep(job.sweep_id)
+            if sweep is None:
+                # The sweep row is gone but the member survived it (ON DELETE SET NULL has
+                # not been applied, or this is a stale read). Scheduling it as an ordinary
+                # job is the safe reading: no sweep, no sweep limit.
+                allowed.append(job)
+                continue
+
+            taken = occupied.setdefault(job.sweep_id, set())
+            if len(taken) >= sweep.concurrency:
+                continue
+
+            allowed.append(job)
+            taken.add(job.id)
+
+        return allowed
+
+    def _occupied_slots(self) -> dict[str, set[str]]:
+        """Which members of each sweep are currently holding one of its slots.
+
+        The database knows about everything that has reached PREPARING. The ledger knows
+        about everything this scheduler has admitted, synchronously, at the moment it was
+        admitted -- which covers the gap before the executor's transition is written.
+        """
+        occupied = self._repo.active_members_by_sweep()
+
+        for job_id, sweep_id in list(self._admitted_sweep_slots.items()):
+            if not self._resources.holds(job_id):
+                # The ledger released it: the job has ended, and whether it ever reached
+                # the database as active no longer matters.
+                del self._admitted_sweep_slots[job_id]
+                continue
+            occupied.setdefault(sweep_id, set()).add(job_id)
+
+        return occupied
+
+    def _sweep_blocked(self, job: Job) -> str | None:
+        """Why a sweep member is waiting on its own sweep, if it is.
+
+        Read-only, and used for the queue view's explanation. It intentionally re-derives
+        the answer rather than caching what the admission pass decided: the pass runs on
+        nudges, the user reads the queue whenever they like, and a stale reason is worse
+        than none.
+        """
+        if job.sweep_id is None:
+            return None
+        sweep = self._repo.get_sweep(job.sweep_id)
+        if sweep is None:
+            return None
+        if sweep.running >= sweep.concurrency:
+            return f"waiting for its sweep ({sweep.running}/{sweep.concurrency} running)"
+        return None
 
     def _dependency_satisfied(self, job: Job) -> bool:
         """Whether a job's ``run after`` dependency, if it has one, has been met."""
@@ -217,10 +314,13 @@ class Scheduler:
             return False
 
         self._resources.acquire(job.id, job.resources)
+        if job.sweep_id is not None:
+            self._admitted_sweep_slots[job.id] = job.sweep_id
         try:
             self._executor.launch(job)
         except Exception:
             self._resources.release(job.id)
+            self._admitted_sweep_slots.pop(job.id, None)
             log.exception("Could not launch job %s", job.id)
             return False
         log.info(
@@ -272,6 +372,9 @@ class Scheduler:
         blocking = self._blocking_dependency(job)
         if blocking is not None:
             return blocking
+        held_by_sweep = self._sweep_blocked(job)
+        if held_by_sweep is not None:
+            return held_by_sweep
         can, reason = self._resources.can_admit(job.resources)
         if can:
             return "waiting for its turn"

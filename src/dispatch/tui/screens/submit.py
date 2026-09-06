@@ -31,6 +31,17 @@ from dispatch.tui.theme import Palette, severity_style
 __all__ = ["SubmitScreen"]
 
 
+SWEEP_LABEL_WIDTH = 12
+"""Label column for the sweep pane. ``concurrent`` alone needs more than the default."""
+
+SWEEP_PREVIEW = 6
+"""How many of a sweep's cases to name in the detail pane.
+
+Enough to confirm the folder is the one intended and that the ordering looks right,
+without turning the pane into a file listing.
+"""
+
+
 class SubmitScreen(DispatchScreen):
     """Choose a case, then queue it."""
 
@@ -48,6 +59,7 @@ class SubmitScreen(DispatchScreen):
         Binding("g", "edit_gpus", "gpus"),
         Binding("t", "edit_tags", "tags"),
         Binding("a", "run_after", "run after"),
+        Binding("m", "edit_concurrency", "max at once"),
         Binding("p", "edit_path", "go to path"),
         Binding("period", "toggle_hidden", "hidden"),
     ]
@@ -63,6 +75,12 @@ class SubmitScreen(DispatchScreen):
         self.tags: list[str] = []
         self.run_after: dict[str, Any] | None = None
         """The job this one should wait for. ``None`` -- the default -- means none."""
+
+        self.sweep: dict[str, Any] | None = None
+        """The sweep this directory was recognised as, if it was. ``None`` for a case."""
+
+        self.concurrency = 1
+        """How many of a sweep's jobs may run at once. Ignored unless this is a sweep."""
         self.show_hidden = False
         self._inspection: dict[str, Any] | None = None
         self._prompt_mode = ""
@@ -114,6 +132,7 @@ class SubmitScreen(DispatchScreen):
                 label.append(entry["name"], style=Palette.MUTED)
             view.append(ListItem(Label(label)))
 
+        self.sweep = listing.get("sweep")
         self.query_one("#path-line", Static).update(_path_text(self.path))
         await self.inspect(listing.get("case"))
 
@@ -140,6 +159,10 @@ class SubmitScreen(DispatchScreen):
         """
         text = Text()
         result = self._inspection
+
+        if result is None and self.sweep is not None:
+            self.query_one("#detail-text", Static).update(self._sweep_detail())
+            return
 
         if result is None:
             text.append("no case here\n\n", style=Palette.MUTED)
@@ -237,6 +260,83 @@ class SubmitScreen(DispatchScreen):
             )
 
         self.query_one("#detail-text", Static).update(text)
+
+    def _sweep_detail(self) -> Text:
+        """The right-hand pane for a sweep folder.
+
+        Deliberately the same shape as the case pane -- the same aligned label/value rows,
+        the same key line -- because a sweep is not a different kind of thing to submit, it
+        is the same thing with two extra numbers on it.
+        """
+        assert self.sweep is not None
+        text = Text()
+        text.append("sweep folder\n\n", style=Palette.ACCENT)
+
+        # `concurrent` is exactly ten characters, so the default label column leaves no gap
+        # between it and its value. Widened here rather than globally: the case pane's
+        # labels are shorter and its alignment is already right.
+        _row(text, "solver", str(self.sweep["solver"]), width=SWEEP_LABEL_WIDTH)
+        _row(text, "cases", str(self.sweep["count"]), width=SWEEP_LABEL_WIDTH)
+        free = self.app_state.snapshot.get("free_cores")
+        _row(
+            text,
+            "cores/job",
+            str(self.cores),
+            note=f"{free} free" if free is not None else "",
+            width=SWEEP_LABEL_WIDTH,
+        )
+        total_gpus = int(self.app_state.snapshot.get("total_gpus", 0) or 0)
+        if self.gpus or total_gpus:
+            free_gpus = self.app_state.snapshot.get("free_gpus")
+            _row(
+                text,
+                "gpus/job",
+                str(self.gpus),
+                note=f"{free_gpus} free" if free_gpus is not None else "",
+                style=Palette.ACCENT if self.gpus else Palette.MUTED,
+                width=SWEEP_LABEL_WIDTH,
+            )
+        # The setting the whole feature exists for, so it is stated as a limit rather than
+        # left to be inferred from a bare number.
+        _row(
+            text,
+            "concurrent",
+            str(self.concurrency),
+            note=f"at most {self.concurrency * self.cores} cores in use",
+            width=SWEEP_LABEL_WIDTH,
+        )
+        if self.tags:
+            _row(text, "tags", " ".join(self.tags), width=SWEEP_LABEL_WIDTH)
+
+        text.append("\n")
+        for position, name in enumerate(self.sweep["cases"][:SWEEP_PREVIEW], start=1):
+            # Numbered, because the order is a property of the sweep the user is about to
+            # commit to and not merely how the directory happened to list.
+            text.append(f"  {position:>3} ", style=Palette.FAINT)
+            text.append(f"{name}\n", style=Palette.MUTED)
+        remaining = int(self.sweep["count"]) - SWEEP_PREVIEW
+        if remaining > 0:
+            text.append(f"      and {remaining} more — press d to review\n", style=Palette.FAINT)
+
+        text.append("\n")
+        text.append(
+            _keyline(
+                ("s", "submit sweep"),
+                ("d", "review"),
+                ("c", "cores/job"),
+                ("m", "max at once"),
+            )
+        )
+        return text
+
+    def action_edit_concurrency(self) -> None:
+        """Set how many of a sweep's jobs may run at once."""
+        if self.sweep is None:
+            self.notify_error("This directory is not a sweep folder")
+            return
+        self._open_prompt(
+            "concurrency", f"concurrent jobs (currently {self.concurrency}): "
+        )
 
     def on_resize(self) -> None:
         """Re-wrap the detail pane when its width changes.
@@ -343,6 +443,14 @@ class SubmitScreen(DispatchScreen):
         box.remove_class("visible")
         self.query_one("#entries", ListView).focus()
 
+        if self._prompt_mode == "concurrency" and value:
+            try:
+                self.concurrency = max(1, int(value))
+            except ValueError:
+                self.notify_error(f"{value!r} is not a number")
+            else:
+                self._render_detail()
+            return
         if self._prompt_mode == "cores" and value:
             try:
                 self.cores = max(1, int(value))
@@ -372,6 +480,9 @@ class SubmitScreen(DispatchScreen):
 
     async def action_dry_run(self) -> None:
         """Show the execution plan without submitting anything."""
+        if self._inspection is None and self.sweep is not None:
+            await self._review_sweep()
+            return
         if self._inspection is None or "error" in self._inspection:
             self.notify_error("This directory is not a recognised case.")
             return
@@ -391,6 +502,9 @@ class SubmitScreen(DispatchScreen):
         await self._submit(force=True)
 
     async def _submit(self, *, force: bool) -> None:
+        if self._inspection is None and self.sweep is not None:
+            await self._submit_sweep()
+            return
         if self._inspection is None or "error" in self._inspection:
             self.notify_error("This directory is not a recognised case.")
             return
@@ -414,6 +528,69 @@ class SubmitScreen(DispatchScreen):
 
         job = result["job"]
         self.notify_ok(f"Queued {job['name']} ({job['cores']} cores)")
+        self.dismiss()
+
+    async def _review_sweep(self) -> None:
+        """Show what submitting this folder as a sweep would do, without doing it.
+
+        The per-case plan comes from the ordinary ``case.dryrun`` path, run against the
+        first case: every member of a sweep is the same solver with the same resources, so
+        one case's plan is the plan, and asking for it through the existing endpoint means
+        the review cannot drift from what submission will actually do. What the sweep adds
+        on top -- the full ordered case list, the cap, the ceiling on cores -- is carried
+        alongside it rather than recomputed anywhere.
+        """
+        assert self.sweep is not None
+        first = self.path / self.sweep["cases"][0]
+        try:
+            report = await self.dispatch_app.call(
+                Method.CASE_DRYRUN,
+                workdir=str(first),
+                cores=self.cores,
+                gpus=self.gpus,
+            )
+        except Exception as exc:
+            self.notify_error(str(exc))
+            return
+
+        self.app.push_screen(
+            PlanScreen(
+                report,
+                sweep={
+                    "root": str(self.path),
+                    "solver": self.sweep["solver"],
+                    "cases": list(self.sweep["cases"]),
+                    "cores_per_job": self.cores,
+                    "gpus_per_job": self.gpus,
+                    "concurrency": self.concurrency,
+                },
+            )
+        )
+
+    async def _submit_sweep(self) -> None:
+        """Queue the whole folder as one sweep.
+
+        No force variant: a sweep is refused only when the daemon no longer sees it as one,
+        which force could not make true anyway.
+        """
+        try:
+            result = await self.dispatch_app.call(
+                Method.SWEEP_SUBMIT,
+                root=str(self.path),
+                cores_per_job=self.cores,
+                concurrency=self.concurrency,
+                gpus=self.gpus,
+                tags=self.tags,
+            )
+        except Exception as exc:
+            self.notify_error(str(exc))
+            return
+
+        sweep = result["sweep"]
+        self.notify_ok(
+            f"Queued sweep {sweep['name']}: {sweep['total']} cases, "
+            f"{sweep['cores_per_job']} cores each, {sweep['concurrency']} at a time"
+        )
         self.dismiss()
 
 
@@ -476,15 +653,52 @@ class PlanScreen(DispatchScreen):
 
     BINDINGS = [Binding("escape,q,enter", "back", "back")]
 
-    def __init__(self, report: dict[str, Any]) -> None:
+    def __init__(self, report: dict[str, Any], *, sweep: dict[str, Any] | None = None) -> None:
         super().__init__()
         self.report = report
+        self.sweep = sweep
+        """Sweep context, when the report is one case standing in for a whole folder."""
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
         yield Static("", id="heading")
         yield Static(self._body(), id="plan")
         yield from self.compose_footer()
+
+    def _sweep_summary(self) -> Text:
+        """What the sweep would submit: every case, in order, and the limits on them.
+
+        The whole list, not a preview. This is the screen the user opens *to check* the
+        order and membership before committing, so truncating it would remove the only
+        reason to open it.
+        """
+        assert self.sweep is not None
+        sweep = self.sweep
+        cases = sweep["cases"]
+        cores = int(sweep["cores_per_job"])
+        concurrency = int(sweep["concurrency"])
+
+        text = Text()
+        text.append("sweep\n\n", style=Palette.ACCENT)
+        _row(text, "folder", str(sweep["root"]), width=12)
+        _row(text, "solver", str(sweep["solver"]), width=12)
+        _row(text, "cases", f"{len(cases)} jobs", width=12)
+        _row(text, "cores/job", str(cores), width=12)
+        if sweep.get("gpus_per_job"):
+            _row(text, "gpus/job", str(sweep["gpus_per_job"]), width=12)
+        _row(
+            text,
+            "concurrent",
+            str(concurrency),
+            note=f"a hard cap; at most {concurrency * cores} cores in use at once",
+            width=12,
+        )
+
+        text.append("\norder\n", style=Palette.FAINT)
+        for position, name in enumerate(cases, start=1):
+            text.append(f"  {position:>3} ", style=Palette.FAINT)
+            text.append(f"{name}\n", style=Palette.TEXT)
+        return text
 
     def _body(self) -> Text:
         """The dry-run report.
@@ -495,6 +709,10 @@ class PlanScreen(DispatchScreen):
         """
         report = self.report
         text = Text()
+
+        if self.sweep is not None:
+            text.append(self._sweep_summary())
+            text.append("\nplan for each case\n\n", style=Palette.FAINT)
 
         _row(text, "case", str(report["workdir"]), width=12)
         if report["detections"]:
