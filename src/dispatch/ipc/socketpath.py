@@ -20,9 +20,36 @@ import os
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
-__all__ = ["MAX_SOCKET_PATH", "connect_unix", "is_too_long", "start_unix_server"]
+from dispatch.ipc.protocol import MAX_MESSAGE_BYTES
+
+__all__ = [
+    "MAX_SOCKET_PATH",
+    "STREAM_LIMIT",
+    "connect_unix",
+    "is_too_long",
+    "start_unix_server",
+]
+
+STREAM_LIMIT: Final = MAX_MESSAGE_BYTES
+"""Buffer size for both ends of the socket, in bytes.
+
+Passed explicitly because asyncio's default is 64 KiB, and leaving it implicit gives the
+protocol two ceilings 64x apart: the one it documents and enforces
+(:data:`~dispatch.ipc.protocol.MAX_MESSAGE_BYTES`, 4 MiB) and the one that actually fires.
+
+That gap is not a tidiness problem. ``readuntil`` raises ``LimitOverrunError`` when a line
+outruns this buffer, and a reader treats that as the stream being unusable -- so a response
+merely *larger than 64 KiB* ends the connection, and the failure surfaces nowhere near its
+cause: the daemon logs nothing, because the daemon did nothing. A ``job.list`` of about
+forty-six jobs is enough to cross it, which is to say the interface worked until the user
+had run enough jobs and then stopped.
+
+Sized to ``MAX_MESSAGE_BYTES`` so the buffer and the enforced limit are the same number.
+Oversized messages are still refused -- by the explicit length check in
+:func:`~dispatch.ipc.codec.read_message`, which reports what happened.
+"""
 
 MAX_SOCKET_PATH = 100
 """Conservative ceiling. The kernel's limit is 108 including the NUL terminator; leaving
@@ -64,16 +91,16 @@ async def start_unix_server(
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if not is_too_long(path):
-        return await asyncio.start_unix_server(handler, path=str(path))
+        return await asyncio.start_unix_server(handler, path=str(path), limit=STREAM_LIMIT)
 
     with _in_directory(path.parent):
-        return await asyncio.start_unix_server(handler, path=path.name)
+        return await asyncio.start_unix_server(handler, path=path.name, limit=STREAM_LIMIT)
 
 
 async def connect_unix(path: Path) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Connect to a Unix socket, working around the path length limit."""
     if not is_too_long(path):
-        return await asyncio.open_unix_connection(str(path))
+        return await asyncio.open_unix_connection(str(path), limit=STREAM_LIMIT)
 
     with _in_directory(path.parent):
-        return await asyncio.open_unix_connection(path.name)
+        return await asyncio.open_unix_connection(path.name, limit=STREAM_LIMIT)

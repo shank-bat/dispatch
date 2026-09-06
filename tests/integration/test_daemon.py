@@ -570,3 +570,65 @@ async def test_several_clients_share_one_daemon(daemon: Daemon, tmp_path: Path) 
     finally:
         for connection in clients:
             await connection.close()
+
+
+# -- responses larger than a default stream buffer ------------------------------------------
+#
+# asyncio's StreamReader defaults to a 64 KiB buffer, and `readuntil` treats a line that
+# outruns it as the stream being unusable. Left implicit, that gives the protocol two
+# ceilings 64x apart -- the 4 MiB it documents and enforces, and the 64 KiB that actually
+# fires -- and a reply merely larger than 64 KiB ends the connection. The daemon logs
+# nothing, because the daemon did nothing, so it reads as "the daemon is unreachable".
+#
+# It is a threshold bug: it appears only once the machine has enough history for one reply
+# to cross 64 KiB, which is roughly forty-odd jobs.
+
+
+def test_the_stream_buffer_matches_the_enforced_message_limit() -> None:
+    """One ceiling, not two. The buffer is what silently truncates; the check is what reports."""
+    from dispatch.ipc.protocol import MAX_MESSAGE_BYTES
+    from dispatch.ipc.socketpath import STREAM_LIMIT
+
+    assert STREAM_LIMIT == MAX_MESSAGE_BYTES
+
+
+async def test_a_reply_larger_than_64k_does_not_drop_the_connection(
+    client: DaemonClient, daemon: Daemon, tmp_path: Path
+) -> None:
+    """The exact failure: a big `job.list` looked like the daemon hanging up.
+
+    Enough jobs are queued for the reply to cross the old 64 KiB buffer, then the whole
+    page is fetched in one call -- which is what the interface does on every connect.
+    """
+    for index in range(60):
+        await client.call(
+            Method.JOB_SUBMIT,
+            workdir=str(make_case(tmp_path / f"case_{index:03d}", script="exit 0")),
+            cores=1,
+        )
+
+    page = await client.call(Method.JOB_LIST, limit=500)
+
+    assert len(page["items"]) >= 60
+    assert client.connected, "a large reply must not be reported as a disconnection"
+    # Still usable afterwards: the read loop is the thing that used to die.
+    assert await client.call(Method.SYSTEM_SNAPSHOT)
+
+
+async def test_the_interface_caches_a_full_queue_on_connect(
+    client: DaemonClient, daemon: Daemon, tmp_path: Path
+) -> None:
+    """What the user actually saw: the TUI's own startup call, at its own page size."""
+    for index in range(60):
+        await client.call(
+            Method.JOB_SUBMIT,
+            workdir=str(make_case(tmp_path / f"job_{index:03d}", script="exit 0")),
+            cores=1,
+        )
+
+    snapshot = await client.call(Method.SYSTEM_SNAPSHOT)
+    page = await client.call(Method.JOB_LIST, limit=500)
+    sweeps = await client.call(Method.SWEEP_LIST)
+
+    assert snapshot and page["items"] and sweeps is not None
+    assert client.connected
