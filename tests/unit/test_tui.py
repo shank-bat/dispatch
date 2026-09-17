@@ -991,3 +991,95 @@ async def test_the_dashboard_says_nothing_when_no_sweep_is_active(
         screen.refresh_view()
         await pilot.pause()
         assert str(screen._sweeps()) == ""
+
+
+# -- the logo: which terminals get the real picture ----------------------------------------
+#
+# graphics_supported() decides whether a terminal is trusted with the kitty graphics
+# protocol. It has to be right in both directions: too eager and a terminal that cannot
+# actually composite the placeholder cells shows a grid of raw glyphs on top of the
+# artwork instead of a bird; too conservative and terminals that work perfectly well get
+# downgraded to the text rendering for nothing.
+
+
+def _graphics_supported_with_tty(monkeypatch: pytest.MonkeyPatch, **env: str) -> bool:
+    """Call graphics_supported() as if stdin/stdout were a real terminal.
+
+    The function's very first check is "is this even a terminal", which every one of
+    these tests wants to get past so it is actually exercising the terminal-identity
+    logic underneath -- a plain subprocess call, with its output piped, would return
+    False at that first line regardless of which environment variables are set, and would
+    look like a passing test for entirely the wrong reason.
+    """
+    from dispatch.tui import logo
+
+    # A real fileno() that points nowhere useful, not a missing one: production code
+    # only ever meets genuine file objects, and the nearest a fake gets to one is a
+    # descriptor that fails the *next* real syscall (termios.tcgetattr) the same way a
+    # closed or redirected stdin would -- caught already, by the same OSError/ValueError
+    # handling that covers those.
+    tty = type("Tty", (), {"isatty": lambda self: True, "fileno": lambda self: -1})
+    monkeypatch.setattr(logo.sys, "__stdout__", tty())
+    monkeypatch.setattr(logo.sys, "__stdin__", tty())
+    for key in (
+        "TERM", "TERM_PROGRAM", "KITTY_WINDOW_ID", "KONSOLE_VERSION", "WEZTERM_PANE",
+        "TMUX", "STY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    logo.graphics_supported.cache_clear()
+    try:
+        return logo.graphics_supported()
+    finally:
+        logo.graphics_supported.cache_clear()
+
+
+def test_konsole_is_refused_the_real_picture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The regression this exists for: Konsole acknowledges the protocol but does not
+    composite Unicode placeholder cells, so trusting it does not lose the bird -- it draws
+    a visible grid of raw placeholder glyphs on top of it, which is worse than the text
+    fallback ever is.
+    """
+    assert _graphics_supported_with_tty(
+        monkeypatch, TERM="xterm-256color", KONSOLE_VERSION="24080200"
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"TERM": "xterm-kitty", "KITTY_WINDOW_ID": "1"},
+        {"TERM": "xterm-256color", "TERM_PROGRAM": "ghostty"},
+        {"TERM": "xterm-256color", "WEZTERM_PANE": "0"},
+    ],
+    ids=["kitty", "ghostty", "wezterm"],
+)
+def test_terminals_that_actually_work_are_still_trusted(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    """Denying Konsole specifically must not have widened the net by accident."""
+    assert _graphics_supported_with_tty(monkeypatch, **env) is True
+
+
+def test_a_multiplexer_is_still_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unchanged by the Konsole fix: a passthrough that may not be configured is still a
+    risk not worth taking, for kitty itself running inside tmux as much as anything else.
+    """
+    assert (
+        _graphics_supported_with_tty(
+            monkeypatch, TERM="xterm-kitty", KITTY_WINDOW_ID="1", TMUX="/tmp/x"
+        )
+        is False
+    )
+
+
+def test_an_unrecognised_terminal_is_asked_rather_than_assumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No env var names a graphics terminal and nothing denies one either -- the honest
+    answer is "ask it", not a guess in either direction. Asking means writing to and
+    reading from a real terminal, which does not exist in this test process, so the
+    question itself is expected to come back negative here.
+    """
+    assert _graphics_supported_with_tty(monkeypatch, TERM="xterm-256color") is False

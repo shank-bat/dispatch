@@ -17,12 +17,15 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Container, Vertical
+from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import Footer, Label, Static
 
+from dispatch.tui import logo
+from dispatch.tui.state import core_hours_used
 from dispatch.tui.theme import Palette
+from dispatch.tui.widgets.meters import HeaderStats
 
 if TYPE_CHECKING:
     from dispatch.tui.app import DispatchApp
@@ -30,12 +33,28 @@ if TYPE_CHECKING:
 
 __all__ = ["ConfirmScreen", "DispatchScreen", "run_when_confirmed"]
 
-SEPARATOR = "  ·  "
 """Between fields in the top bar.
 
 A middle dot with generous space either side, rather than a pipe. It separates without
 drawing a line, which is the whole idea.
 """
+
+
+_TRANSMITTED = False
+
+
+def _prepare_logo() -> None:
+    """Give the terminal whatever the logo needs, once, however many screens mount.
+
+    Failure is not worth reporting: the mark degrades to the wordmark alone, and nothing
+    else about the interface depends on it.
+    """
+    global _TRANSMITTED
+    if _TRANSMITTED:
+        return
+    _TRANSMITTED = True
+    with contextlib.suppress(Exception):
+        logo.load().prepare()
 
 
 class DispatchScreen(Screen[None]):
@@ -75,6 +94,10 @@ class DispatchScreen(Screen[None]):
         when the top bar mattered most.
         """
         chrome = Vertical(id="chrome")
+        header_row = Horizontal(id="header-row")
+        header_row.compose_add_child(Static(logo.load().render(), id="logo"))
+        header_row.compose_add_child(HeaderStats(id="header-stats"))
+        chrome.compose_add_child(header_row)
         chrome.compose_add_child(Static("", id="banner"))
         chrome.compose_add_child(Static("", id="topbar"))
         yield chrome
@@ -99,9 +122,6 @@ class DispatchScreen(Screen[None]):
         arrives, so the eye can ignore it once learned.
         """
         text = Text()
-        text.append("dispatch", style=f"bold {Palette.TEXT}")
-        text.append(SEPARATOR, style=Palette.FAINT)
-
         for index, (key, label) in enumerate(self.NAV):
             if index:
                 text.append("   ", style=Palette.FAINT)
@@ -129,6 +149,17 @@ class DispatchScreen(Screen[None]):
 
         topbar.update(_justify(self.topbar_left(), self.topbar_right(), self.size.width - 4))
 
+        # The machine's numbers, beside the logo. Updated from the same place the topbar
+        # is, rather than given its own timer: every screen that keeps the clock ticking
+        # already calls update_status on the same schedule, and one that does not tick
+        # every second (history, submit, plot) is no worse off than the topbar's own clock
+        # already is on those screens.
+        with contextlib.suppress(Exception):
+            stats = self.query_one("#header-stats", HeaderStats)
+            stats.snapshot = self.app_state.snapshot
+            stats.history = self.app_state.history
+            stats.core_hours = core_hours_used(self.app_state)
+
         heading = self.heading()
         if heading is not None:
             # Not every screen has a heading region; the log viewer, for one, has its own
@@ -155,6 +186,7 @@ class DispatchScreen(Screen[None]):
         bar, because nothing else ever asks it to draw. Async so that screens whose setup
         needs the daemon can override it without changing the signature.
         """
+        _prepare_logo()
         self.update_status()
 
     def refresh_view(self) -> None:

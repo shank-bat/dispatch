@@ -44,8 +44,37 @@ Tooltip {
     height: auto;
 }
 
-/* The top bar: application identity on the left, live status on the right. One line,
- * always in the same place, so the eye learns where to find it. */
+/* The mark and the machine's numbers, side by side, above the bar. A fixed height in
+ * both renderings of the mark -- image and text -- so the screens below do not move when
+ * the same session is opened in a terminal with different capabilities. Height must match
+ * logo.LOGO_ROWS. */
+#header-row {
+    height: 10;
+}
+
+/* No background of its own: a kitty image is composited behind these cells by the
+ * terminal, and a background would paint over it. Width hugs the content -- the bird plus
+ * the wordmark -- rather than expanding, so the stats column sits right beside it instead
+ * of off at the far edge of a wide terminal. */
+#logo {
+    width: auto;
+    height: 10;
+    padding: 0 0 0 2;
+}
+
+/* A grid of label/sparkline/value cells -- see widgets/meters.py:HeaderStats. Claims
+ * whatever the row has left beside #logo's fixed width, rather than a fixed width of its
+ * own, so the sparklines can be stretched to fill a wide terminal instead of the grid
+ * sitting undersized in the middle of blank space (HeaderStats._spark_width). */
+#header-stats {
+    width: 1fr;
+    height: 10;
+    padding: 0 2 0 3;
+    content-align: left middle;
+}
+
+/* The top bar: navigation on the left, live status on the right. One line, always in the
+ * same place, so the eye learns where to find it. */
 #topbar {
     height: 1;
     padding: 0 2;

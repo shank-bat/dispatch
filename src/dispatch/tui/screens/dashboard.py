@@ -21,7 +21,6 @@ from dispatch.tui.screens.base import DispatchScreen
 from dispatch.tui.state import sweep_summary
 from dispatch.tui.theme import Palette
 from dispatch.tui.widgets.jobtable import JobTable
-from dispatch.tui.widgets.meters import ResourceMeters
 
 __all__ = ["DashboardScreen"]
 
@@ -42,7 +41,11 @@ class DashboardScreen(DispatchScreen):
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
         with Vertical():
-            yield ResourceMeters(id="meters")
+            # No meters line of its own: the header's stats grid (see
+            # screens/base.py:compose_header, widgets/meters.py:HeaderStats) already shows
+            # cores, CPU, memory, GPU, load and core-hours beside the logo on every screen,
+            # this one included. Repeating the same six numbers immediately below it would
+            # be exactly the clutter the grid was built to avoid.
             yield Static(_section("active"), classes="section")
             yield JobTable(id="running")
             yield Static("", id="next-up")
@@ -63,7 +66,6 @@ class DashboardScreen(DispatchScreen):
         """Re-render from the cached state."""
         state = self.app_state
 
-        self.query_one("#meters", ResourceMeters).snapshot = state.snapshot
         self.query_one("#running", JobTable).show(state.running, state.progress)
         self.query_one("#recent", JobTable).show(state.finished[:8])
         self.query_one("#next-up", Static).update(self._next_up())

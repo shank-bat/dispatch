@@ -136,7 +136,7 @@ class DispatchApp(App[None]):
         except DispatchError as exc:
             self.state.error = str(exc)
             return
-        self.state.snapshot = snapshot
+        self.state.push_snapshot(snapshot)
         self.state.replace_jobs(page["items"])
         self.state.replace_sweeps(sweeps.get("sweeps") or [])
         self.state.error = None
@@ -148,7 +148,7 @@ class DispatchApp(App[None]):
         data = notification.data
 
         if event == Event.SYSTEM_STATS:
-            self.state.snapshot = data
+            self.state.push_snapshot(data)
         elif event == Event.JOB_STATE:
             self.state.update_job(data)
         elif event == Event.JOB_PROGRESS:

@@ -10,11 +10,24 @@ That is what makes the TUI genuinely disposable: killing it loses nothing.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
-__all__ = ["AppState", "sweep_summary"]
+__all__ = ["AppState", "core_hours_used", "sweep_summary"]
+
+HISTORY_LENGTH = 30
+"""Readings kept per metric, for the header's sparklines.
+
+The daemon pushes a system snapshot roughly every two seconds (see
+``SystemMonitor`` on the daemon side), so thirty of them is about a minute -- long
+enough for a trend to be visible, short enough that the line is still readable at the
+dozen-odd cells a header sparkline actually has.
+"""
+
+HISTORY_METRICS = ("cores", "cpu", "mem", "gpu")
 
 ACTIVE_STATES = ("QUEUED", "HELD", "PREPARING", "RUNNING")
 TERMINAL_STATES = ("COMPLETED", "FAILED", "CANCELLED", "REJECTED", "UNKNOWN")
@@ -38,6 +51,39 @@ class AppState:
     already cached here.
     """
     error: str | None = None
+
+    history: dict[str, deque[float]] = field(
+        default_factory=lambda: {name: deque(maxlen=HISTORY_LENGTH) for name in HISTORY_METRICS}
+    )
+    """Recent utilisation, as a percentage, per metric in :data:`HISTORY_METRICS`.
+
+    Populated by :meth:`push_snapshot` alone -- never by a plain assignment to
+    :attr:`snapshot`, which is why that method exists instead of screens setting the
+    attribute directly. ``"gpu"`` stays empty on a machine with none, which a sparkline
+    reads the same way :class:`~dispatch.tui.widgets.meters.HeaderStats` already reads an
+    empty gauge: nothing to show, rather than a flat lie at zero.
+    """
+
+    def push_snapshot(self, data: dict[str, Any]) -> None:
+        """Record a system snapshot, both as the current reading and as one more point of
+        history for the header's sparklines.
+
+        The single entry point for setting :attr:`snapshot`: every other write to it would
+        let readers accumulate silently on connect and resync alike, which is what makes it
+        safe to look at these from any picture of the machine the daemon ever hands over,
+        not only the ones a live sampler happens to push.
+        """
+        self.snapshot = data
+        total_cores = float(data.get("total_cores") or 0)
+        if total_cores:
+            self.history["cores"].append(float(data.get("allocated_cores", 0)) / total_cores * 100)
+        self.history["cpu"].append(float(data.get("cpu_percent", 0.0)))
+        total_ram = float(data.get("total_ram_mb") or 0)
+        if total_ram:
+            self.history["mem"].append(float(data.get("used_ram_mb", 0)) / total_ram * 100)
+        total_gpus = float(data.get("total_gpus") or 0)
+        if total_gpus:
+            self.history["gpu"].append(float(data.get("allocated_gpus", 0)) / total_gpus * 100)
 
     def replace_jobs(self, jobs: Sequence[dict[str, Any]]) -> None:
         """Replace the whole job cache. Used on connect and on resync."""
@@ -159,3 +205,32 @@ def sweep_summary(state: AppState, sweep: dict[str, Any]) -> str:
         f"sweep {sweep['name']}  {running} running, {done}/{total} done"
         f"  (max {sweep['concurrency']})"
     )
+
+
+def core_hours_used(state: AppState) -> float:
+    """Core-hours consumed by every job the interface currently has cached.
+
+    ``cores * elapsed hours``, summed. Finished jobs use their recorded ``runtime_s``, the
+    same figure the job table shows; a still-running job uses ``now - started_at``, so the
+    total keeps climbing while it works rather than waiting for it to finish to count.
+
+    "Cached" rather than "ever run": the interface only ever holds what one ``job.list``
+    page and the events since have told it about (state.py's own docstring), so on a
+    machine with a long history this is a total over recent jobs, not all of history. That
+    is the same boundary the rest of the interface already lives with -- the job table
+    shows the same jobs -- so this does not claim to know more than it does.
+    """
+    now = datetime.now().timestamp()
+    total_seconds = 0.0
+    for job in state.jobs.values():
+        cores = job.get("cores")
+        if not cores:
+            continue
+        runtime = (job.get("metrics") or {}).get("runtime_s")
+        if not runtime:
+            started = job.get("started_at")
+            if started and job.get("state") in ("RUNNING", "PREPARING"):
+                runtime = max(0.0, now - started)
+        if runtime:
+            total_seconds += cores * runtime
+    return total_seconds / 3600

@@ -209,7 +209,13 @@ def _run_tui(config: Config, *, autostart: bool) -> int:
         )
         return 2
 
+    from dispatch.tui import logo
     from dispatch.tui.app import DispatchApp
+
+    # Before Textual takes the screen: working out whether the terminal can draw graphics
+    # may involve asking it and reading the reply, which is only safe while nothing else
+    # owns the terminal.
+    logo.prime()
 
     app = DispatchApp(config=config, autostart=autostart)
     app.run()
