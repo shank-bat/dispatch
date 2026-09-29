@@ -31,6 +31,7 @@ class Palette:
     BORDER: Final = "#504945"
 
     TEXT: Final = "#ebdbb2"
+    LOGO_P: Final = "#ea6962"
     MUTED: Final = "#bdae93"
     FAINT: Final = "#928374"
 

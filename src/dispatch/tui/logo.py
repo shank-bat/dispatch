@@ -193,7 +193,7 @@ class Logo:
                 text.append(" " * GAP)
             index = row - offset
             if 0 <= index < len(self.wordmark):
-                text.append(self.wordmark[index], style=Palette.TEXT)
+                text.append(self.wordmark[index], style=Palette.LOGO_P)
         return text
 
 
