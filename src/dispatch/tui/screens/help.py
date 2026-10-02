@@ -23,6 +23,7 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("3", "history"),
             ("n", "new job"),
             ("space", "expand a job's latest values (dashboard)"),
+            ("m", "count physical cores / logical threads (dashboard)"),
             ("?", "this help"),
             ("q", "quit — simulations keep running"),
             ("ctrl+c", "quit"),
@@ -86,6 +87,15 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("m", "max running at once — a hard cap, not a target"),
             ("d", "review every case, in order, before submitting"),
             ("s", "submit the folder as one sweep"),
+        ],
+    ),
+    (
+        "Case information",
+        [
+            ("v", "render an image: angle, then plain mesh or a field"),
+            ("V", "render a video over every written time: angle, then field"),
+            ("x", "cancel the running render — frames already written are kept"),
+            ("r", "reload"),
         ],
     ),
     (

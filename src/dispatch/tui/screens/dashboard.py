@@ -20,7 +20,7 @@ from textual.containers import Vertical
 from textual.widgets import Static
 
 from dispatch.ipc.protocol import Method
-from dispatch.tui.screens.base import DispatchScreen
+from dispatch.tui.screens.base import DispatchScreen, run_when_confirmed
 from dispatch.tui.state import sweep_summary
 from dispatch.tui.theme import Palette
 from dispatch.tui.widgets.jobtable import JobTable
@@ -47,6 +47,7 @@ class DashboardScreen(DispatchScreen):
         Binding("p", "plot", "plot"),
         Binding("i", "case_info", "info"),
         Binding("space", "expand", "details"),
+        Binding("m", "cpu_mode", "cores/threads"),
     ]
     """The dashboard is where a running job is being watched, so the things worth doing to
     one from here -- read its output, plot its numbers, glance at its coefficients -- are
@@ -129,6 +130,74 @@ class DashboardScreen(DispatchScreen):
         job_id = self._selected()
         if job_id:
             self.dispatch_app.open_case_info(job_id=job_id)
+
+    # -- CPU counting mode ----------------------------------------------------------------
+
+    def action_cpu_mode(self) -> None:
+        """Switch between counting physical cores and logical threads.
+
+        Previewed first, because the consequences are not obvious: counting cores on a
+        machine already running jobs sized in threads leaves it over-committed until they
+        finish, and a queued job that asks for more than the new total will never start.
+        Both are spelled out before anything changes.
+        """
+        self.app.call_later(self._preview_cpu_mode)
+
+    async def _preview_cpu_mode(self) -> None:
+        try:
+            preview = await self.dispatch_app.call(
+                Method.SCHEDULER_CPU_MODE, mode="toggle", preview=True
+            )
+        except Exception as exc:
+            self.notify_error(str(exc))
+            return
+
+        target = str(preview["mode"])
+        unit = "threads" if target == "logical" else "cores"
+        previous_unit = "threads" if preview["previous"] == "logical" else "cores"
+        question = (
+            f"Count {unit} instead of {previous_unit}? "
+            f"{preview['previous_total']} {previous_unit} → {preview['total_cores']} {unit}"
+        )
+
+        lines: list[str] = []
+        if preview["relabel_only"]:
+            lines.append(
+                "scheduler.total_cores is set in the config, so only the label changes."
+            )
+        if preview["over_committed"]:
+            lines.append(
+                f"{preview['allocated_cores']} are allocated to running jobs, more than the "
+                f"{preview['schedulable_cores']} schedulable: they keep running, and nothing "
+                "new starts until enough of them finish."
+            )
+        stranded = list(preview.get("stranded") or [])
+        if stranded:
+            names = ", ".join(str(job["name"]) for job in stranded[:3])
+            more = f" and {len(stranded) - 3} more" if len(stranded) > 3 else ""
+            lines.append(
+                f"{len(stranded)} queued job(s) ask for more than {preview['schedulable_cores']} "
+                f"and will not start in this mode: {names}{more}."
+            )
+        if not lines:
+            lines.append("Running jobs keep what they were given; only new admissions change.")
+
+        run_when_confirmed(
+            self,
+            question,
+            lambda: self.app.call_later(self._apply_cpu_mode, target),
+            detail="\n".join(lines),
+        )
+
+    async def _apply_cpu_mode(self, target: str) -> None:
+        try:
+            result = await self.dispatch_app.call(Method.SCHEDULER_CPU_MODE, mode=target)
+        except Exception as exc:
+            self.notify_error(str(exc))
+            return
+        unit = "threads" if result["mode"] == "logical" else "cores"
+        self.notify_ok(f"Scheduling {result['total_cores']} {unit}")
+        await self.dispatch_app.resync()
 
     # -- the expander ---------------------------------------------------------------------
 

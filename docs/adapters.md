@@ -322,6 +322,7 @@ All additive, all with safe defaults, so `ADAPTER_API_VERSION` is unchanged.
 | `describe_case(ctx)` | a page naming the solver | The `i` view. Build it with `core.caseinfo.ReportBuilder`; format your own numbers; give empty sections a `missing` reason. |
 | `geometry(ctx)` | `None` ("cannot tell", treated as 3-D) | Rendering. Return `CaseGeometry` with bounds and dimensionality from your solver's own conventions. |
 | `visualise(ctx, request)` | `None` | `dispatch render`. Return a `VisualPlan` of `CommandStep`s; return `None` when the renderer is not installed. |
+| `visual_fields(ctx)` | `()` | The render field chooser. Return `VisualField(name, kind, label)` for each field `visualise` can colour by, most useful first. |
 
 Two context fields matter to some adapters:
 

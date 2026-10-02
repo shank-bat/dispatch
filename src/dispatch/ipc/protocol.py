@@ -66,6 +66,8 @@ class Method(StrEnum):
     DAEMON_INFO = "daemon.info"
     DAEMON_SHUTDOWN = "daemon.shutdown"
     SYSTEM_SNAPSHOT = "system.snapshot"
+    SCHEDULER_CPU_MODE = "scheduler.cpu_mode"
+    """Switch, or preview switching, between physical cores and logical threads (§4.3.2)."""
 
     JOB_SUBMIT = "job.submit"
     JOB_LIST = "job.list"
@@ -101,6 +103,12 @@ class Method(StrEnum):
     CASE_RENDER = "case.render"
     """Render a picture of a case -- a mesh screenshot or an animation (§8.10)."""
 
+    CASE_FIELDS = "case.fields"
+    """The fields a render of a case can be coloured by (§8.10)."""
+
+    RENDER_LIST = "render.list"
+    RENDER_CANCEL = "render.cancel"
+
     CASE_INFO = "case.info"
     """A full human-readable description of a case directory (§9.8)."""
 
@@ -124,6 +132,8 @@ class Topic(StrEnum):
     QUEUE = "queue"
     SYSTEM = "system"
     DAEMON = "daemon"
+    RENDERS = "renders"
+    """Progress and completion of background renders (§8.10)."""
 
 
 class Event(StrEnum):
@@ -135,6 +145,8 @@ class Event(StrEnum):
     SYSTEM_STATS = "system.stats"
     DAEMON_SHUTDOWN = "daemon.shutdown"
     RESYNC = "resync"
+    RENDER_PROGRESS = "render.progress"
+    RENDER_FINISHED = "render.finished"
     """The client's event queue overflowed and was dropped; refetch everything."""
 
 
@@ -145,6 +157,8 @@ EVENT_TOPICS: Final[dict[Event, Topic]] = {
     Event.SYSTEM_STATS: Topic.SYSTEM,
     Event.DAEMON_SHUTDOWN: Topic.DAEMON,
     Event.RESYNC: Topic.DAEMON,
+    Event.RENDER_PROGRESS: Topic.RENDERS,
+    Event.RENDER_FINISHED: Topic.RENDERS,
 }
 
 
@@ -262,6 +276,7 @@ def encode_snapshot(snapshot: SystemSnapshot) -> dict[str, Any]:
         "reserved_cores": snapshot.reserved_cores,
         "free_cores": snapshot.free_cores,
         "cpu_mode": snapshot.cpu_mode,
+        "cpu_mode_source": snapshot.cpu_mode_source,
         "core_unit": snapshot.core_unit,
         "total_gpus": snapshot.total_gpus,
         "allocated_gpus": snapshot.allocated_gpus,

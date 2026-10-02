@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import TextIO
 
 from dispatch.adapters.registry import build_default_registry
-from dispatch.core.config import Config, load_config
+from dispatch.core.config import Config, CpuMode, load_config
 from dispatch.core.errors import DispatchError
 from dispatch.daemon.dryrun import CaseInspector
 from dispatch.daemon.events import EventBus
@@ -41,7 +41,7 @@ from dispatch.daemon.notify import Notifier, event_for_state
 from dispatch.daemon.policies import build_policy
 from dispatch.daemon.provenance import ProvenanceCollector
 from dispatch.daemon.recovery import recover
-from dispatch.daemon.resources import ResourceModel
+from dispatch.daemon.resources import CPU_MODE_SETTING, ResourceModel
 from dispatch.daemon.scheduler import Scheduler
 from dispatch.daemon.selfcheck import survives_logout
 from dispatch.daemon.server import IpcServer
@@ -124,6 +124,7 @@ class Daemon:
         self.conn = connect(config.paths.database)
         migrate(self.conn)
         self.repo = JobRepository(self.conn, specs=self.registry.specs())
+        self._restore_cpu_mode()
 
         self.monitor = SystemMonitor(resources=self.resources, bus=self.bus, config=config.daemon)
         self.bus._on_demand_change = self.monitor.on_demand_change
@@ -166,6 +167,25 @@ class Daemon:
             bus=self.bus,
             on_shutdown=self.request_stop,
         )
+
+    def _restore_cpu_mode(self) -> None:
+        """Re-apply a CPU mode chosen from the interface before the daemon last stopped.
+
+        Before recovery and before the first admission pass, so the ledger rebuilt from the
+        surviving jobs is measured in the units the dashboard last showed. An unreadable value
+        -- written by a future version, say -- is ignored with a warning rather than allowed
+        to stop the daemon; the config file's mode then applies.
+        """
+        stored = self.repo.get_setting(CPU_MODE_SETTING)
+        if stored is None:
+            return
+        try:
+            mode = CpuMode(stored)
+        except ValueError:
+            log.warning("Ignoring unknown stored CPU mode %r; using the config file's", stored)
+            return
+        self.resources.set_cpu_mode(mode)
+        log.info("CPU mode %s, as last chosen from the interface", mode.value)
 
     # -- lifecycle ------------------------------------------------------------------------
 

@@ -329,3 +329,34 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
         ).fetchone()
     )
+
+
+# -- settings (migration 007) ------------------------------------------------------------------
+
+
+def test_an_upgraded_database_has_somewhere_to_keep_settings(tmp_path: Path) -> None:
+    """A choice made in the interface must outlive the daemon, without editing config.toml."""
+    conn = at_version(tmp_path / "settings.db", 6)
+    legacy_job(conn, "66666666-6666-6666-6666-666666666666", name="cavity", cores=4)
+    migrate(conn)
+
+    repo = JobRepository(conn, clock=FakeClock())
+    assert repo.get_setting("scheduler.cpu_mode") is None
+    repo.set_setting("scheduler.cpu_mode", "logical")
+    assert repo.get_setting("scheduler.cpu_mode") == "logical"
+    assert repo.list_jobs(limit=1).items[0].name == "cavity"
+    conn.close()
+
+
+def test_a_setting_is_replaced_rather_than_duplicated(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "s.db")
+    migrate(conn)
+    repo = JobRepository(conn, clock=FakeClock())
+    repo.set_setting("k", "a")
+    repo.set_setting("k", "b")
+    assert repo.get_setting("k") == "b"
+    assert conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 1
+    repo.clear_setting("k")
+    assert repo.get_setting("k") is None
+    repo.clear_setting("k")  # clearing what is not there is not an error
+    conn.close()

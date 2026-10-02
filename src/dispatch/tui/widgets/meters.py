@@ -209,7 +209,13 @@ class HeaderStats(Static):
         text = Text(no_wrap=True, overflow="crop")
         rows = (
             (
-                ("core", self.history.get("cores", ()), f"{allocated}/{total}"),
+                # The ledger's own unit, never guessed: in logical mode these are threads,
+                # and labelling them cores would misstate the number admission runs on.
+                (
+                    "thrd" if data.get("cpu_mode") == "logical" else "core",
+                    self.history.get("cores", ()),
+                    f"{allocated}/{total}",
+                ),
                 ("cpu", self.history.get("cpu", ()), f"{cpu:.0f}%"),
             ),
             (

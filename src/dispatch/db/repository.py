@@ -412,6 +412,30 @@ class JobRepository:
         ).fetchall()
         return self._hydrate(rows)
 
+    # -- interface settings -----------------------------------------------------------
+
+    def get_setting(self, key: str) -> str | None:
+        """A setting changed from the interface, or ``None`` when the config file rules."""
+        row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Record an interface override, replacing any earlier one."""
+        with transaction(self._conn):
+            self._conn.execute(
+                """
+                INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT (key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at
+                """,
+                (key, value, self._clock.now()),
+            )
+
+    def clear_setting(self, key: str) -> None:
+        """Drop an override, returning the setting to whatever config.toml says."""
+        with transaction(self._conn):
+            self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
     def jobs_for_workdir(self, workdir: Path) -> Sequence[Job]:
         """Every job that ran in a directory, newest first.
 

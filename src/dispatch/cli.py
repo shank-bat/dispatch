@@ -192,7 +192,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="isometric",
         help="front, back, left, right, top, bottom or isometric (default: isometric)",
     )
-    render.add_argument("--field", help="field to colour by, e.g. p or U")
+    render.add_argument("--field", help="field to colour by, e.g. p or U (see --list-fields)")
+    render.add_argument(
+        "--list-fields", action="store_true", help="list the fields this case offers, then stop"
+    )
+    render.add_argument("--fps", type=int, default=24, help="animation frames per second")
+    render.add_argument(
+        "--discard-frames",
+        action="store_true",
+        help="delete the uncompressed frames once the video is encoded",
+    )
     render.add_argument("--frames", type=int, metavar="N", help="cap the animation length")
     render.add_argument("--width", type=int, default=1600)
     render.add_argument("--height", type=int, default=1000)
@@ -205,6 +214,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     case_info = sub.add_parser("case", help="describe a case directory in full")
     case_info.add_argument("path", type=Path, help="the case directory")
+
+    cpu_mode = sub.add_parser(
+        "cpu-mode", help="show or switch whether Dispatch counts physical cores or threads"
+    )
+    cpu_mode.add_argument(
+        "mode", nargs="?", choices=["physical", "logical", "toggle"], help="omit to show"
+    )
 
     sub.add_parser("status", help="show the machine and the queue")
     sub.add_parser("tags", help="list tags in use")
@@ -516,8 +532,16 @@ async def _show(client: DaemonClient, args: Any, console: Any, config: Config) -
 
 
 async def _render(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
-    """Render a case with ParaView, headlessly."""
+    """Render a case with ParaView, headlessly; an animation is encoded to video by ffmpeg."""
     path = args.path.expanduser().resolve()
+    if args.list_fields:
+        listing = await client.call(Method.CASE_FIELDS, path=str(path))
+        for item in listing["fields"]:
+            console.print(f"  {item['name']:<20} [dim]{item['kind']:<7} {item['label']}[/dim]")
+        if not listing["fields"]:
+            console.print("[dim]No fields found in this case's time directories.[/dim]")
+        return 0
+
     result = await client.call(
         Method.CASE_RENDER,
         path=str(path),
@@ -527,17 +551,21 @@ async def _render(client: DaemonClient, args: Any, console: Any, config: Config)
         frames=args.frames,
         width=args.width,
         height=args.height,
+        fps=args.fps,
+        keep_frames=not args.discard_frames,
         dry_run=args.render_dry_run,
+        # A command line has nothing else to do while it waits, unlike the interface.
+        wait=not args.render_dry_run,
     )
     for note in result["notes"]:
         console.print(f"  [yellow]note[/yellow] {note}")
     console.print(f"  [bold]Tool[/bold]    {result['tool']}")
     if not result["rendered"]:
-        console.print(f"  [bold]Command[/bold] {' '.join(result['command'])}")
+        for index, step in enumerate(result["steps"], start=1):
+            console.print(f"  [bold]{index}[/bold] {step['description']}")
+            console.print(f"    [dim]{' '.join(step['command'])}[/dim]")
         console.print("\n  [dim]Nothing was rendered.[/dim]")
         return 0
-    for line in result["produced"]:
-        console.print(f"  {line}")
     for output in result["outputs"]:
         console.print(f"  [green]wrote[/green] {output}")
     return 0
@@ -560,6 +588,29 @@ async def _case(client: DaemonClient, args: Any, console: Any, config: Config) -
             styled = f"[cyan]{value}[/cyan]" if item["important"] else value
             note = f"  [dim]{item['note']}[/dim]" if item["note"] else ""
             console.print(f"  {item['label']:<20} {styled}{note}")
+    return 0
+
+
+async def _cpu_mode(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
+    """Show or switch the CPU counting mode."""
+    if args.mode is None:
+        snapshot = await client.call(Method.SYSTEM_SNAPSHOT)
+        console.print(
+            f"{snapshot.get('cpu_mode', 'physical')}: {snapshot['total_cores']} "
+            f"{snapshot.get('core_unit', 'core')}s  "
+            f"[dim](from {snapshot.get('cpu_mode_source', 'config')})[/dim]"
+        )
+        return 0
+    result = await client.call(Method.SCHEDULER_CPU_MODE, mode=args.mode)
+    unit = "threads" if result["mode"] == "logical" else "cores"
+    console.print(f"Scheduling {result['total_cores']} {unit} ({result['mode']})")
+    if result["over_committed"]:
+        console.print(
+            f"  [yellow]{result['allocated_cores']} allocated exceeds "
+            f"{result['schedulable_cores']} schedulable; nothing new starts until jobs end[/yellow]"
+        )
+    for job in result["stranded"]:
+        console.print(f"  [yellow]{job['name']} asks for {job['cores']} and cannot start[/yellow]")
     return 0
 
 
@@ -941,6 +992,7 @@ _HANDLERS = {
     "priority": _priority,
     "repartition": _repartition,
     "render": _render,
+    "cpu-mode": _cpu_mode,
     "case": _case,
     "rm": _rm,
     "tag": _tag,

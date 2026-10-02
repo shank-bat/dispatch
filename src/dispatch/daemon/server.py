@@ -23,7 +23,7 @@ from typing import Any
 from dispatch.adapters.base import DEFAULT_LOG_NAME
 from dispatch.adapters.registry import AdapterRegistry
 from dispatch.core.clock import Clock, SystemClock
-from dispatch.core.config import Config
+from dispatch.core.config import Config, CpuMode
 from dispatch.core.errors import DispatchError, ValidationError
 from dispatch.core.metadata import CaseMetadata
 from dispatch.core.models import JobSpec, ResourceRequest, SweepSpec
@@ -38,7 +38,8 @@ from dispatch.daemon.joblog import assign_log_paths
 from dispatch.daemon.monitor import SystemMonitor
 from dispatch.daemon.plotdata import extract_datasets, latest_case_values
 from dispatch.daemon.projects import search_projects
-from dispatch.daemon.resources import ResourceModel
+from dispatch.daemon.renders import RenderManager
+from dispatch.daemon.resources import CPU_MODE_SETTING, ResourceModel
 from dispatch.daemon.scheduler import Scheduler
 from dispatch.db.repository import JobRepository
 from dispatch.ipc.codec import ProtocolError, read_message, write_message
@@ -137,6 +138,7 @@ class IpcServer:
         self._server: asyncio.Server | None = None
         self._sessions: set[ClientSession] = set()
         self._started_at = self._clock.now()
+        self._renders = RenderManager(bus)
         self._handlers: dict[str, Handler] = self._build_handlers()
 
     # -- lifecycle ------------------------------------------------------------------------
@@ -156,7 +158,13 @@ class IpcServer:
         log.info("Listening on %s", path)
 
     async def stop(self) -> None:
-        """Tell clients the daemon is going away, then close the socket."""
+        """Tell clients the daemon is going away, stop renders, then close the socket.
+
+        Renders are stopped rather than left running: unlike a simulation, a renderer is not
+        re-adopted on restart, so one left behind would be an orphan using the machine with
+        nothing left to report its result to.
+        """
+        await self._renders.shutdown()
         self._bus.publish(Event.DAEMON_SHUTDOWN, {"reason": "the daemon is shutting down"})
         await asyncio.sleep(0)  # let the notification reach session outboxes
 
@@ -274,6 +282,7 @@ class IpcServer:
             Method.DAEMON_INFO: self._daemon_info,
             Method.DAEMON_SHUTDOWN: self._daemon_shutdown,
             Method.SYSTEM_SNAPSHOT: self._system_snapshot,
+            Method.SCHEDULER_CPU_MODE: self._scheduler_cpu_mode,
             Method.JOB_SUBMIT: self._job_submit,
             Method.SWEEP_SUBMIT: self._sweep_submit,
             Method.SWEEP_LIST: self._sweep_list,
@@ -296,6 +305,9 @@ class IpcServer:
             Method.CASE_VALIDATE: self._case_validate,
             Method.CASE_INFO: self._case_info,
             Method.CASE_RENDER: self._case_render,
+            Method.CASE_FIELDS: self._case_fields,
+            Method.RENDER_LIST: self._render_list,
+            Method.RENDER_CANCEL: self._render_cancel,
             Method.CASE_DRYRUN: self._case_dryrun,
             Method.FS_LIST: self._fs_list,
             Method.PROJECTS_SEARCH: self._projects_search,
@@ -353,6 +365,75 @@ class IpcServer:
 
     def _system_snapshot(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
         return encode_snapshot(self._monitor.snapshot())
+
+    def _scheduler_cpu_mode(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Switch -- or, with ``preview``, describe switching -- what a core means.
+
+        The preview exists because the consequences are not obvious and some are not
+        reversible by waiting: going from threads to cores on a busy machine can leave the
+        ledger over-committed until jobs finish, and a queued job asking for more cores than
+        the new total will never start. The dashboard shows both before asking to confirm.
+
+        Persisted in the daemon's settings table rather than config.toml (migration 007).
+        Choosing the config file's own value clears the override, so "back to what the file
+        says" needs no special command.
+        """
+        current = self._resources.cpu_mode
+        raw = str(params.get("mode") or "").strip().lower()
+        if raw in ("", "toggle"):
+            target = CpuMode.PHYSICAL if current is CpuMode.LOGICAL else CpuMode.LOGICAL
+        else:
+            try:
+                target = CpuMode(raw)
+            except ValueError as exc:
+                valid = ", ".join(mode.value for mode in CpuMode)
+                raise ValidationError(f"Unknown CPU mode {raw!r}. Valid modes: {valid}") from exc
+
+        total, schedulable = self._resources.totals_for(target)
+        allocated = self._resources.allocated_cores
+        stranded = [
+            {"id": job.id, "name": job.name, "cores": job.cores}
+            for job in self._repo.queued()
+            if job.cores > schedulable
+        ]
+        result: dict[str, Any] = {
+            "previous": current.value,
+            "mode": target.value,
+            "previous_total": self._resources.total_cores,
+            "total_cores": total,
+            "schedulable_cores": schedulable,
+            "allocated_cores": allocated,
+            "over_committed": allocated > schedulable,
+            "stranded": stranded,
+            "relabel_only": bool(self._config.scheduler.total_cores),
+            "applied": False,
+        }
+        if params.get("preview") or target is current:
+            return result
+
+        configured = self._config.scheduler.resolved_cpu_mode
+        if target is configured:
+            self._repo.clear_setting(CPU_MODE_SETTING)
+            self._resources.set_cpu_mode(target, source="config")
+        else:
+            self._repo.set_setting(CPU_MODE_SETTING, target.value)
+            self._resources.set_cpu_mode(target, source="interface")
+
+        log.info(
+            "CPU mode %s -> %s (%d -> %d %s)",
+            current.value,
+            target.value,
+            result["previous_total"],
+            total,
+            "threads" if target is CpuMode.LOGICAL else "cores",
+        )
+        # More capacity may admit waiting work immediately; less changes nothing running.
+        self._scheduler.nudge()
+        self._bus.publish(Event.SYSTEM_STATS, encode_snapshot(self._monitor.snapshot()))
+        result["applied"] = True
+        return result
 
     # -- jobs --------------------------------------------------------------------------------------
 
@@ -754,20 +835,11 @@ class IpcServer:
             )
         return {"title": "dispatch history", "missing": "", "fields": fields}
 
-    async def _case_render(
-        self, session: ClientSession, params: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Render a picture of a case, with the adapter deciding how (§8.10).
+    def _render_target(self, params: dict[str, Any]) -> tuple[Path, Any, Any]:
+        """The case directory a render request names, with its adapter and context.
 
-        The adapter returns commands; this runs them. Same division as everything else: the
-        solver-specific half -- which renderer, where the camera goes, what the file is
-        called -- belongs to the adapter, and supervision belongs here.
-
-        Runs the command rather than handing it to the executor on purpose. A render is not a
-        simulation: it holds no allocation, has no exit code worth recording in the history,
-        and must not take a place in the queue behind a week-long run. It is bounded by the
-        step's own timeout, because a renderer that cannot find a GL context does not fail --
-        it waits.
+        ``path`` for a directory being browsed, ``id`` for a job's working directory -- the
+        same two ways the information view is opened.
         """
         raw = params.get("path") or params.get("workdir")
         if raw:
@@ -784,17 +856,6 @@ class IpcServer:
         detection = self._registry.best_detection(resolved)
         if detection is None:
             raise ValidationError(f"No solver recognises {resolved}, so there is nothing to render")
-
-        request = VisualRequest(
-            kind=VisualKind(str(params.get("kind") or VisualKind.MESH.value).lower()),
-            preset=str(params.get("preset") or "isometric"),
-            field=params.get("field"),
-            frames=_as_optional_int(params.get("frames")),
-            width=_as_int(params.get("width"), default=1600),
-            height=_as_int(params.get("height"), default=1000),
-        )
-
-        preview = bool(params.get("dry_run"))
         adapter = self._registry.get(detection.solver)
         ctx = replace(
             self._registry.context(
@@ -806,7 +867,58 @@ class IpcServer:
             ),
             # A preview describes the render; it must not leave a generated script and a
             # reader stub behind in a case it was only asked about.
-            dry_run=preview,
+            dry_run=bool(params.get("dry_run")),
+        )
+        return resolved, adapter, ctx
+
+    async def _case_fields(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """What a render of a case can be coloured by -- velocity, pressure, whatever it has.
+
+        Read by the adapter from the case's own files, so the interface offers exactly this
+        case's fields rather than a fixed list that is wrong for half the cases it is shown on.
+        """
+        resolved, adapter, ctx = self._render_target(params)
+        fields = await asyncio.to_thread(adapter.visual_fields, ctx)
+        return {
+            "path": str(resolved),
+            "fields": [
+                {"name": item.name, "kind": item.kind, "label": item.display}
+                for item in fields
+            ],
+        }
+
+    async def _case_render(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Render a picture or a video of a case, with the adapter deciding how (§8.10).
+
+        The adapter returns commands; :class:`~dispatch.daemon.renders.RenderManager` runs
+        them. Started in the background and answered at once, unless ``wait`` is set: this
+        daemon answers each client's requests in turn, so an animation run inside the request
+        would freeze that interface for hours. Progress and the result arrive as ``renders``
+        events. The CLI waits, because a command line has nothing else to do.
+
+        Not a job, on purpose: a render holds no allocation, has no place in the history, and
+        must not queue behind a week-long run.
+        """
+        resolved, adapter, ctx = self._render_target(params)
+        try:
+            kind = VisualKind(str(params.get("kind") or VisualKind.MESH.value).lower())
+        except ValueError as exc:
+            valid = ", ".join(item.value for item in VisualKind)
+            raise ValidationError(f"Unknown render kind. Valid kinds: {valid}") from exc
+
+        request = VisualRequest(
+            kind=kind,
+            preset=str(params.get("preset") or "isometric"),
+            field=params.get("field") or None,
+            frames=_as_optional_int(params.get("frames")),
+            width=_as_int(params.get("width"), default=1600),
+            height=_as_int(params.get("height"), default=1000),
+            fps=_as_int(params.get("fps"), default=24),
+            keep_frames=params.get("keep_frames", True) is not False,
         )
         plan = await asyncio.to_thread(adapter.visualise, ctx, request)
         if plan is None:
@@ -815,45 +927,26 @@ class IpcServer:
                 f"{tool} was not found on this machine, so Dispatch cannot render this case."
             )
 
-        if preview:
-            return _render_result(plan, started=False, outputs=[])
+        result = _render_result(plan, started=False, outputs=[])
+        if ctx.dry_run:
+            return result
+        if params.get("wait"):
+            produced = await self._renders.run_inline(resolved, kind.value, plan)
+            return {**result, "rendered": True, "produced": produced}
 
-        produced: list[str] = []
-        for step in plan.steps:
-            code, output = await self._run_tool(step)
-            if code != 0:
-                raise ValidationError(
-                    f"{plan.tool} failed while rendering (exit {code}). "
-                    f"{output.strip().splitlines()[-1] if output.strip() else ''}"
-                )
-            produced.extend(line for line in output.splitlines() if line.strip())
+        entry = self._renders.start(resolved, kind.value, plan)
+        return {**result, "render_id": entry.id, "started": True}
 
-        return _render_result(plan, started=True, outputs=produced)
+    def _render_list(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
+        """Renders currently running, so a reopened interface can pick their progress back up."""
+        return {"renders": [entry.describe() for entry in self._renders.active]}
 
-    async def _run_tool(self, step: Any) -> tuple[int, str]:
-        """Run one external tool, capturing its output and bounding its runtime.
-
-        Output is captured rather than written to a job log because this is not a job: there
-        is no job id to file it under, and the few lines a renderer prints are the result the
-        caller wants back rather than a transcript to keep.
-        """
-        process = await asyncio.create_subprocess_exec(
-            *step.argv,
-            cwd=str(step.cwd),
-            env=dict(step.env) if step.env is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=step.timeout_s)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            raise ValidationError(
-                f"The render exceeded its {step.timeout_s:.0f}s limit and was stopped."
-            ) from None
-        return process.returncode or 0, stdout.decode("utf-8", errors="replace")
+    def _render_cancel(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
+        """Stop a render. Frames already written stay where they are."""
+        render_id = str(params.get("id") or "").strip()
+        if not render_id or not self._renders.cancel(render_id):
+            raise ValidationError(f"No running render matches {render_id!r}")
+        return {"cancelled": True, "id": render_id}
 
     def _case_dryrun(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
         ram = params.get("ram_mb")
@@ -1158,7 +1251,7 @@ class IpcServer:
 
 
 def _render_result(plan: Any, *, started: bool, outputs: Sequence[str]) -> dict[str, Any]:
-    """Render result, including what the plan *would* produce for a dry run."""
+    """What a render request reports: the plan, and what it produced if it ran."""
     return {
         "tool": plan.tool,
         "rendered": started,
@@ -1166,6 +1259,10 @@ def _render_result(plan: Any, *, started: bool, outputs: Sequence[str]) -> dict[
         "outputs": [str(path) for path in plan.outputs],
         "produced": list(outputs),
         "command": list(plan.steps[0].argv) if plan.steps else [],
+        "steps": [
+            {"description": step.description, "command": list(step.argv)}
+            for step in plan.steps
+        ],
     }
 
 

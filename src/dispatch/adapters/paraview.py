@@ -23,9 +23,12 @@ See ``docs/ARCHITECTURE.md`` §8.10.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
+import re
 import shutil
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -40,6 +43,8 @@ __all__ = [
     "RenderRequest",
     "animation_script",
     "camera_for",
+    "encode_argv",
+    "find_ffmpeg",
     "find_paraview",
     "render_argv",
     "screenshot_script",
@@ -75,6 +80,38 @@ ISOMETRIC_DIRECTION: Final = (1.0, 1.0, 1.0)
 
 DEFAULT_SIZE: Final = (1600, 1000)
 """Pixels. A 16:10 frame large enough to read a mesh in, small enough to send over SSH."""
+
+PNG_COMPRESSION: Final = "0"
+"""zlib level for every PNG ParaView writes: always zero, i.e. stored uncompressed.
+
+Required, not a tuning choice. Compression in ParaView's PNG writer is single-threaded and
+sits inside the per-frame loop, so on a long animation it is a large share of the render
+time; and the frames are an intermediate that ffmpeg reads straight back. Every
+``SaveScreenshot`` call goes through :func:`_save_screenshot`, so no template can forget it.
+"""
+
+FFMPEG_BINARY: Final = "ffmpeg"
+
+VIDEO_ENCODERS: Final = (
+    ("libx264", ("-c:v", "libx264", "-preset", "medium", "-crf", "18")),
+    ("libopenh264", ("-c:v", "libopenh264", "-b:v", "12M")),
+    ("mpeg4", ("-c:v", "mpeg4", "-q:v", "2")),
+)
+"""H.264 encoders in preference order, with a widely-built MPEG-4 fallback.
+
+``libx264`` at CRF 18 is visually lossless for a CFD render. Distribution builds that cannot
+ship it usually have ``libopenh264``; ``mpeg4`` is in essentially every ffmpeg ever built.
+"""
+
+DEFAULT_FPS: Final = 24
+
+ANIMATION_TIMEOUT_S: Final = 6 * 3600.0
+"""Rendering every written time of a large case is hours of work, not minutes."""
+
+ENCODE_TIMEOUT_S: Final = 2 * 3600.0
+
+BYTES_PER_PIXEL: Final = 3
+"""An uncompressed RGB PNG is essentially width x height x 3 bytes; used to warn about disk."""
 
 RENDER_TIMEOUT_S: Final = 900.0
 """Wall-clock limit on one render.
@@ -294,6 +331,9 @@ class RenderRequest:
         frames: Cap on animation frames, or ``None`` for every written time.
         planar: Whether the case is two-dimensional. Only consulted when no camera could be
             computed, in which case the script works the plane's normal out for itself.
+        frames_dir: Where an animation's frames go. A directory of their own, cleared before
+            each render, so a re-render that produces fewer frames cannot leave stale ones
+            behind for ffmpeg to splice onto the end of the new video.
     """
 
     reader: Path
@@ -305,6 +345,20 @@ class RenderRequest:
     decomposed: bool = False
     frames: int | None = None
     planar: bool = False
+    frames_dir: Path | None = None
+
+    @property
+    def frame_dir(self) -> Path:
+        """The animation's frame directory, defaulting beside the video."""
+        return self.frames_dir or self.output / f"{self.name}.frames"
+
+    @property
+    def frame_pattern(self) -> Path:
+        """``frame.%05d.png`` inside :attr:`frame_dir` -- the form both ParaView and ffmpeg use.
+
+        Five digits: four overflows at 10,000 frames, which a long transient run reaches.
+        """
+        return self.frame_dir / "frame.%05d.png"
 
 
 def render_argv(binary: str, script: Path) -> list[str]:
@@ -314,6 +368,85 @@ def render_argv(binary: str, script: Path) -> list[str]:
     try to find a display that is not there. Harmless on a build without it.
     """
     return [binary, "--force-offscreen-rendering", str(script)]
+
+
+def find_ffmpeg(env: Mapping[str, str] | None = None) -> str | None:
+    """ffmpeg on the job's own ``PATH``, or ``None``."""
+    return shutil.which(FFMPEG_BINARY, path=(env or {}).get("PATH"))
+
+
+@functools.lru_cache(maxsize=8)
+def video_encoder(ffmpeg: str) -> tuple[str, tuple[str, ...]]:
+    """The best H.264 (or MPEG-4) encoder this ffmpeg was built with.
+
+    Asked once per binary and cached: the answer cannot change while the daemon runs, and
+    probing is a subprocess. A probe that fails falls back to ``mpeg4``, which every build
+    has, rather than refusing to encode at all.
+    """
+    try:
+        listing = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        listing = ""
+    available = {line.split()[1] for line in listing.splitlines() if len(line.split()) > 1}
+    for name, arguments in VIDEO_ENCODERS:
+        if name in available:
+            return name, arguments
+    return VIDEO_ENCODERS[-1]
+
+
+def encode_argv(
+    ffmpeg: str,
+    request: RenderRequest,
+    video: Path,
+    *,
+    fps: int = DEFAULT_FPS,
+    encoder: tuple[str, tuple[str, ...]] | None = None,
+) -> list[str]:
+    """The ffmpeg command that joins an animation's frames into a video.
+
+    ``yuv420p`` because it is the only pixel format every player decodes; the ``pad`` filter
+    because yuv420p needs even dimensions and a user-chosen size may be odd. ``+faststart``
+    puts the index at the front so the file plays while it is still being copied off the
+    machine.
+    """
+    _, arguments = encoder or video_encoder(ffmpeg)
+    return [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-framerate",
+        str(max(1, fps)),
+        "-start_number",
+        "0",
+        "-i",
+        str(request.frame_pattern),
+        *arguments,
+        "-pix_fmt",
+        "yuv420p",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-movflags",
+        "+faststart",
+        str(video),
+    ]
+
+
+def frame_bytes(size: tuple[int, int]) -> int:
+    """Disk taken by one uncompressed frame, for warning before an animation starts."""
+    return size[0] * size[1] * BYTES_PER_PIXEL
+
+
+def safe_name(text: str) -> str:
+    """A field name made safe for a filename: ``alpha.water`` stays, ``grad(p)`` -> ``grad_p_``."""
+    return re.sub(r"[^\w.\-]", "_", text) or "field"
 
 
 _PREAMBLE = '''\
@@ -333,6 +466,18 @@ from paraview.simple import (
 reader = OpenFOAMReader(registrationName="case", FileName={reader!r})
 reader.CaseType = {case_type!r}
 reader.MeshRegions = ["internalMesh"]
+# Include the initial condition: the reader skips time 0 by default. Setting the property is
+# not enough on its own -- the reader listed its time steps when it was created, and only
+# re-reads the case directory when told to reload, so without this every animation would
+# still silently start one write into the run.
+reader.SkipZeroTime = 0
+try:
+    from paraview.simple import ReloadFiles
+
+    ReloadFiles(reader)
+except Exception:  # pragma: no cover - very old ParaView
+    reader.Refresh()
+reader.UpdatePipelineInformation()
 UpdatePipeline(proxy=reader)
 
 view = GetActiveViewOrCreate("RenderView")
@@ -347,7 +492,8 @@ try:
 except AttributeError:  # pragma: no cover - older ParaView has no palette override
     pass
 view.Background = [1.0, 1.0, 1.0]
-view.BackgroundColorMode = "Single Color" if hasattr(view, "BackgroundColorMode") else None
+if hasattr(view, "BackgroundColorMode"):
+    view.BackgroundColorMode = "Single Color"
 
 display = Show(reader, view)
 display.Representation = {representation!r}
@@ -449,19 +595,60 @@ def _camera_block(
     )
 
 
-def _colour_block(field: str | None) -> str:
-    if not field:
-        return ""
-    # Rescaled over the whole run rather than per frame, so a feature does not appear to
-    # pulse because the colour bar moved underneath it between time steps.
-    return f'''
+_COLOUR = '''
 from paraview.simple import ColorBy, GetColorTransferFunction
 
-ColorBy(display, ("POINTS", {field!r}))
-display.RescaleTransferFunctionToDataRange(True, False)
-GetColorTransferFunction({field!r}).ApplyPreset("Cool to Warm", True)
+# Point or cell data, decided here rather than assumed: the OpenFOAM reader offers fields as
+# cell arrays, and only interpolates to points when asked, so a hard-coded "POINTS" fails on
+# exactly the fields a user picks.
+_field = {field!r}
+if _field in reader.PointData.keys():
+    _association = "POINTS"
+elif _field in reader.CellData.keys():
+    _association = "CELLS"
+else:
+    raise SystemExit(
+        "field %r is not in this case; it has %s"
+        % (_field, ", ".join(sorted(set(reader.CellData.keys()) | set(reader.PointData.keys()))))
+    )
+
+ColorBy(display, (_association, _field))
+_lut = GetColorTransferFunction(_field)
+_lut.ApplyPreset("Cool to Warm", True)
+{rescale}
 display.SetScalarBarVisibility(view, True)
 '''
+
+_RESCALE_NOW = "display.RescaleTransferFunctionToDataRange(True, False)"
+
+_RESCALE_OVER_TIME = '''\
+# One colour scale for the whole run, then frozen. Rescaled per frame, the bar moves under
+# the flow and every feature appears to pulse; ParaView's default also grows the range as it
+# goes, so the first frames are coloured against a scale the later ones then change.
+if hasattr(display, "RescaleTransferFunctionToDataRangeOverTime"):
+    display.RescaleTransferFunctionToDataRangeOverTime()
+else:  # pragma: no cover - ParaView before 5.6
+    display.RescaleTransferFunctionToDataRange(True, False)
+_lut.AutomaticRescaleRangeMode = "Never"'''
+
+
+def _colour_block(field: str | None, *, over_time: bool = False) -> str:
+    """Colour the surface by ``field``, or nothing for a plain mesh.
+
+    Vectors are coloured by magnitude, which is ParaView's default for a vector array and
+    the reading people want from velocity.
+    """
+    if not field:
+        return ""
+    return _COLOUR.format(field=field, rescale=_RESCALE_OVER_TIME if over_time else _RESCALE_NOW)
+
+
+def _save_screenshot(target: str, size: tuple[int, int]) -> str:
+    """One ``SaveScreenshot`` call, always uncompressed. See :data:`PNG_COMPRESSION`."""
+    return (
+        f"SaveScreenshot({target}, view, ImageResolution=[{size[0]:d}, {size[1]:d}], "
+        f"CompressionLevel={PNG_COMPRESSION!r})"
+    )
 
 
 def screenshot_script(request: RenderRequest, camera: Camera | None) -> str:
@@ -475,14 +662,22 @@ def screenshot_script(request: RenderRequest, camera: Camera | None) -> str:
         _preamble(request, representation="Surface With Edges")
         + _colour_block(request.field)
         + _camera_block(camera, request.preset, planar=request.planar)
-        + f'\nSaveScreenshot({str(target)!r}, view, ImageResolution=['
-        f"{request.size[0]:d}, {request.size[1]:d}])\n"
-        f"print({str(target)!r})\n"
+        + "\n"
+        + _save_screenshot(repr(str(target)), request.size)
+        + f"\nprint({str(target)!r})\n"
     )
 
 
 _ANIMATION = """
+import glob
+
 from paraview.simple import GetAnimationScene
+
+# A directory of its own, emptied first: a re-render that produces fewer frames must not
+# leave the old tail behind for ffmpeg to splice onto the new video.
+os.makedirs({frames_dir!r}, exist_ok=True)
+for _stale in glob.glob(os.path.join({frames_dir!r}, "frame.*.png")):
+    os.remove(_stale)
 
 scene = GetAnimationScene()
 scene.UpdateAnimationUsingDataTimeSteps()
@@ -492,38 +687,28 @@ for index, time in enumerate(times):
     view.ViewTime = time
     scene.AnimationTime = time
     UpdatePipeline(time=time, proxy=reader)
-    SaveScreenshot(
-        {pattern!r} % index,
-        view,
-        ImageResolution=[{width:d}, {height:d}],
-    )
+    {save}
+    print("frame %d/%d  t = %g" % (index + 1, len(times), time), flush=True)
 
-print("%d frame(s) in %s" % (len(times), {output!r}))
-print("ffmpeg -framerate 24 -i {pattern} -pix_fmt yuv420p {video}")
+print("%d frame(s) in %s" % (len(times), {frames_dir!r}))
 """
 
 
 def animation_script(request: RenderRequest, camera: Camera | None) -> str:
-    """A pvbatch script that saves one image per written time step.
+    """A pvbatch script that saves one uncompressed frame per written time step.
 
-    A numbered PNG series rather than a video file, deliberately. ``SaveAnimation`` can write
-    ``.avi`` or ``.ogv``, but only if that ParaView was built with the encoder, and a feature
-    that works on one install and fails on the next with a message about codecs is worse than
-    one that always produces frames. Frames are also what anybody wanting a video will feed
-    to ``ffmpeg`` anyway, so the script prints the command that does it.
+    Frames only: joining them into a video is ffmpeg's job, as a separate step of the same
+    plan (:func:`encode_argv`). Keeping the two apart means a failed encode -- a missing
+    codec, a full disk -- leaves the frames, which took the hours, intact.
     """
-    pattern = request.output / f"{request.name}.%04d.png"
     return (
         _preamble(request, representation="Surface")
-        + _colour_block(request.field or "p")
+        + _colour_block(request.field, over_time=True)
         + _camera_block(camera, request.preset, planar=request.planar)
         + _ANIMATION.format(
             slice="" if request.frames is None else f"[:{request.frames:d}]",
-            pattern=str(pattern),
-            width=request.size[0],
-            height=request.size[1],
-            output=str(request.output),
-            video=str(request.output / f"{request.name}.mp4"),
+            frames_dir=str(request.frame_dir),
+            save=_save_screenshot(f"{str(request.frame_pattern)!r} % index", request.size),
         )
     )
 

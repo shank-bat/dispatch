@@ -271,3 +271,103 @@ def read_geometry(case: Path) -> CaseGeometry:
     return CaseGeometry(
         bounds=bounds, dimensionality=dimensionality, normal=normal, source=source
     )
+
+
+FIELD_CLASSES: Final[dict[str, str]] = {
+    "volScalarField": "scalar",
+    "volVectorField": "vector",
+    "volSymmTensorField": "tensor",
+    "volTensorField": "tensor",
+    "volSphericalTensorField": "tensor",
+    "pointScalarField": "scalar",
+    "pointVectorField": "vector",
+}
+"""FoamFile classes ParaView's reader turns into colourable arrays.
+
+Surface fields (``phi``) are absent on purpose: the reader does not load them onto the
+internal mesh, so offering one would produce a render that fails with "no such array".
+"""
+
+FIELD_LABELS: Final[dict[str, str]] = {
+    "U": "velocity",
+    "p": "pressure",
+    "p_rgh": "pressure minus hydrostatic",
+    "T": "temperature",
+    "k": "turbulent kinetic energy",
+    "omega": "specific dissipation rate",
+    "epsilon": "dissipation rate",
+    "nut": "turbulent viscosity",
+    "nuTilda": "Spalart-Allmaras variable",
+    "rho": "density",
+    "alpha.water": "water fraction",
+    "vorticity": "vorticity",
+    "Q": "Q-criterion",
+}
+"""Plain-language names for the fields CFD users meet most, shown beside the solver's name."""
+
+_CLASS = re.compile(r"\bclass\s+(\w+)\s*;")
+
+
+def _field_class(path: Path) -> str | None:
+    """A field file's FoamFile ``class``, reading only its header (gzipped or not)."""
+    try:
+        if path.suffix == ".gz":
+            import gzip
+
+            with gzip.open(path, "rb") as handle:
+                head = handle.read(HEADER_BYTES)
+        else:
+            with path.open("rb") as handle:
+                head = handle.read(HEADER_BYTES)
+    except OSError:
+        return None
+    match = _CLASS.search(head.decode("utf-8", errors="replace"))
+    return match.group(1) if match else None
+
+
+def _time_dirs(root: Path) -> list[tuple[float, Path]]:
+    found: list[tuple[float, Path]] = []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return found
+    for child in children:
+        if not child.is_dir():
+            continue
+        try:
+            found.append((float(child.name), child))
+        except ValueError:
+            continue
+    return sorted(found)
+
+
+def render_fields(case: Path) -> list[tuple[str, str]]:
+    """``(name, kind)`` for every field a render of this case can be coloured by.
+
+    Read from the **latest** written time rather than ``0/``: a field the solver derives as it
+    runs (``vorticity``, ``Q``, ``yPlus``) exists only in written times, and those are what
+    an animation shows. Falls back to the earliest directory for a case that has not run.
+    A decomposed case's times live in ``processor0``.
+    """
+    for root in (case / "processor0", case):
+        times = _time_dirs(root)
+        if not times:
+            continue
+        written = [entry for entry in times if entry[0] > 0]
+        directory = (written or times)[-1][1]
+        fields: list[tuple[str, str]] = []
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_file() or entry.name.startswith("."):
+                continue
+            kind = FIELD_CLASSES.get(_field_class(entry) or "")
+            if kind is None:
+                continue
+            name = entry.name[:-3] if entry.name.endswith(".gz") else entry.name
+            fields.append((name, kind))
+        if fields:
+            return fields
+    return []

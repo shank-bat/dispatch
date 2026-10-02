@@ -137,6 +137,13 @@ class DispatchApp(App[None]):
         except DispatchError as exc:
             self.state.error = str(exc)
             return
+        # Renders that started before this interface connected -- or before it was restarted
+        # -- are picked back up here, so their progress is shown and their result announced.
+        with contextlib.suppress(DispatchError):
+            renders = await self.client.call(Method.RENDER_LIST)
+            self.state.renders = {
+                str(item["id"]): item for item in renders.get("renders") or []
+            }
         self.state.push_snapshot(snapshot)
         self.state.replace_jobs(page["items"])
         self.state.replace_sweeps(sweeps.get("sweeps") or [])
@@ -167,8 +174,29 @@ class DispatchApp(App[None]):
         elif event == Event.DAEMON_SHUTDOWN:
             self.state.connected = False
             self.notify("The daemon is shutting down. Simulations keep running.", timeout=8)
+        elif event == Event.RENDER_PROGRESS:
+            self.state.renders[str(data.get("id"))] = data
+        elif event == Event.RENDER_FINISHED:
+            self.state.renders.pop(str(data.get("id")), None)
+            self._announce_render(data)
 
         self._refresh_screen()
+
+    def _announce_render(self, data: dict[str, Any]) -> None:
+        """Say how a background render ended, on whatever screen the user is on now.
+
+        At the app rather than on the screen that started it, because an animation takes long
+        enough that the user will have gone somewhere else -- and a result nobody sees is a
+        result that has to be gone looking for.
+        """
+        outputs = list(data.get("outputs") or [])
+        if data.get("ok"):
+            where = outputs[0] if outputs else "postProcessing/dispatch/"
+            self.notify(f"Render finished: {where}", timeout=12)
+        elif data.get("error") == "cancelled":
+            self.notify("Render cancelled. Frames already written were kept.", timeout=6)
+        else:
+            self.notify(f"Render failed: {data.get('error')}", severity="error", timeout=15)
 
     def _refresh_screen(self) -> None:
         with contextlib.suppress(Exception):

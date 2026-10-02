@@ -1005,7 +1005,8 @@ async def test_a_render_failure_is_reported_with_its_output(
 
     case = foam_case_at(tmp_path / "wing")
     with pytest.raises(RemoteError, match="exit 3"):
-        await foam_client.call(Method.CASE_RENDER, path=str(case), kind="mesh")
+        # `wait`, as the CLI does: the failure is then the response rather than an event.
+        await foam_client.call(Method.CASE_RENDER, path=str(case), kind="mesh", wait=True)
 
 
 async def test_a_successful_render_reports_what_it_wrote(
@@ -1019,11 +1020,261 @@ async def test_a_successful_render_reports_what_it_wrote(
 
     case = foam_case_at(tmp_path / "wing")
     result = await foam_client.call(
-        Method.CASE_RENDER, path=str(case), kind="mesh", preset="top"
+        Method.CASE_RENDER, path=str(case), kind="mesh", preset="top", wait=True
     )
     assert result["rendered"] is True
     assert result["produced"] == ["rendered"]
-    assert result["outputs"][0].endswith("mesh-top.png")
+    # The case is planar and has no blockMeshDict, so the script aims along the plane's
+    # normal itself, and the name says so rather than claiming the angle that was asked for.
+    assert result["outputs"][0].endswith("mesh-plane.png")
     # The generated script and the reader stub are the only things written into the case.
-    assert (case / "postProcessing" / "dispatch" / "mesh-top.py").is_file()
+    assert (case / "postProcessing" / "dispatch" / "mesh-plane.py").is_file()
     assert (case / "wing.foam").is_file()
+
+
+# == choosing a field, and renders that run in the background (§8.10) ========================
+
+
+def fake_tool(directory: Path, name: str, body: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    binary = directory / name
+    binary.write_text(f"#!/bin/sh\n{body}\n")
+    binary.chmod(0o755)
+    return binary
+
+
+def foam_with_results(root: Path) -> Path:
+    case = foam_case_at(root)
+    for time in ("0", "0.2"):
+        (case / time).mkdir(exist_ok=True)
+        (case / time / "p").write_text("FoamFile { class volScalarField; object p; }\n")
+        (case / time / "U").write_text("FoamFile { class volVectorField; object U; }\n")
+    return case
+
+
+async def test_a_case_lists_what_it_can_be_coloured_by(
+    foam_client: DaemonClient, tmp_path: Path
+) -> None:
+    case = foam_with_results(tmp_path / "wing")
+    result = await foam_client.call(Method.CASE_FIELDS, path=str(case))
+    assert [item["name"] for item in result["fields"]] == ["U", "p"]
+    assert result["fields"][0]["label"] == "U (velocity, magnitude)"
+
+
+async def test_a_render_runs_in_the_background_and_reports_when_done(
+    daemon: Daemon, foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    """The request returns at once, other requests are answered meanwhile, and the result
+    arrives as an event."""
+    from dispatch.adapters.paraview import video_encoder
+    from dispatch.ipc.protocol import Event, Topic
+
+    tools = tmp_path / "bin"
+    fake_tool(tools, "pvbatch", 'echo "frame 1/2  t = 0"; sleep 1; echo "frame 2/2  t = 0.2"')
+    fake_tool(tools, "ffmpeg", 'echo " V....D libx264  H.264"')
+    video_encoder.cache_clear()
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+
+    events: list = []
+    watcher = DaemonClient(
+        daemon.config.paths.socket, autostart=False, on_event=lambda note: events.append(note)
+    )
+    await watcher.connect()
+    try:
+        await watcher.subscribe([str(Topic.RENDERS)])
+        case = foam_with_results(tmp_path / "wing")
+        started = await foam_client.call(
+            Method.CASE_RENDER, path=str(case), kind="animation", field="U", preset="front"
+        )
+        assert started["started"] is True and started["render_id"]
+        # Planar with no blockMeshDict: aimed along the normal by the script, and named so.
+        assert started["outputs"][0].endswith("animation-U-plane.mp4")
+
+        listed = await foam_client.call(Method.RENDER_LIST)
+        assert [entry["id"] for entry in listed["renders"]] == [started["render_id"]]
+
+        for _ in range(200):
+            if any(note.event == str(Event.RENDER_FINISHED) for note in events):
+                break
+            await asyncio.sleep(0.05)
+        done = next(note.data for note in events if note.event == str(Event.RENDER_FINISHED))
+        assert done["ok"] is True, done
+        assert done["steps"] == 2, "render, then encode"
+        assert any(note.event == str(Event.RENDER_PROGRESS) for note in events)
+        assert (await foam_client.call(Method.RENDER_LIST))["renders"] == []
+    finally:
+        await watcher.close()
+
+
+async def test_a_background_render_can_be_cancelled(
+    foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    fake_tool(tmp_path / "bin", "pvbatch", "exec sleep 30")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+    case = foam_with_results(tmp_path / "wing")
+    started = await foam_client.call(Method.CASE_RENDER, path=str(case), kind="mesh")
+
+    await foam_client.call(Method.RENDER_CANCEL, id=started["render_id"][:8])
+    for _ in range(100):
+        if not (await foam_client.call(Method.RENDER_LIST))["renders"]:
+            break
+        await asyncio.sleep(0.05)
+    assert (await foam_client.call(Method.RENDER_LIST))["renders"] == []
+    with pytest.raises(RemoteError, match="No running render"):
+        await foam_client.call(Method.RENDER_CANCEL, id="nonsense")
+
+
+async def test_an_unknown_field_is_refused_before_anything_runs(
+    foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    fake_tool(tmp_path / "bin", "pvbatch", "exit 0")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+    case = foam_with_results(tmp_path / "wing")
+    with pytest.raises(RemoteError, match="velocity"):
+        await foam_client.call(Method.CASE_RENDER, path=str(case), kind="mesh", field="velocity")
+
+
+# == switching what a core means, from the interface (§4.3.2) =================================
+
+
+@pytest.fixture
+def smt_config(dispatch_config: Config, monkeypatch) -> Config:
+    """A 16-core, 24-thread machine with no explicit core count, so the mode matters."""
+    monkeypatch.setattr("dispatch.core.config.physical_cores", lambda: 16)
+    monkeypatch.setattr("dispatch.core.config.logical_cpus", lambda: 24)
+    return replace(dispatch_config, scheduler=replace(dispatch_config.scheduler, total_cores=None))
+
+
+@pytest.fixture
+async def smt_daemon(smt_config: Config, registry) -> AsyncIterator[Daemon]:
+    instance = Daemon(smt_config, load_plugins=False)
+    instance.registry = registry
+    instance.executor._registry = registry
+    instance.inspector._registry = registry
+    instance.server._registry = registry
+    instance.scheduler.start()
+    await instance.server.start()
+    try:
+        yield instance
+    finally:
+        await instance.server.stop()
+        await instance.scheduler.stop()
+        await instance.executor.shutdown(kill_jobs=True)
+        instance.conn.close()
+
+
+@pytest.fixture
+async def smt_client(smt_daemon: Daemon) -> AsyncIterator[DaemonClient]:
+    connection = DaemonClient(smt_daemon.config.paths.socket, autostart=False)
+    await connection.connect()
+    try:
+        yield connection
+    finally:
+        await connection.close()
+
+
+async def test_the_preview_says_what_a_switch_would_do_and_does_nothing(
+    smt_daemon: Daemon, smt_client: DaemonClient
+) -> None:
+    preview = await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="toggle", preview=True)
+    assert (preview["previous"], preview["mode"]) == ("physical", "logical")
+    assert (preview["previous_total"], preview["total_cores"]) == (16, 24)
+    assert preview["applied"] is False and preview["relabel_only"] is False
+    assert smt_daemon.resources.total_cores == 16
+    assert smt_daemon.repo.get_setting("scheduler.cpu_mode") is None
+
+
+async def test_switching_changes_the_snapshot_the_dashboard_draws(
+    smt_daemon: Daemon, smt_client: DaemonClient
+) -> None:
+    result = await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="logical")
+    assert result["applied"] is True
+    snapshot = await smt_client.call(Method.SYSTEM_SNAPSHOT)
+    assert snapshot["cpu_mode"] == "logical"
+    assert snapshot["cpu_mode_source"] == "interface"
+    assert snapshot["total_cores"] == 24
+
+
+async def test_the_choice_survives_a_daemon_restart(
+    smt_config: Config, smt_daemon: Daemon, smt_client: DaemonClient
+) -> None:
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="logical")
+    restarted = Daemon(smt_config, load_plugins=False)
+    try:
+        assert restarted.resources.cpu_mode.value == "logical"
+        assert restarted.resources.cpu_mode_source == "interface"
+        assert restarted.resources.total_cores == 24
+    finally:
+        restarted.conn.close()
+
+
+async def test_choosing_the_config_s_own_mode_clears_the_override(
+    smt_daemon: Daemon, smt_client: DaemonClient
+) -> None:
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="logical")
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="toggle")
+    assert smt_daemon.repo.get_setting("scheduler.cpu_mode") is None
+    assert smt_daemon.resources.cpu_mode_source == "config"
+    assert smt_daemon.resources.total_cores == 16
+
+
+async def test_an_unreadable_stored_mode_does_not_stop_the_daemon(
+    smt_config: Config, smt_daemon: Daemon
+) -> None:
+    smt_daemon.repo.set_setting("scheduler.cpu_mode", "quantum")
+    restarted = Daemon(smt_config, load_plugins=False)
+    try:
+        assert restarted.resources.cpu_mode.value == "physical"
+    finally:
+        restarted.conn.close()
+
+
+async def test_the_preview_names_jobs_a_switch_would_strand(
+    smt_daemon: Daemon, smt_client: DaemonClient, tmp_path: Path
+) -> None:
+    """A queued job asking for more than the new total would never start."""
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="logical")
+    # Twelve threads busy, so the twenty-thread job waits rather than starting.
+    busy = await submit(smt_client, make_case(tmp_path / "busy", script="sleep 30"), cores=12)
+    await await_state(smt_client, busy["id"], JobState.RUNNING.value)
+    job = await submit(smt_client, make_case(tmp_path / "wide", script="exit 0"), cores=20)
+
+    preview = await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="physical", preview=True)
+    assert [entry["id"] for entry in preview["stranded"]] == [job["id"]]
+    for each in (busy, job):
+        await smt_client.call(Method.JOB_CANCEL, id=each["id"], force=True)
+
+
+async def test_a_running_job_over_the_new_total_is_reported_over_committed(
+    smt_daemon: Daemon, smt_client: DaemonClient, tmp_path: Path
+) -> None:
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="logical")
+    job = await submit(smt_client, make_case(tmp_path / "big", script="sleep 30"), cores=20)
+    await await_state(smt_client, job["id"], JobState.RUNNING.value)
+
+    preview = await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="physical", preview=True)
+    assert preview["over_committed"] is True
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="physical")
+    assert smt_daemon.resources.allocated_cores == 20, "the running job keeps its cores"
+    await smt_client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_more_capacity_admits_waiting_work_at_once(
+    smt_daemon: Daemon, smt_client: DaemonClient, tmp_path: Path
+) -> None:
+    """No wait for the next heartbeat: the heartbeat in these tests is an hour."""
+    first = await submit(smt_client, make_case(tmp_path / "a", script="sleep 30"), cores=12)
+    await await_state(smt_client, first["id"], JobState.RUNNING.value)
+    second = await submit(smt_client, make_case(tmp_path / "b", script="sleep 30"), cores=8)
+    await asyncio.sleep(0.3)
+    assert (await smt_client.call(Method.JOB_GET, id=second["id"]))["job"]["state"] == "QUEUED"
+
+    await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="logical")
+    await await_state(smt_client, second["id"], JobState.RUNNING.value)
+    for job in (first, second):
+        await smt_client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_an_unknown_mode_is_refused_with_the_valid_ones(smt_client: DaemonClient) -> None:
+    with pytest.raises(RemoteError, match="physical, logical"):
+        await smt_client.call(Method.SCHEDULER_CPU_MODE, mode="hyper")

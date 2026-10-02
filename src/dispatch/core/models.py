@@ -505,6 +505,9 @@ class SystemSnapshot:
     load_average: tuple[float, float, float]
     uptime_s: float
 
+    cpu_mode_source: str = "config"
+    """``config`` or ``interface``: whether the mode came from config.toml or the dashboard."""
+
     cpu_mode: str = "physical"
     """Whether :attr:`total_cores` counts physical cores or logical threads (§4.3.2).
 

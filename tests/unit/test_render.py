@@ -281,12 +281,14 @@ def test_colouring_by_a_field_is_requested_when_asked(tmp_path: Path) -> None:
     assert "ColorBy" not in screenshot_script(request_for(tmp_path), None)
 
 
-def test_an_animation_writes_a_numbered_series(tmp_path: Path) -> None:
-    """Frames rather than a video file: an encoder that is missing on one ParaView build
-    fails in a way nobody can act on, and frames are what ffmpeg wants anyway."""
-    script = animation_script(request_for(tmp_path, name="flow"), None)
-    assert "flow.%04d.png" in script
-    assert "ffmpeg" in script
+def test_an_animation_writes_frames_into_a_directory_of_its_own(tmp_path: Path) -> None:
+    """Frames, then a video from them: the frames are what took the hours, so they live
+    apart from the video and survive a failed encode."""
+    request = request_for(tmp_path, name="flow")
+    script = animation_script(request, None)
+    assert str(request.frame_pattern) in script
+    assert request.frame_pattern.name == "frame.%05d.png"
+    assert request.frame_dir == tmp_path / "out" / "flow.frames"
 
 
 def test_an_animation_can_be_capped(tmp_path: Path) -> None:

@@ -427,7 +427,7 @@ PlotScreen #plot-status {
 
 /* ------------------------------------------------------------------ modals */
 
-ConfirmScreen, RunAfterScreen, ProjectSearchScreen, _PresetScreen {
+ConfirmScreen, RunAfterScreen, ProjectSearchScreen, ChoiceScreen {
     align: center middle;
     background: $background 60%;
 }
@@ -462,7 +462,7 @@ ProjectSearchScreen #project-status {
 
 /* Elevated surface and a thin border, the way a VS Code dialog reads: floating above the
  * page rather than cut into it. */
-ConfirmScreen > Container, RunAfterScreen > Container, _PresetScreen > Container {
+ConfirmScreen > Container, RunAfterScreen > Container, ChoiceScreen > Container {
     width: 56;
     height: auto;
     padding: 1 3;
@@ -478,7 +478,7 @@ ConfirmScreen Label, RunAfterScreen Label {
 
 /* Bounded so a long queue scrolls inside the dialog rather than growing it off screen. */
 RunAfterScreen ListView,
-_PresetScreen ListView {
+ChoiceScreen ListView {
     height: auto;
     max-height: 12;
     padding: 1 0;
@@ -486,7 +486,7 @@ _PresetScreen ListView {
 }
 
 RunAfterScreen ListItem,
-_PresetScreen ListItem {
+ChoiceScreen ListItem {
     background: $surface-lighten-1;
 }
 

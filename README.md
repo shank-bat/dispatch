@@ -50,7 +50,9 @@ dispatch submit ~/sweep --sweep --from-latest      # continue every case where i
 dispatch repartition <id> 24              # stop at the next write, resume on 24 cores
 dispatch case ~/cases/wing                # full description of a case
 dispatch render ~/cases/wing -c top       # mesh PNG with ParaView (headless)
-dispatch render ~/cases/wing -k animation --field p
+dispatch render ~/cases/wing -k animation --field U   # MP4 video, encoded with ffmpeg
+dispatch render ~/cases/wing --list-fields            # what it can be coloured by
+dispatch cpu-mode toggle                  # schedule by threads instead of cores, or back
 dispatch status                           # machine and queue, cores and GPUs
 dispatch ls                               # active jobs
 dispatch logs <id> -f                     # follow a job's output
@@ -60,7 +62,9 @@ dispatch search 'tag:paper resource:gpu cores>=16 endTime>500'
 
 In the interface: `1` dashboard, `2` queue, `3` history, `n` new job, `p` plot a job's
 numbers (`d` switches to force coefficients), `i` case information, `space` on the dashboard
-shows a job's latest CL/CD, `c` in the queue re-cores a running job, `?` help. It is entirely keyboard-driven.
+shows a job's latest CL/CD, `m` on the dashboard switches between counting cores and threads,
+`v`/`V` in the case view render an image or a video of any field the case has (`x` cancels),
+`c` in the queue re-cores a running job, `?` help. It is entirely keyboard-driven.
 
 ## What it does
 

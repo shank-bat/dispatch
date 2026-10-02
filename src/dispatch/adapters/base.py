@@ -30,7 +30,7 @@ from dispatch.core.models import Detection
 from dispatch.core.plan import ExecutionPlan
 from dispatch.core.series import Dataset, PlotData
 from dispatch.core.validation import ValidationReport
-from dispatch.core.visual import VisualPlan, VisualRequest
+from dispatch.core.visual import VisualField, VisualPlan, VisualRequest
 
 __all__ = [
     "ADAPTER_API_VERSION",
@@ -274,6 +274,10 @@ class SolverAdapter(Protocol):
 
     def visualise(self, ctx: CaseContext, request: VisualRequest) -> VisualPlan | None:
         """Commands that render a picture of the case, or ``None`` if it cannot."""
+        ...
+
+    def visual_fields(self, ctx: CaseContext) -> Sequence[VisualField]:
+        """The quantities a render of this case can be coloured by."""
         ...
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
@@ -536,6 +540,16 @@ class BaseAdapter(ABC):
         found" rather than into a failed command.
         """
         return None
+
+    def visual_fields(self, ctx: CaseContext) -> Sequence[VisualField]:
+        """The quantities a render of this case can be coloured by (§8.10).
+
+        Read from the case's own files, so the interface can offer exactly what this case
+        has -- velocity, pressure, a phase fraction -- instead of a fixed list that is wrong
+        for half the cases it is shown on. Empty by default, and for an adapter that cannot
+        render.
+        """
+        return ()
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
         """Attempt a clean solver-native stop.

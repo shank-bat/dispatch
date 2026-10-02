@@ -463,6 +463,28 @@ Two details carry the correctness:
   machine); in logical mode it is INFO (sharing cores is the point), because warning on every job of
   a correctly configured machine teaches people to ignore the validator.
 
+**Switching at runtime.** `m` on the dashboard (or `dispatch cpu-mode [physical|logical|toggle]`)
+calls `scheduler.cpu_mode`. It is previewed first. The preview is `ResourceModel.totals_for`, which
+is pure, so asking changes nothing. It shows the old and new totals and three things that are not
+obvious:
+
+* **Over-committed.** The running jobs already hold more than the new mode can schedule.
+* **Stranded.** These queued jobs ask for more than the new total and would never start.
+* **Relabel only.** An explicit `total_cores` is set, so only the unit changes.
+
+Applying calls `ResourceModel.set_cpu_mode`. It recomputes the total and the reservation and
+**never touches allocations**: a job admitted on twelve threads keeps them. The ledger can therefore
+read over-committed after a switch, with `free_cores` at zero until enough work finishes. It can
+never *admit* past the new total. The scheduler is then nudged, so extra capacity admits waiting
+work at once rather than at the next heartbeat.
+
+The choice is stored in the daemon's `settings` table (`scheduler.cpu_mode`), not in `config.toml`.
+Rewriting a user's hand-edited TOML would lose their comments and layout. `Daemon` restores the
+setting before recovery, so the rebuilt ledger uses the units the dashboard last showed. An
+unreadable stored value is ignored with a warning. Choosing the config file's own mode clears the
+override. The snapshot's `cpu_mode_source` (`config` | `interface`) tells the header which applies,
+and the header labels the meter `thrd` or `core` to match the ledger.
+
 ### 4.4 Structured metadata
 
 A bare `Mapping[str, Any]` is a place where information goes to become unsearchable. Every adapter
@@ -716,6 +738,7 @@ corrupting data — a real risk on a machine that runs for months across upgrade
 | 003 | `jobs.depends_on_job_id` | `NULL` — schedule as soon as it fits, exactly as before |
 | 004 | `jobs.resource_kind`, `jobs.gpus`, `jobs.log_path` | `'cpu'`, `0`, `NULL` — which is what every job before this feature *was*, and whose output is still where it was written |
 | 006 | `jobs.start_from_latest`, `sweeps.start_from_latest`, `jobs.repartition_cores` | `0`, `0`, `NULL` — every existing job starts where it always did and has no pending core change |
+| 007 | `settings (key, value, updated_at)` | empty — every daemon runs on its config file until a choice is made in the interface (§4.3.2) |
 
 Every column added so far has been nullable or defaulted, and that is a rule rather than a
 coincidence: **the upgrade path must never require deleting the database.** Migration 004's
@@ -1331,7 +1354,11 @@ with "restart the daemon", not a `KeyError`.
 | `case.dryrun` | same params as `job.submit` → DryRunReport (§6.11), no side effects |
 | `fs.list` | path → directories (+ per-entry "looks like a case" hint) |
 | `case.info` | path or id → full adapter-produced case description (§9.8) |
-| `case.render` | path or id, kind, preset, field, dry_run → ParaView render (§8.10) |
+| `case.render` | path or id, kind, preset, field, fps, keep_frames, dry_run, wait → plan, or `render_id` of a background render (§8.10) |
+| `case.fields` | path or id → fields a render can be coloured by, with labels (§8.10) |
+| `render.list` | — → renders in flight, with step and frame progress |
+| `render.cancel` | id (or unambiguous prefix) → ack; kills the renderer and keeps written frames |
+| `scheduler.cpu_mode` | mode (`physical`/`logical`/`toggle`), preview? → totals, stranded jobs, over-commit (§4.3.2) |
 | `projects.search` | query, limit → directories under the projects root, ranked (§9.5) |
 | `subscribe` / `unsubscribe` | topics → ack |
 
@@ -1344,7 +1371,8 @@ worker thread, so a cold projects tree or a gigabyte of residuals cannot stall t
 ### 7.5 Events and backpressure
 
 Topics: `jobs` (state changes, progress), `queue` (ordering changed), `system` (CPU/RAM
-snapshots), `daemon` (shutdown, config reload).
+snapshots), `renders` (`render.progress`, at most once a second per render, and `render.finished`),
+`daemon` (shutdown, config reload).
 
 Each `ClientSession` owns a **bounded** `asyncio.Queue(maxsize=256)`. If a client stalls (suspended
 TUI, frozen SSH pipe) the queue fills; the session then drops the backlog, emits a single
@@ -1683,13 +1711,49 @@ daemon runs them. Only OpenFOAM implements `SolverAdapter.visualise`; every othe
 * **Headless only.** `pvbatch` (then `pvpython`) with `--force-offscreen-rendering`; the GUI binary is
   never used, because the machine is reached over SSH. Not installed → `visualise` returns `None` and
   the daemon says "ParaView was not found" rather than reporting a failed command.
-* **Not a job.** A render holds no allocation and must not queue behind a week-long run, so
-  `case.render` runs it directly, bounded by a 15-minute timeout (a ParaView with no GL context waits
-  rather than failing).
-* **Output** goes to `postProcessing/dispatch/<kind>-<angle>.png` beside the generated script.
-  Animations are a numbered PNG series — always available, unlike a video encoder — and the script
-  prints the `ffmpeg` command. The only other write is a `.foam` reader stub, reused if one exists.
-  **`log.foam` is excluded explicitly**: it is Dispatch's own log (§6.4) and matches `*.foam`.
+* **Not a job, and not inside a request.** A render holds no allocation and must not queue behind a
+  week-long run. It must not run inside the request either: the daemon answers each client's requests
+  one at a time, so an hours-long animation would freeze that interface. `case.render` therefore
+  hands the plan to `RenderManager` (`daemon/renders.py`), which runs it as a task and returns a
+  `render_id` at once. Progress is parsed from the script's own `frame i/n` lines and published on
+  the `renders` topic. `render.finished` carries success, the error, or `cancelled`. The TUI
+  announces the result on whatever screen the user is on, and resyncs `render.list` on reconnect.
+  The CLI passes `wait` and runs the same plan inline. Every step is killed on timeout, cancellation
+  or daemon shutdown (a ParaView with no GL context waits rather than failing): 15 minutes for a
+  still, 6 hours for an animation. A second render of the same output is refused while one runs,
+  since both would write the same frames.
+* **Output** goes to `postProcessing/dispatch/<kind>[-<field>]-<angle>`. When the script aims a
+  planar case along its own normal, `<angle>` is `plane`. The only other write is a `.foam` reader
+  stub, reused if one exists. **`log.foam` is excluded explicitly**: it is Dispatch's own log (§6.4)
+  and matches `*.foam`.
+* **Animations are videos.** Frames are rendered into `<name>.frames/frame.%05d.png`, which is
+  cleared first so a shorter re-render cannot leave a stale tail. A second step then encodes them
+  with `ffmpeg` into `<name>.mp4`, using H.264 (libx264, then libopenh264, falling back to mpeg4,
+  probed once), `yuv420p`, even-dimension padding and `+faststart`, so the file plays anywhere. A
+  missing `ffmpeg` is refused *before* rendering, so hours of frames never end with no video. With
+  `--discard-frames`, the frames are deleted in a third step after a successful encode. A failed
+  encode stops the plan, so the frames survive it.
+* **PNGs are always uncompressed.** Every `SaveScreenshot` in every template passes
+  `CompressionLevel='0'` (`paraview.PNG_COMPRESSION`), and a test asserts it for every template
+  variant. Frames are written once and read once by the encoder, so compressing them only costs
+  time. The cost is disk: about 3 bytes per pixel per frame. An animation whose frames would not fit
+  in the free space is refused, and the estimate is shown in the plan's notes.
+* **Every written time, including the initial one.** `SkipZeroTime = 0` only takes effect after
+  `ReloadFiles(reader)`. Without it, the first frame is silently missing. An animation's colour
+  scale is fixed over the whole run (`RescaleTransferFunctionToDataRangeOverTime`, then
+  `AutomaticRescaleRangeMode = "Never"`), so features do not appear to pulse. A still is scaled to
+  its own data.
+
+**Choosing what to render.** `SolverAdapter.visual_fields(ctx)` (default `()`) lists what a render
+can be coloured by. OpenFOAM reads the field headers of the latest written time, preferring
+`processor0` for a decomposed case and reading gzip-compressed files. It offers `vol*` and `point*`
+fields and leaves out `surface*` fields, which the reader does not put on the mesh. The order is
+familiar quantities first (U, p, p_rgh, T, alpha.water, k, omega, epsilon, nut), then the rest, then
+`_0` old-time fields. Labels say what a field is, for example "U (velocity, magnitude)". The TUI
+(`v` still, `V` video in the case view) offers an angle, then exactly this case's fields. A still
+may be the plain mesh. A video defaults to pressure, since a grey mesh in every frame is a video of
+nothing. An unknown field is refused with the list of real ones. The script colours by POINTS or
+CELLS, whichever the reader provides: OpenFOAM fields arrive as cell arrays.
 
 **Dimensionality comes from the adapter** (`SolverAdapter.geometry`, default `None` = "cannot tell",
 treated as 3-D). OpenFOAM has no 2-D meshes; a planar case is one cell thick with `empty` front and
@@ -2263,6 +2327,19 @@ costs one field and fixed a pre-existing `decomposeParDict` write as a side effe
 Using `os.cpu_count()` would schedule against hardware a cgroup forbids; exposing CPU ids would invite
 treating them as a dense range. Manual affinity is out of scope.
 
+**13.35 A runtime CPU mode lives in the database, not the config file.**
+Rewriting `config.toml` from the daemon was rejected: it would discard the user's comments and layout,
+and a file edited by two writers ends up belonging to neither. A `settings` table costs one migration.
+The config remains the default, and choosing its own value clears the override. Allocations are not
+changed by a switch: taking cores from a running process is not something a ledger can do.
+
+**13.36 Renders run in the background with events, and animations are encoded to video.**
+Running a render inside its request was rejected because sessions are served sequentially (§13.32 kept
+renders out of the queue, which is a different problem). A numbered PNG series with a printed `ffmpeg`
+command was rejected as the deliverable: a video is what is wanted, and the encode belongs in the plan
+where its failure is reported. Frames are uncompressed because they are intermediate. The disk check
+and the cleanup-after-encode ordering keep that from costing a full disk or a lost run.
+
 ---
 
 ## 14. Implementation roadmap
@@ -2281,6 +2358,7 @@ Each phase ends with tests passing and something demonstrable.
 | **7** | Packaging | **Done** — systemd unit, `uv build`, README, install docs |
 | **8+** | `CalculiXAdapter` | **Done** — New adapter, zero scheduler changes — the thesis, verified |
 | **10** | Sweep continue-from-latest, pause-and-recore, CPU mode, case info, force coefficients, ParaView renders, search fix | **Done** — schema 006; one migration, no new job state |
+| **11** | Runtime cores/threads switch, video animations via ffmpeg, uncompressed frames, field choice, background renders | **Done** — schema 007 (settings); everything reachable from the TUI |
 | **9** | Working-directory logs, CPU/GPU resources, ML + PINN adapters, project search, terminal plotting | **Done** — schema 004; two adapters added with no daemon change; `p` plots a residual history over SSH |
 
 Phase 2b is the risk concentration: process supervision, exit-code durability, and recovery are

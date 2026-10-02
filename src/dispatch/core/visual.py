@@ -21,7 +21,7 @@ from pathlib import Path
 
 from dispatch.core.plan import CommandStep
 
-__all__ = ["VisualKind", "VisualPlan", "VisualRequest"]
+__all__ = ["VisualField", "VisualKind", "VisualPlan", "VisualRequest"]
 
 
 class VisualKind(StrEnum):
@@ -32,6 +32,27 @@ class VisualKind(StrEnum):
 
     ANIMATION = "animation"
     """A frame per written time step, over the whole run."""
+
+
+@dataclass(frozen=True, slots=True)
+class VisualField:
+    """One quantity a case can be coloured by.
+
+    Attributes:
+        name: The solver's own name for it -- ``p``, ``U``, ``alpha.water``. What is passed
+            back in a :class:`VisualRequest`.
+        kind: ``scalar``, ``vector``, ``tensor``; for a vector the render shows magnitude.
+        label: What to show a human, e.g. ``U (velocity, magnitude)``. Chosen by the
+            adapter, which is the one that knows what ``U`` means.
+    """
+
+    name: str
+    kind: str = "scalar"
+    label: str = ""
+
+    @property
+    def display(self) -> str:
+        return self.label or self.name
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +67,10 @@ class VisualRequest:
         frames: Cap on animation frames. ``None`` renders every written time.
         width: Image width in pixels.
         height: Image height in pixels.
+        fps: Frames per second of an animation's video.
+        keep_frames: Keep an animation's uncompressed frames after the video is encoded.
+            On by default, because they took the render time and are lossless; off for a long
+            run where they would fill the disk.
     """
 
     kind: VisualKind = VisualKind.MESH
@@ -54,6 +79,8 @@ class VisualRequest:
     frames: int | None = None
     width: int = 1600
     height: int = 1000
+    fps: int = 24
+    keep_frames: bool = True
 
 
 @dataclass(frozen=True, slots=True)

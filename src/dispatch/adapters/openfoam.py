@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import ClassVar
@@ -51,7 +52,7 @@ from dispatch.core.models import Detection
 from dispatch.core.plan import CommandStep, ExecutionPlan, FailureAction, StepKind
 from dispatch.core.series import Dataset, PlotData
 from dispatch.core.validation import ReportBuilder, ValidationReport
-from dispatch.core.visual import VisualKind, VisualPlan, VisualRequest
+from dispatch.core.visual import VisualField, VisualKind, VisualPlan, VisualRequest
 
 __all__ = ["OpenFOAMAdapter"]
 
@@ -775,25 +776,44 @@ class OpenFOAMAdapter(BaseAdapter):
             shape.bounds if shape else None, preset, geometry=shape
         )
 
+        animated = request.kind is VisualKind.ANIMATION
+        field = self._chosen_field(ctx, request)
+
+        ffmpeg = paraview.find_ffmpeg(ctx.env) if animated else None
+        if animated and ffmpeg is None:
+            # Refused before anything is rendered: discovering this after hours of frames
+            # would leave the user with a directory of PNGs and no video.
+            raise ValidationError(
+                "ffmpeg was not found on this machine, so the frames could not be joined into "
+                "a video. Install ffmpeg and try again."
+            )
+
         decomposed = count_processor_dirs(case) > 0
-        # Always names the angle, including when the bounds were unknown and ParaView framed
-        # the mesh itself: a predictable filename is one that does not depend on whether a
-        # blockMeshDict happened to be readable.
-        name = f"{request.kind.value}-{angle_preset.value}"
+        # Always names the angle -- and the field, when there is one -- so the filename is
+        # predictable and two renders of the same case do not overwrite each other.
+        parts = [request.kind.value]
+        if field:
+            parts.append(paraview.safe_name(field))
+        # A planar case whose extent Dispatch could not read is aimed along its normal by the
+        # script itself, whatever was requested -- so the name says "plane" rather than
+        # claiming an angle the image was not taken from.
+        deferred = camera is None and bool(shape and shape.is_planar)
+        parts.append("plane" if deferred else angle_preset.value)
+        name = "-".join(parts)
         spec = paraview.RenderRequest(
             reader=self._reader_stub(case, write=not ctx.dry_run),
             output=output,
             name=name,
             preset=angle_preset,
             size=(request.width, request.height),
-            field=request.field,
+            field=field,
             decomposed=decomposed,
             frames=request.frames,
             planar=bool(shape and shape.is_planar),
         )
         body = (
             paraview.animation_script(spec, camera)
-            if request.kind is VisualKind.ANIMATION
+            if animated
             else paraview.screenshot_script(spec, camera)
         )
 
@@ -820,28 +840,143 @@ class OpenFOAMAdapter(BaseAdapter):
         if decomposed:
             notes.append("reading the decomposed case from its processor directories")
 
+        steps: list[CommandStep] = [
+            CommandStep(
+                argv=paraview.render_argv(binary, script),
+                cwd=case,
+                description=(
+                    f"Rendering {'frames' if animated else 'a still'} of {case.name}"
+                    + (f" coloured by {field}" if field else "")
+                    + f" from {angle_preset.value}"
+                ),
+                kind=StepKind.PREPARE,
+                env=dict(ctx.env),
+                timeout_s=(
+                    paraview.ANIMATION_TIMEOUT_S if animated else paraview.RENDER_TIMEOUT_S
+                ),
+            )
+        ]
         outputs: list[Path] = [output / f"{name}.png"]
-        if request.kind is VisualKind.ANIMATION:
-            outputs = [output]
 
-        return VisualPlan(
-            steps=(
+        if animated:
+            assert ffmpeg is not None
+            video = output / f"{name}.mp4"
+            encoder = paraview.video_encoder(ffmpeg)
+            steps.append(
                 CommandStep(
-                    argv=paraview.render_argv(binary, script),
-                    cwd=case,
-                    description=(
-                        f"Rendering {request.kind.value} of {case.name} "
-                        f"from {angle_preset.value}"
+                    argv=paraview.encode_argv(
+                        ffmpeg, spec, video, fps=request.fps, encoder=encoder
                     ),
+                    cwd=case,
+                    description=f"Encoding the frames to {video.name} with {encoder[0]}",
                     kind=StepKind.SOLVE,
                     env=dict(ctx.env),
-                    timeout_s=paraview.RENDER_TIMEOUT_S,
-                ),
-            ),
+                    timeout_s=paraview.ENCODE_TIMEOUT_S,
+                )
+            )
+            if not request.keep_frames:
+                # Only reached if the encode succeeded: a failed step stops the plan, so the
+                # frames -- which took the hours -- are never deleted without a video.
+                steps.append(
+                    CommandStep(
+                        argv=["rm", "-rf", str(spec.frame_dir)],
+                        cwd=case,
+                        description="Removing the frames now that the video exists",
+                        kind=StepKind.CLEANUP,
+                        env=dict(ctx.env),
+                    )
+                )
+            outputs = [video]
+            notes.extend(self._frame_budget(ctx, request, spec))
+
+        return VisualPlan(
+            steps=tuple(steps),
             outputs=tuple(outputs),
             tool=binary,
             notes=tuple(notes),
         )
+
+    def visual_fields(self, ctx: CaseContext) -> Sequence[VisualField]:
+        """The fields this case can be coloured by, read from its latest written time.
+
+        Ordered for a chooser: the fields people reach for first, then the rest by name, and
+        the ``_0`` copies OpenFOAM keeps of the previous time last, since they are almost
+        never what anybody wants to look at.
+        """
+        found = foammesh.render_fields(ctx.workdir)
+        preferred = ("U", "p", "p_rgh", "T", "alpha.water", "k", "omega", "epsilon", "nut")
+
+        def order(item: tuple[str, str]) -> tuple[int, int, str]:
+            name = item[0]
+            stale = name.endswith("_0")
+            rank = preferred.index(name) if name in preferred else len(preferred)
+            return (1 if stale else 0, rank, name.lower())
+
+        fields: list[VisualField] = []
+        for name, kind in sorted(found, key=order):
+            meaning = foammesh.FIELD_LABELS.get(name, "")
+            if kind == "vector":
+                meaning = f"{meaning}, magnitude" if meaning else "magnitude"
+            fields.append(
+                VisualField(
+                    name=name, kind=kind, label=f"{name} ({meaning})" if meaning else name
+                )
+            )
+        return tuple(fields)
+
+    def _chosen_field(self, ctx: CaseContext, request: VisualRequest) -> str | None:
+        """The field to colour by, checked against what the case actually has.
+
+        Checked here, at planning time, so a typo is refused with the list of real fields
+        rather than discovered by ParaView an hour into an animation. An animation with no
+        field named takes pressure, then velocity, then the first available -- a plain grey
+        mesh for every frame is a video of nothing.
+        """
+        available = [item.name for item in self.visual_fields(ctx)]
+        if request.field:
+            if available and request.field not in available:
+                raise ValidationError(
+                    f"This case has no field {request.field!r}. "
+                    f"Available: {', '.join(available)}"
+                )
+            return request.field
+        if request.kind is VisualKind.ANIMATION and available:
+            for default in ("p", "U"):
+                if default in available:
+                    return default
+            return available[0]
+        return None
+
+    def _frame_budget(
+        self, ctx: CaseContext, request: VisualRequest, spec: paraview.RenderRequest
+    ) -> list[str]:
+        """What the uncompressed frames will cost on disk, refused if they cannot fit.
+
+        Frames are stored uncompressed by requirement, so a long animation is large: a
+        1600x1000 frame is about 4.8 MB, and a thousand-step run is near five gigabytes. That
+        is worth saying before it happens, and refusing outright when the filesystem
+        plainly cannot hold it -- a render that fills the disk can take the running
+        simulations' output down with it.
+        """
+        times = len(_written_times(ctx.workdir)) + 1  # every write, plus the initial condition
+        if request.frames is not None:
+            times = min(times, request.frames)
+        need = times * paraview.frame_bytes((request.width, request.height))
+        try:
+            free = shutil.disk_usage(ctx.workdir).free
+        except OSError:
+            free = None
+        if free is not None and need > free:
+            raise ValidationError(
+                f"About {times} frames of {request.width}x{request.height} uncompressed PNG "
+                f"need ~{need / 1e9:.1f} GB, but only {free / 1e9:.1f} GB is free. Cap the "
+                "frames, lower the resolution, or free some space."
+            )
+        kept = "kept" if request.keep_frames else "deleted after encoding"
+        return [
+            f"~{times} uncompressed frame(s), ~{need / 1e9:.2f} GB in "
+            f"{spec.frame_dir.name}/ ({kept})"
+        ]
 
     def _reader_stub(self, case: Path, *, write: bool) -> Path:
         """The ``.foam`` file ParaView's reader opens, creating one if the case has none.

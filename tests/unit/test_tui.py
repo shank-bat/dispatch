@@ -1125,3 +1125,213 @@ def test_an_unrecognised_terminal_is_asked_rather_than_assumed(
     question itself is expected to come back negative here.
     """
     assert _graphics_supported_with_tty(monkeypatch, TERM="xterm-256color") is False
+
+
+# -- switching cores/threads, and choosing what to render -----------------------------------
+
+
+def test_the_header_names_threads_when_threads_are_counted() -> None:
+    """The ledger's own unit: twenty-four of something, and the label says which."""
+    from dispatch.tui.widgets.meters import HeaderStats
+
+    stats = HeaderStats()
+    base = {
+        "total_cores": 24,
+        "allocated_cores": 4,
+        "free_cores": 20,
+        "cpu_percent": 5.0,
+        "used_ram_mb": 4000,
+        "total_ram_mb": 32000,
+        "load_average": [0.1],
+    }
+    stats.snapshot = {**base, "cpu_mode": "logical"}
+    assert rendered(stats).startswith("thrd ")
+    stats.snapshot = {**base, "cpu_mode": "physical"}
+    assert rendered(stats).startswith("core ")
+
+
+def calls_to(app: DispatchApp, method: str) -> list[dict[str, Any]]:
+    """The parameters of every call ``recording_app`` saw to ``method``."""
+    return app.calls_to(method)  # type: ignore[attr-defined]
+
+
+CPU_PREVIEW: dict[str, Any] = {
+    "previous": "physical",
+    "mode": "logical",
+    "previous_total": 16,
+    "total_cores": 24,
+    "schedulable_cores": 24,
+    "allocated_cores": 0,
+    "over_committed": False,
+    "stranded": [],
+    "relabel_only": False,
+    "applied": False,
+}
+
+
+async def test_the_dashboard_switches_cores_and_threads_after_asking(
+    offline_config: Config,
+) -> None:
+    from dispatch.tui.screens.base import ConfirmScreen
+
+    replies: dict[str, Any] = {Method.SCHEDULER_CPU_MODE: CPU_PREVIEW}
+    app = recording_app(offline_config, replies)
+    async with app.run_test() as pilot:
+        await pilot.press("m")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmScreen)
+        assert calls_to(app, Method.SCHEDULER_CPU_MODE) == [{"mode": "toggle", "preview": True}]
+        assert "16 cores → 24 threads" in app.screen._question
+
+        replies[Method.SCHEDULER_CPU_MODE] = {**CPU_PREVIEW, "applied": True}
+        await pilot.press("y")
+        await pilot.pause()
+        assert calls_to(app, Method.SCHEDULER_CPU_MODE)[-1] == {"mode": "logical"}
+
+
+async def test_declining_the_switch_changes_nothing(offline_config: Config) -> None:
+    app = recording_app(offline_config, {Method.SCHEDULER_CPU_MODE: CPU_PREVIEW})
+    async with app.run_test() as pilot:
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert calls_to(app, Method.SCHEDULER_CPU_MODE) == [{"mode": "toggle", "preview": True}]
+
+
+async def test_the_switch_warns_about_jobs_that_would_never_start(
+    offline_config: Config,
+) -> None:
+    preview = {
+        **CPU_PREVIEW,
+        "previous": "logical",
+        "mode": "physical",
+        "previous_total": 24,
+        "total_cores": 16,
+        "schedulable_cores": 16,
+        "stranded": [{"id": "j1", "name": "wide-wing", "cores": 20}],
+    }
+    app = recording_app(offline_config, {Method.SCHEDULER_CPU_MODE: preview})
+    async with app.run_test() as pilot:
+        await pilot.press("m")
+        await pilot.pause()
+        detail = getattr(app.screen, "_detail", "")
+        assert "wide-wing" in detail and "will not start" in detail
+
+
+async def test_a_choice_screen_returns_the_value_not_the_label(offline_config: Config) -> None:
+    from dispatch.tui.screens.caseinfo import ChoiceScreen
+
+    chosen: list[str | None] = []
+    app = DispatchApp(config=offline_config, autostart=False)
+    async with app.run_test() as pilot:
+        app.push_screen(
+            ChoiceScreen("colour by", [("U", "U (velocity)"), ("p", "p (pressure)")], initial="p"),
+            chosen.append,
+        )
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        app.push_screen(ChoiceScreen("colour by", [("U", "U")]), chosen.append)
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+    assert chosen == ["p", None]
+
+
+CASE_REPORT = {
+    "path": "/cases/wing",
+    "title": "wing",
+    "solver": "openfoam",
+    "sections": [],
+}
+
+
+async def render_through_the_case_view(
+    offline_config: Config, keys: list[str], fields: list[dict[str, str]]
+) -> Any:
+    from dispatch.tui.screens.caseinfo import CaseInfoScreen
+
+    replies: dict[str, Any] = {
+        Method.CASE_INFO: CASE_REPORT,
+        Method.CASE_FIELDS: {"path": "/cases/wing", "fields": fields},
+        Method.CASE_RENDER: {"started": True, "render_id": "r1", "outputs": [], "notes": []},
+    }
+    app = recording_app(offline_config, replies)
+    async with app.run_test() as pilot:
+        await app.push_screen(CaseInfoScreen(path="/cases/wing"))
+        await pilot.pause()
+        for key in keys:
+            await pilot.press(key)
+            await pilot.pause()
+    return app
+
+
+FIELDS = [
+    {"name": "U", "kind": "vector", "label": "U (velocity, magnitude)"},
+    {"name": "p", "kind": "scalar", "label": "p (pressure)"},
+]
+
+
+async def test_a_video_of_a_chosen_field_can_be_started_from_the_case_view(
+    offline_config: Config,
+) -> None:
+    # V, accept the default angle, move to the second field (p), choose it.
+    app = await render_through_the_case_view(
+        offline_config, ["V", "enter", "down", "enter"], FIELDS
+    )
+    assert calls_to(app, Method.CASE_RENDER) == [
+        {"path": "/cases/wing", "kind": "animation", "preset": "isometric", "field": "p"}
+    ]
+
+
+async def test_a_still_may_be_the_plain_mesh(offline_config: Config) -> None:
+    app = await render_through_the_case_view(offline_config, ["v", "enter", "enter"], FIELDS)
+    assert calls_to(app, Method.CASE_RENDER) == [
+        {"path": "/cases/wing", "kind": "mesh", "preset": "isometric"}
+    ]
+
+
+async def test_a_still_can_be_coloured_by_velocity(offline_config: Config) -> None:
+    app = await render_through_the_case_view(
+        offline_config, ["v", "enter", "down", "enter"], FIELDS
+    )
+    assert calls_to(app, Method.CASE_RENDER)[0]["field"] == "U"
+
+
+async def test_backing_out_of_the_field_choice_renders_nothing(offline_config: Config) -> None:
+    app = await render_through_the_case_view(offline_config, ["V", "enter", "escape"], FIELDS)
+    assert calls_to(app, Method.CASE_RENDER) == []
+
+
+def test_renders_are_found_by_case() -> None:
+    state = AppState()
+    state.renders = {
+        "a": {"id": "a", "case": "/cases/wing"},
+        "b": {"id": "b", "case": "/cases/cavity"},
+    }
+    assert [item["id"] for item in state.renders_for("/cases/wing")] == ["a"]
+
+
+@pytest.mark.parametrize(
+    ("data", "expected", "severity"),
+    [
+        ({"ok": True, "outputs": ["/w/animation-p.mp4"]}, "/w/animation-p.mp4", "information"),
+        ({"ok": False, "error": "cancelled"}, "cancelled", "information"),
+        ({"ok": False, "error": "exit 3: no GL"}, "exit 3: no GL", "error"),
+    ],
+)
+async def test_the_end_of_a_render_is_announced_wherever_the_user_is(
+    offline_config: Config, data: dict, expected: str, severity: str
+) -> None:
+    from dispatch.ipc.protocol import Event, Notification
+
+    app = DispatchApp(config=offline_config, autostart=False)
+    said: list[tuple[str, str]] = []
+    async with app.run_test() as pilot:
+        app.notify = lambda message, **kw: said.append((message, kw.get("severity", "information")))  # type: ignore[method-assign]
+        app.state.renders["r1"] = {"id": "r1", "case": "/w"}
+        app._on_event(Notification(event=str(Event.RENDER_FINISHED), data={"id": "r1", **data}))
+        await pilot.pause()
+    assert "r1" not in app.state.renders
+    assert any(expected in message and level == severity for message, level in said)

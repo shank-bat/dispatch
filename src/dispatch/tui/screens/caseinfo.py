@@ -42,8 +42,9 @@ class CaseInfoScreen(DispatchScreen):
     BINDINGS = [
         Binding("escape,q,i", "back", "back"),
         Binding("r", "reload", "reload"),
-        Binding("v", "render", "render mesh"),
-        Binding("V", "render_animation", "animate"),
+        Binding("v", "render", "render image"),
+        Binding("V", "render_animation", "render video"),
+        Binding("x", "cancel_render", "cancel render"),
     ]
 
     def __init__(self, path: str | None = None, *, job_id: str | None = None) -> None:
@@ -91,34 +92,67 @@ class CaseInfoScreen(DispatchScreen):
         self.dismiss()
 
     def action_render(self) -> None:
-        """Render a mesh screenshot, after asking which angle."""
-        self.app.push_screen(_PresetScreen(), self._render_mesh)
+        """Render a still of the mesh: choose an angle, then what to colour it by."""
+        self._choose_render("mesh")
 
     def action_render_animation(self) -> None:
-        """Render a frame per written time step."""
-        self.app.push_screen(_PresetScreen(), self._render_animation)
+        """Render a video over every written time: choose an angle, then a field."""
+        self._choose_render("animation")
 
-    def _render_mesh(self, preset: str | None) -> None:
-        if preset:
-            self.app.call_later(self._run_render, "mesh", preset)
+    def action_cancel_render(self) -> None:
+        """Stop the render running for this case, keeping any frames already written."""
+        running = self._renders()
+        if not running:
+            self.notify_error("No render is running for this case.")
+            return
+        self.dispatch_app.send(Method.RENDER_CANCEL, id=running[0]["id"])
 
-    def _render_animation(self, preset: str | None) -> None:
-        if preset:
-            self.app.call_later(self._run_render, "animation", preset)
+    def _choose_render(self, kind: str) -> None:
+        def _angle(preset: str | None) -> None:
+            if preset:
+                self.app.call_later(self._choose_field, kind, preset)
 
-    async def _run_render(self, kind: str, preset: str) -> None:
-        """Ask the daemon to render, and say where the result went.
+        self.app.push_screen(
+            ChoiceScreen("camera angle", [(name, name) for name in PRESETS], initial="isometric"),
+            _angle,
+        )
 
-        Rendering an animation over a long run takes minutes, so the notification says it has
-        started and the result replaces it when it arrives -- rather than the screen appearing
-        to do nothing.
+    async def _choose_field(self, kind: str, preset: str) -> None:
+        """Offer exactly the fields this case has, as the adapter read them.
+
+        A still may also be the plain mesh -- that is what a mesh screenshot usually is. An
+        animation needs something that changes, so the plain mesh is not offered for one
+        unless the case has no fields at all.
         """
-        self.notify_ok(f"rendering the {kind}… this can take a while")
-        params: dict[str, Any] = {"kind": kind, "preset": preset}
-        if self.path is not None:
-            params["path"] = self.path
-        if self.job_id is not None:
-            params["id"] = self.job_id
+        try:
+            listing = await self.dispatch_app.call(Method.CASE_FIELDS, **self._target())
+        except Exception as exc:
+            self.notify_error(str(exc))
+            return
+        fields = [(str(item["name"]), str(item["label"])) for item in listing["fields"]]
+
+        options: list[tuple[str, str]] = []
+        if kind == "mesh" or not fields:
+            options.append(("", "none (plain mesh, edges shown)"))
+        options.extend(fields)
+
+        def _field(choice: str | None) -> None:
+            if choice is not None:
+                self.app.call_later(self._start_render, kind, preset, choice or None)
+
+        title = "colour by" if kind == "mesh" else "animate which field"
+        self.app.push_screen(ChoiceScreen(title, options), _field)
+
+    async def _start_render(self, kind: str, preset: str, field: str | None) -> None:
+        """Start the render in the background; progress shows here, the result anywhere.
+
+        Not awaited to completion: an animation can take hours, and the daemon answers one
+        interface's requests in turn, so waiting here would freeze everything else this
+        interface asks for until it finished.
+        """
+        params: dict[str, Any] = {**self._target(), "kind": kind, "preset": preset}
+        if field:
+            params["field"] = field
         try:
             result = await self.dispatch_app.call(Method.CASE_RENDER, **params)
         except Exception as exc:
@@ -126,8 +160,24 @@ class CaseInfoScreen(DispatchScreen):
             return
         for note in result.get("notes") or []:
             self.notify_ok(str(note))
-        outputs = result.get("outputs") or []
-        self.notify_ok(f"wrote {outputs[0]}" if outputs else "rendered")
+        what = "video" if kind == "animation" else "image"
+        self.notify_ok(f"Rendering the {what} in the background; x cancels")
+        self.refresh_view()
+
+    def _target(self) -> dict[str, Any]:
+        if self.path is not None:
+            return {"path": self.path}
+        return {"id": self.job_id}
+
+    def _renders(self) -> list[dict[str, Any]]:
+        case = (self.report or {}).get("path")
+        return self.app_state.renders_for(str(case)) if case else []
+
+    def refresh_view(self) -> None:
+        """Repaint when a render's progress arrives."""
+        if self.report is not None:
+            self._redraw()
+
 
     def heading(self) -> Text:
         text = Text("case", style=f"bold {Palette.TEXT}")
@@ -151,13 +201,21 @@ class CaseInfoScreen(DispatchScreen):
             body.update(Text("reading the case…", style=Palette.FAINT))
             self.update_status()
             return
-        body.update(_render_report(self.report))
+        body.update(_render_report(self.report, self._renders()))
         self.update_status()
 
 
-def _render_report(report: dict[str, Any]) -> Text:
-    """Lay out a case report: warnings, then each section's fields."""
+def _render_report(report: dict[str, Any], renders: list[dict[str, Any]] | None = None) -> Text:
+    """Lay out a case report: renders in progress, warnings, then each section's fields."""
     text = Text()
+    for item in renders or []:
+        frame, frames = item.get("frame"), item.get("frames")
+        detail = f"frame {frame}/{frames}" if frame and frames else str(item.get("description", ""))
+        text.append("  ▶ ", style=Palette.ACCENT)
+        text.append(f"rendering {item.get('kind')}: {detail}", style=Palette.TEXT)
+        text.append(
+            f"   step {item.get('step')}/{item.get('steps')} · x cancels\n", style=Palette.FAINT
+        )
 
     path = report.get("path")
     if path:
@@ -205,36 +263,52 @@ def _field(text: Text, item: dict[str, Any]) -> None:
     text.append("\n")
 
 
-class _PresetScreen(ModalScreen[str | None]):
-    """Pick a camera angle.
+PRESETS = ("front", "back", "left", "right", "top", "bottom", "isometric")
+"""Kept in step with :class:`dispatch.adapters.paraview.CameraPreset`, which the interface may
+not import -- the TUI does not depend on adapters (§3). A name this list has wrong is refused
+by the daemon with the valid ones, rather than silently rendering something else."""
 
-    A list rather than a typed name: there are seven, they are the whole vocabulary, and
-    nobody should have to remember which spellings are accepted.
+
+class ChoiceScreen(ModalScreen[str | None]):
+    """Pick one of a short list of named options.
+
+    Dismisses with the chosen value, or ``None`` when the user backs out. A list rather than a
+    typed name: the options are the whole vocabulary, and nobody should have to remember which
+    spellings -- or which of this case's fields -- exist.
     """
 
     BINDINGS = [Binding("escape", "cancel", "cancel")]
 
-    PRESETS = ("front", "back", "left", "right", "top", "bottom", "isometric")
-    """Kept in step with :class:`dispatch.adapters.paraview.CameraPreset`, which the
-    interface may not import -- the TUI does not depend on adapters (§3). A name this list
-    has wrong is refused by the daemon with the valid ones, rather than silently rendering
-    something else."""
+    def __init__(
+        self, title: str, options: list[tuple[str, str]], *, initial: str | None = None
+    ) -> None:
+        """Args:
+        title: What is being chosen.
+        options: ``(value, label)`` pairs, in display order.
+        initial: Value to start the cursor on.
+        """
+        super().__init__()
+        self.title_text = title
+        self.options = options
+        self._initial = initial
 
     def compose(self) -> ComposeResult:
         with Container():
-            yield Label(Text("camera angle", style=f"bold {Palette.TEXT}"))
+            yield Label(Text(self.title_text, style=f"bold {Palette.TEXT}"))
             yield ListView(
-                *(ListItem(Label(Text(name))) for name in self.PRESETS),
-                id="preset-list",
+                *(ListItem(Label(Text(label))) for _, label in self.options),
+                id="choice-list",
             )
 
     def on_mount(self) -> None:
-        view = self.query_one("#preset-list", ListView)
-        view.index = len(self.PRESETS) - 1  # isometric: the one that shows a 3-D mesh best
+        view = self.query_one("#choice-list", ListView)
+        values = [value for value, _ in self.options]
+        view.index = values.index(self._initial) if self._initial in values else 0
         view.focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        self.dismiss(self.PRESETS[event.list_view.index or 0])
+        if self.options:
+            self.dismiss(self.options[event.list_view.index or 0][0])
 
     def action_cancel(self) -> None:
         self.dismiss(None)

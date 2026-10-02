@@ -26,14 +26,17 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-from dispatch.core.config import SchedulerConfig
+from dispatch.core.config import CpuMode, SchedulerConfig
 from dispatch.core.models import ResourceRequest
 
-__all__ = ["Capacity", "MemoryProbe", "ResourceModel"]
+__all__ = ["CPU_MODE_SETTING", "Capacity", "MemoryProbe", "ResourceModel"]
+
+CPU_MODE_SETTING = "scheduler.cpu_mode"
+"""The settings-table key under which an interface-chosen CPU mode is persisted (§4.3.2)."""
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +118,8 @@ class ResourceModel:
         self.total_cores = config.resolve_total_cores()
         self.reserved_cores = min(config.reserved_cores, max(0, self.total_cores - 1))
         self.cpu_mode = config.resolved_cpu_mode
+        self.cpu_mode_source = "config"
+        """Where :attr:`cpu_mode` came from: ``config`` or ``interface`` (§4.3.2)."""
         """What this ledger's core counts mean -- physical cores or logical threads.
 
         Carried on the ledger rather than re-read from config at each call site, so the
@@ -139,8 +144,39 @@ class ResourceModel:
         return sum(request.ram_mb or 0 for request in self._allocations.values())
 
     def describe_cores(self, count: int) -> str:
-        """``20 cores`` or ``20 threads``, matching whatever this ledger counts."""
-        return self._config.describe_cores(count)
+        """``20 cores`` or ``20 threads``, matching whatever this ledger counts *now*.
+
+        From the ledger's own mode, not the config's: the mode can be switched at runtime,
+        and a label read from the file would describe the machine as it was at startup.
+        """
+        unit = "thread" if self.cpu_mode is CpuMode.LOGICAL else "core"
+        return f"{count} {unit}{'' if count == 1 else 's'}"
+
+    def totals_for(self, mode: CpuMode) -> tuple[int, int]:
+        """``(total, schedulable)`` cores this ledger *would* have under ``mode``.
+
+        Pure, so the interface can show what a switch will do before anybody commits to it.
+        An explicit ``scheduler.total_cores`` is honoured in either mode, in which case the
+        switch changes only what the number is called.
+        """
+        total = replace(self._config, cpu_mode=mode.value).resolve_total_cores()
+        reserved = min(self._config.reserved_cores, max(0, total - 1))
+        return total, max(1, total - reserved)
+
+    def set_cpu_mode(self, mode: CpuMode, *, source: str = "interface") -> None:
+        """Switch what a core means, recomputing the totals the ledger admits against.
+
+        **Allocations are not touched.** A job admitted as twelve threads keeps its twelve:
+        it is running, it was promised them, and the process it supervises does not know the
+        dashboard changed its mind. If the new total is smaller than what is already
+        allocated, :attr:`free_cores` simply reads zero until enough of it is released --
+        the ledger can be over-committed by a switch, but it can never *admit* past the new
+        total, which is the property that matters.
+        """
+        self.cpu_mode = mode
+        self.cpu_mode_source = source
+        self.total_cores, _ = self.totals_for(mode)
+        self.reserved_cores = min(self._config.reserved_cores, max(0, self.total_cores - 1))
 
     @property
     def allocated_gpus(self) -> int:

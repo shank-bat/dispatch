@@ -140,6 +140,7 @@ class SystemMonitor:
             load_average=self._resources.load_average(),
             uptime_s=max(0.0, self._clock.now() - self._boot),
             cpu_mode=self._resources.cpu_mode.value,
+            cpu_mode_source=self._resources.cpu_mode_source,
             total_gpus=self._resources.total_gpus,
             allocated_gpus=self._resources.allocated_gpus,
         )

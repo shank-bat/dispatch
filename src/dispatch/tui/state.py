@@ -43,6 +43,8 @@ class AppState:
     snapshot: dict[str, Any] = field(default_factory=dict)
     jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     progress: dict[str, dict[str, Any]] = field(default_factory=dict)
+    renders: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Background renders in flight, by id, as their last progress event described them."""
     sweeps: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Sweeps by id, as the daemon last reported them.
 
@@ -107,6 +109,10 @@ class AppState:
             return
         current = self.progress.setdefault(job_id, {})
         current.update(data)
+
+    def renders_for(self, case: str) -> list[dict[str, Any]]:
+        """Renders currently running against one case directory."""
+        return [item for item in self.renders.values() if item.get("case") == case]
 
     def forget(self, job_id: str) -> None:
         """Drop a deleted job."""

@@ -228,3 +228,58 @@ def test_the_launcher_still_oversubscribes_when_it_must(tmp_path: Path) -> None:
     counts -- so 24 ranks on 16 slots needs it in both modes."""
     assert mpi.OVERSUBSCRIBE_FLAG in mpi.launch_argv(24, "icoFoam", "-parallel", slots=16)
     assert mpi.OVERSUBSCRIBE_FLAG not in mpi.launch_argv(8, "icoFoam", "-parallel", slots=16)
+
+
+# -- switching at runtime ----------------------------------------------------------------
+
+
+def smt(monkeypatch, physical: int = 16, logical: int = 24) -> None:
+    monkeypatch.setattr("dispatch.core.config.physical_cores", lambda: physical)
+    monkeypatch.setattr("dispatch.core.config.logical_cpus", lambda: logical)
+
+
+def test_switching_recomputes_the_totals(monkeypatch) -> None:
+    smt(monkeypatch)
+    model = ResourceModel(SchedulerConfig(reserved_cores=2), memory_probe=lambda: 64_000)
+    assert (model.total_cores, model.schedulable_cores) == (16, 14)
+
+    model.set_cpu_mode(CpuMode.LOGICAL)
+    assert (model.total_cores, model.schedulable_cores) == (24, 22)
+    assert model.cpu_mode is CpuMode.LOGICAL and model.cpu_mode_source == "interface"
+    assert model.describe_cores(2) == "2 threads"
+
+    model.set_cpu_mode(CpuMode.PHYSICAL, source="config")
+    assert model.total_cores == 16 and model.describe_cores(1) == "1 core"
+
+
+def test_the_preview_changes_nothing(monkeypatch) -> None:
+    smt(monkeypatch)
+    model = ResourceModel(SchedulerConfig(reserved_cores=0), memory_probe=lambda: 64_000)
+    assert model.totals_for(CpuMode.LOGICAL) == (24, 24)
+    assert model.cpu_mode is CpuMode.PHYSICAL and model.total_cores == 16
+
+
+def test_switching_never_takes_cores_from_a_running_job(monkeypatch) -> None:
+    """Allocations stand; the ledger may read over-committed, but never admits past it."""
+    smt(monkeypatch)
+    model = ResourceModel(
+        SchedulerConfig(cpu_mode="logical", reserved_cores=0), memory_probe=lambda: 64_000
+    )
+    model.acquire("big", ResourceRequest(cores=20))
+    model.set_cpu_mode(CpuMode.PHYSICAL)
+
+    assert model.allocated_cores == 20, "the running job keeps what it was given"
+    assert model.free_cores == 0
+    assert not model.can_admit(ResourceRequest(cores=1))[0]
+
+    model.release("big")
+    assert model.free_cores == 16
+
+
+def test_an_explicit_total_is_only_relabelled(monkeypatch) -> None:
+    smt(monkeypatch)
+    model = ResourceModel(
+        SchedulerConfig(total_cores=10, reserved_cores=0), memory_probe=lambda: 64_000
+    )
+    model.set_cpu_mode(CpuMode.LOGICAL)
+    assert model.total_cores == 10 and model.describe_cores(10) == "10 threads"
