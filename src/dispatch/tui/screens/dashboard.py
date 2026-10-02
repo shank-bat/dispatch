@@ -11,18 +11,29 @@ because the tables beneath them are already unmistakable.
 
 from __future__ import annotations
 
+from typing import Any
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Static
 
+from dispatch.ipc.protocol import Method
 from dispatch.tui.screens.base import DispatchScreen
 from dispatch.tui.state import sweep_summary
 from dispatch.tui.theme import Palette
 from dispatch.tui.widgets.jobtable import JobTable
 
 __all__ = ["DashboardScreen"]
+
+
+DETAIL_VALUES = 2
+"""How many measured values the collapsed-by-default expander shows.
+
+Two, because the dashboard's worth is that it fits on one screen and the first two are the
+ones asked for. The full set is one keypress away in the plot view.
+"""
 
 
 class DashboardScreen(DispatchScreen):
@@ -34,9 +45,12 @@ class DashboardScreen(DispatchScreen):
     BINDINGS = [
         Binding("enter", "open", "logs"),
         Binding("p", "plot", "plot"),
+        Binding("i", "case_info", "info"),
+        Binding("space", "expand", "details"),
     ]
-    """The dashboard is where a running job is being watched, so the two things worth
-    doing to one from here -- read its output, plot its numbers -- are bound directly."""
+    """The dashboard is where a running job is being watched, so the things worth doing to
+    one from here -- read its output, plot its numbers, glance at its coefficients -- are
+    bound directly."""
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -48,6 +62,7 @@ class DashboardScreen(DispatchScreen):
             # be exactly the clutter the grid was built to avoid.
             yield Static(_section("active"), classes="section")
             yield JobTable(id="running")
+            yield Static("", id="details")
             yield Static("", id="next-up")
             yield Static("", id="sweeps")
             yield Static(_section("recent"), classes="section")
@@ -62,12 +77,27 @@ class DashboardScreen(DispatchScreen):
         self.refresh_view()
         self.query_one("#running", JobTable).focus()
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._expanded: str | None = None
+        """Which job's details are showing, if any. ``None`` keeps the dashboard compact."""
+
+        self._metrics: dict[str, dict[str, Any]] = {}
+        """Latest case values by job id, as the daemon last reported them.
+
+        Cached so the one-second repaint renders from memory. Fetched only when a job is
+        expanded and when its row changes -- never on a timer, because reading a case's
+        output files on every tick for a job nobody is looking at is exactly the kind of
+        background work Dispatch does not do (§6.1).
+        """
+
     def refresh_view(self) -> None:
         """Re-render from the cached state."""
         state = self.app_state
 
         self.query_one("#running", JobTable).show(state.running, state.progress)
         self.query_one("#recent", JobTable).show(state.finished[:8])
+        self.query_one("#details", Static).update(self._details())
         self.query_one("#next-up", Static).update(self._next_up())
         self.query_one("#sweeps", Static).update(self._sweeps())
         self.update_status()
@@ -94,6 +124,92 @@ class DashboardScreen(DispatchScreen):
         job_id = self._selected()
         if job_id:
             self.dispatch_app.open_plot(job_id)
+
+    def action_case_info(self) -> None:
+        job_id = self._selected()
+        if job_id:
+            self.dispatch_app.open_case_info(job_id=job_id)
+
+    # -- the expander ---------------------------------------------------------------------
+
+    def action_expand(self) -> None:
+        """Show, or hide, the selected job's latest case values.
+
+        Collapsed by default and collapsible again, because the dashboard's value is that it
+        fits on one screen. Expanding one job is a question about that job, not a change of
+        view.
+        """
+        job_id = self._selected()
+        if job_id is None:
+            return
+        if self._expanded == job_id:
+            self._expanded = None
+            self.refresh_view()
+            return
+        self._expanded = job_id
+        self.app.call_later(self._fetch_metrics, job_id)
+
+    async def _fetch_metrics(self, job_id: str) -> None:
+        """Ask the daemon for the case's latest values.
+
+        Reads the case's own output files and not the log, so this costs a stat and a short
+        read rather than parsing a run's worth of residuals.
+        """
+        try:
+            payload = await self.dispatch_app.call(Method.JOB_METRICS, id=job_id)
+        except Exception as exc:
+            self._metrics[job_id] = {}
+            self.notify_error(str(exc))
+            return
+        self._metrics[job_id] = dict(payload.get("datasets") or {})
+        self.refresh_view()
+
+    def _details(self) -> Text:
+        """The expanded job's latest case values, or an honest line saying there are none.
+
+        The labels and their order come from the daemon, which got them from the adapter:
+        this screen renders ``Cl (lift) +0.714`` without knowing that lift exists, which is
+        what keeps the interface solver-ignorant (§3).
+        """
+        if self._expanded is None:
+            return Text("")
+        job = self.app_state.get(self._expanded)
+        if job is None:
+            return Text("")
+
+        text = Text("  ")
+        text.append(str(job["name"]), style=Palette.TEXT)
+        text.append("   ", style=Palette.FAINT)
+
+        if self._expanded not in self._metrics:
+            text.append("reading the case…", style=Palette.FAINT)
+            return text
+
+        datasets = self._metrics[self._expanded]
+        if not datasets:
+            # Most cases write no post-processing output, and that is not a failure.
+            text.append("no case output to summarise", style=Palette.FAINT)
+            return text
+
+        for dataset in datasets.values():
+            values = [
+                entry for entry in (dataset.get("values") or []) if isinstance(entry, dict)
+            ]
+            axis = next((entry for entry in values if entry.get("axis")), None)
+            measured = [entry for entry in values if not entry.get("axis")][:DETAIL_VALUES]
+
+            for entry in measured:
+                text.append(f"{entry['label']} ", style=Palette.FAINT)
+                text.append(f"{float(entry['value']):+.5g}", style=Palette.ACCENT_TEXT)
+                text.append("   ")
+            if axis is not None:
+                text.append(
+                    f"at {axis['label'].lower()} {float(axis['value']):g}", style=Palette.FAINT
+                )
+                text.append("   ")
+
+        text.append("space to collapse · p to plot", style=Palette.FAINT)
+        return text
 
     def _sweeps(self) -> Text:
         """A line per active sweep, or nothing at all when none are running.

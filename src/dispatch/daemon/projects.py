@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +52,9 @@ class ProjectHit:
             better in a list than the same thing with the user's home prefixed to it.
         score: Match quality. Higher is better; used only for ordering.
         depth: How far below the root it sits.
+        is_case: Whether a solver adapter's cheap marker recognises this directory as one
+            of its cases. A directory that is a case is something the user can actually
+            submit, so it outranks a directory that merely matched.
     """
 
     path: Path
@@ -59,6 +62,7 @@ class ProjectHit:
     relative: str
     score: int
     depth: int
+    is_case: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +107,22 @@ PATH_MATCH = 10
 Ranked far below every name match, which is what "search directory names first" means in
 practice: a directory called ``cavity`` always outranks one that merely lives inside a
 folder called ``cavity``.
+
+Ranking alone turned out not to be enough. Measured against a real projects tree, one
+query produced fifty results of which forty-seven were path-only -- every descendant of
+the single folder that matched -- so the genuine matches were correctly sorted to the top
+of a page that was otherwise useless, and the "more exist" warning fired because real
+matches had been pushed off the end. Score decides *order*; :data:`CASE_BONUS` and the tiering in
+:func:`search_projects` decide what is allowed to take up room.
+"""
+
+CASE_BONUS = 1000
+"""Added to any directory a solver adapter recognises as one of its cases.
+
+Large enough to dominate every name score, because it answers a different and more
+important question. The search exists to find something submittable; a directory called
+``cavity`` that is an actual case is a better answer than one called ``cavity`` that is a
+folder of notes, whatever their names score.
 """
 
 SEPARATORS = "-_. "
@@ -128,7 +148,11 @@ def score_name(name: str, query: str) -> int:
 
 
 def search_projects(
-    config: ProjectsConfig, query: str, *, limit: int | None = None
+    config: ProjectsConfig,
+    query: str,
+    *,
+    limit: int | None = None,
+    is_case: Callable[[Path], bool] | None = None,
 ) -> ProjectSearch:
     """Find directories under the configured root whose names match ``query``.
 
@@ -137,6 +161,13 @@ def search_projects(
         query: What to look for. Empty returns the root's immediate children, which makes
             the search box useful before anything has been typed into it.
         limit: Override the configured result count.
+        is_case: Cheap test for "this directory is a submittable case", supplied by the
+            caller so this module stays solver-agnostic -- the daemon passes
+            :meth:`~dispatch.adapters.registry.AdapterRegistry.looks_like_case`. It does
+            two things: a case outranks a mere name match, and the walk **stops** at one,
+            because a case's own time directories and ``processorN`` folders are not
+            projects and offering them is what made this search unusable. Omitted, the
+            walk behaves exactly as it did before this argument existed.
 
     Returns:
         The matches, best first, with enough context for the interface to be honest about
@@ -144,6 +175,7 @@ def search_projects(
     """
     root = config.root.expanduser()
     ceiling = limit or config.limit
+    recognise = is_case or (lambda _: False)
     try:
         resolved = root.resolve()
     except OSError as exc:
@@ -158,48 +190,74 @@ def search_projects(
             ),
         )
 
-    hits: list[ProjectHit] = []
+    named: list[ProjectHit] = []
+    case_paths: list[ProjectHit] = []
+    other_paths: list[ProjectHit] = []
     scanned = 0
     truncated = False
 
-    for directory, depth in _walk(resolved, config):
+    for directory, depth, case in _walk(resolved, config, recognise):
         scanned += 1
         if scanned > config.max_entries:
             truncated = True
             break
-        score = _score(directory, resolved, query)
-        if score:
-            hits.append(
-                ProjectHit(
-                    path=directory,
-                    name=directory.name,
-                    relative=_relative(directory, resolved),
-                    score=score,
-                    depth=depth,
-                )
-            )
+        by_name = _name_score(directory, resolved, query)
+        if by_name:
+            score = by_name + (CASE_BONUS if case else 0)
+            named.append(_hit(directory, resolved, score, depth, case))
+        elif _path_matches(directory, resolved, query):
+            bucket = case_paths if case else other_paths
+            bucket.append(_hit(directory, resolved, PATH_MATCH, depth, case))
 
-    # Best match, then shallowest, then alphabetical. Depth as the second key because a
-    # project directory is nearly always above its own sub-case directories, so the thing
-    # the user meant sorts above the things inside it.
-    hits.sort(key=lambda hit: (-hit.score, hit.depth, hit.name.lower(), str(hit.path)))
-    if len(hits) > ceiling:
-        hits, truncated = hits[:ceiling], True
+    for bucket in (named, case_paths, other_paths):
+        bucket.sort(key=_order)
+
+    # Tiered rather than one sorted list, so that path-only noise can never consume the
+    # page. A name match is what was asked for; a case inside a matching folder is a real,
+    # selectable answer; everything else is context and gets only the room left over.
+    wanted = named + case_paths
+    if len(wanted) > ceiling:
+        # Genuine matches were dropped: the user needs to know there are more.
+        wanted, truncated = wanted[:ceiling], True
+    hits = wanted + other_paths[: max(0, ceiling - len(wanted))]
 
     return ProjectSearch(
         root=resolved, query=query, hits=tuple(hits), scanned=scanned, truncated=truncated
     )
 
 
-def _score(directory: Path, root: Path, query: str) -> int:
-    """Score a directory against the query, names first and paths a distant second."""
+def _hit(directory: Path, root: Path, score: int, depth: int, is_case: bool) -> ProjectHit:
+    """Build one result."""
+    return ProjectHit(
+        path=directory,
+        name=directory.name,
+        relative=_relative(directory, root),
+        score=score,
+        depth=depth,
+        is_case=is_case,
+    )
+
+
+def _order(hit: ProjectHit) -> tuple[int, int, str, str]:
+    """Best match, then shallowest, then alphabetical.
+
+    Depth second because a project directory is nearly always above its own sub-cases, so
+    the thing the user meant sorts above the things inside it.
+    """
+    return (-hit.score, hit.depth, hit.name.lower(), str(hit.path))
+
+
+def _name_score(directory: Path, root: Path, query: str) -> int:
+    """How well a directory's own name matches, ignoring its path. Zero means it does not."""
     if not query:
         # No query: offer the top level, so the picker is not an empty box.
         return EXACT if directory.parent == root else 0
-    by_name = score_name(directory.name, query)
-    if by_name:
-        return by_name
-    return PATH_MATCH if query.lower() in _relative(directory, root).lower() else 0
+    return score_name(directory.name, query)
+
+
+def _path_matches(directory: Path, root: Path, query: str) -> bool:
+    """Whether the query appears anywhere in the path below the root but not in the name."""
+    return bool(query) and query.lower() in _relative(directory, root).lower()
 
 
 def _relative(directory: Path, root: Path) -> str:
@@ -210,12 +268,21 @@ def _relative(directory: Path, root: Path) -> str:
         return str(directory)
 
 
-def _walk(root: Path, config: ProjectsConfig) -> Iterator[tuple[Path, int]]:
-    """Yield directories below ``root``, breadth first, bounded and loop-proof.
+def _walk(
+    root: Path, config: ProjectsConfig, is_case: Callable[[Path], bool]
+) -> Iterator[tuple[Path, int, bool]]:
+    """Yield ``(directory, depth, is_case)`` below ``root``, bounded and loop-proof.
 
     Breadth first rather than depth first so that a bound cut short by ``max_entries``
     truncates the *deepest* level rather than an arbitrary branch -- the shallow
     directories, which are the ones people are usually looking for, are always visited.
+
+    **A case is yielded but not descended into.** Its time directories, ``processorN``
+    folders and ``postProcessing`` tree are part of one case rather than projects of their
+    own, and offering them is what made this search unusable on a real tree: a query that
+    should return three cases returned fifty rows, forty-seven of them the insides of one
+    of them. Pruning there also makes the walk dramatically cheaper, since a meshed case
+    holds far more directories than the project tree above it.
 
     Symlinked directories are not followed. ``a/b -> a`` is enough to make a naive walk run
     until the depth limit, and a pair of symlinks pointing at each other defeats the depth
@@ -241,8 +308,10 @@ def _walk(root: Path, config: ProjectsConfig) -> Iterator[tuple[Path, int]]:
             if marker is None or marker in visited:
                 continue
             visited.add(marker)
-            yield child, depth + 1
-            frontier.append((child, depth + 1))
+            case = is_case(child)
+            yield child, depth + 1, case
+            if not case:
+                frontier.append((child, depth + 1))
 
 
 def _children(directory: Path) -> list[Path]:

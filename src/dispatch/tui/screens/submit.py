@@ -60,6 +60,8 @@ class SubmitScreen(DispatchScreen):
         Binding("t", "edit_tags", "tags"),
         Binding("a", "run_after", "run after"),
         Binding("m", "edit_concurrency", "max at once"),
+        Binding("l", "toggle_from_latest", "from latest"),
+        Binding("i", "case_info", "info"),
         Binding("p", "edit_path", "go to path"),
         Binding("period", "toggle_hidden", "hidden"),
     ]
@@ -81,6 +83,14 @@ class SubmitScreen(DispatchScreen):
 
         self.concurrency = 1
         """How many of a sweep's jobs may run at once. Ignored unless this is a sweep."""
+
+        self.start_from_latest = False
+        """Continue each case from its own latest written output rather than its start.
+
+        Applies to a single case and to a sweep alike, which is why it lives here rather
+        than beside the sweep-only settings: "pick up where this stopped" is the same
+        request either way.
+        """
         self.show_hidden = False
         self._inspection: dict[str, Any] | None = None
         self._prompt_mode = ""
@@ -144,7 +154,11 @@ class SubmitScreen(DispatchScreen):
             return
         try:
             self._inspection = await self.dispatch_app.call(
-                Method.CASE_VALIDATE, path=str(self.path), cores=self.cores, gpus=self.gpus
+                Method.CASE_VALIDATE,
+                path=str(self.path),
+                cores=self.cores,
+                gpus=self.gpus,
+                start_from_latest=self.start_from_latest,
             )
         except Exception as exc:
             self._inspection = {"error": str(exc)}
@@ -216,6 +230,15 @@ class SubmitScreen(DispatchScreen):
             style=Palette.TEXT if self.run_after else Palette.MUTED,
         )
 
+        # Where the run begins. Shown even when it is the default, because "this started
+        # over and threw away six hours" is not something to discover afterwards.
+        _row(
+            text,
+            "start",
+            "latest written time" if self.start_from_latest else "case default",
+            style=Palette.ACCENT if self.start_from_latest else Palette.MUTED,
+        )
+
         validation = result["validation"]
         _row(
             text,
@@ -250,6 +273,8 @@ class SubmitScreen(DispatchScreen):
                     ("d", "plan"),
                     ("c", "cores"),
                     ("g", "gpus"),
+                    ("i", "info"),
+                    ("l", "from latest"),
                     ("t", "tags"),
                     ("a", "after"),
                 )
@@ -307,6 +332,14 @@ class SubmitScreen(DispatchScreen):
         )
         if self.tags:
             _row(text, "tags", " ".join(self.tags), width=SWEEP_LABEL_WIDTH)
+        _row(
+            text,
+            "start",
+            "latest written time" if self.start_from_latest else "case default",
+            note="every case continues where it stopped" if self.start_from_latest else "",
+            style=Palette.ACCENT if self.start_from_latest else Palette.MUTED,
+            width=SWEEP_LABEL_WIDTH,
+        )
 
         text.append("\n")
         for position, name in enumerate(self.sweep["cases"][:SWEEP_PREVIEW], start=1):
@@ -322,12 +355,28 @@ class SubmitScreen(DispatchScreen):
         text.append(
             _keyline(
                 ("s", "submit sweep"),
+                ("l", "from latest"),
                 ("d", "review"),
                 ("c", "cores/job"),
                 ("m", "max at once"),
             )
         )
         return text
+
+    def action_case_info(self) -> None:
+        """Describe the directory the browser is sitting in."""
+        self.dispatch_app.open_case_info(path=str(self.path))
+
+    def action_toggle_from_latest(self) -> None:
+        """Continue from the case's latest output, or start it afresh."""
+        self.start_from_latest = not self.start_from_latest
+        self.app.call_later(self._reinspect)
+
+    async def _reinspect(self) -> None:
+        """Re-validate under the new setting, so the pane reflects what will happen."""
+        await self.inspect(self._inspection.get("solver") if self._inspection else None)
+        if self.sweep is not None:
+            self.query_one("#detail-text", Static).update(self._sweep_detail())
 
     def action_edit_concurrency(self) -> None:
         """Set how many of a sweep's jobs may run at once."""
@@ -488,7 +537,11 @@ class SubmitScreen(DispatchScreen):
             return
         try:
             report = await self.dispatch_app.call(
-                Method.CASE_DRYRUN, workdir=str(self.path), cores=self.cores, gpus=self.gpus
+                Method.CASE_DRYRUN,
+                workdir=str(self.path),
+                cores=self.cores,
+                gpus=self.gpus,
+                start_from_latest=self.start_from_latest,
             )
         except Exception as exc:
             self.notify_error(str(exc))
@@ -515,6 +568,7 @@ class SubmitScreen(DispatchScreen):
         try:
             result = await self.dispatch_app.call(
                 Method.JOB_SUBMIT,
+                start_from_latest=self.start_from_latest,
                 workdir=str(self.path),
                 cores=self.cores,
                 gpus=self.gpus,
@@ -576,6 +630,7 @@ class SubmitScreen(DispatchScreen):
         try:
             result = await self.dispatch_app.call(
                 Method.SWEEP_SUBMIT,
+                start_from_latest=self.start_from_latest,
                 root=str(self.path),
                 cores_per_job=self.cores,
                 concurrency=self.concurrency,

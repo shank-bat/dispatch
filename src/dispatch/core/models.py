@@ -223,6 +223,15 @@ class JobSpec:
     sweep_position: int | None = None
     """Index within the sweep, from zero. ``None`` when the job is not part of one."""
 
+    start_from_latest: bool = False
+    """Continue the case from its own most recent output rather than its configured start.
+
+    A request, not an instruction: Dispatch never says *where* to continue from, because
+    only the case's own files know. The adapter reads that off the disk (§8.3). An adapter
+    with no notion of a saved state ignores this and starts the case normally, which is the
+    honest fallback.
+    """
+
     def __post_init__(self) -> None:
         if not self.solver:
             raise ValidationError("A job spec must name a solver")
@@ -315,6 +324,21 @@ class Job:
     opportunistic as it has always been.
     """
 
+    start_from_latest: bool = False
+    """Whether this job was asked to continue from the case's latest written output.
+
+    Sticky, unlike :attr:`resume_requested`: it describes how the job was configured rather
+    than an interruption that happened to it, so it still applies after a restart.
+    """
+
+    repartition_cores: int | None = None
+    """Cores this job should come back with after stopping at its next write (§6.13).
+
+    ``None`` -- almost always -- means no change is pending. While this is set the job is
+    still an ordinary RUNNING job holding its ordinary allocation; the change takes effect
+    when the solver finishes its current step and the job returns to the queue.
+    """
+
     sweep_position: int | None = None
     """This job's index within its sweep, from zero, in the order the cases were found.
 
@@ -362,6 +386,21 @@ class Job:
     def resource_kind(self) -> ResourceKind:
         """Which pool this job draws from."""
         return self.resources.kind
+
+    @property
+    def continues_from_saved_state(self) -> bool:
+        """Whether this run should pick up from the case's own latest output.
+
+        True for an explicit request and for a reboot resume alike: the two have different
+        meanings in the history but ask the adapter for exactly the same thing, and the
+        adapter should not have to know which one it was.
+        """
+        return self.resume_requested or self.start_from_latest
+
+    @property
+    def repartition_pending(self) -> bool:
+        """Whether a core change is waiting for this job to reach its next write."""
+        return self.repartition_cores is not None
 
     @property
     def output_path(self) -> Path | None:
@@ -466,6 +505,13 @@ class SystemSnapshot:
     load_average: tuple[float, float, float]
     uptime_s: float
 
+    cpu_mode: str = "physical"
+    """Whether :attr:`total_cores` counts physical cores or logical threads (§4.3.2).
+
+    On the snapshot rather than inferred by the client, because a number whose unit the
+    display has to guess is a number the display will eventually label wrongly.
+    """
+
     total_gpus: int = 0
     """GPUs the machine has, as the ledger counts them. Zero on most machines."""
 
@@ -476,6 +522,11 @@ class SystemSnapshot:
     def free_cores(self) -> int:
         """Cores available to new jobs: total, less reserved, less allocated."""
         return max(0, self.total_cores - self.reserved_cores - self.allocated_cores)
+
+    @property
+    def core_unit(self) -> str:
+        """``core`` or ``thread``, for labelling a count in the interface."""
+        return "thread" if self.cpu_mode == "logical" else "core"
 
     @property
     def free_gpus(self) -> int:
@@ -527,6 +578,13 @@ class SweepSpec:
     cores_per_job: int
     concurrency: int
     name: str = ""
+    start_from_latest: bool = False
+    """Continue every case in this sweep from its own latest output (§6.12).
+
+    The setting most often wanted on a sweep of long runs: re-submitting the folder picks
+    each case up where it stopped instead of discarding the hours already computed.
+    """
+
     sweep_id: str = field(default_factory=new_job_id)
     """Generated up front so member specs can name the sweep before it is inserted."""
 
@@ -570,6 +628,9 @@ class Sweep:
     """Hard cap on simultaneously running members. Free cores never override it."""
 
     created_at: float
+    start_from_latest: bool = False
+    """Whether members continue from their own latest output rather than starting afresh."""
+
     total: int = 0
     """How many cases were submitted as part of this sweep."""
 

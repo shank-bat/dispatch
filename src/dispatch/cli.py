@@ -88,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="sweep only: how many of its jobs may run at once (default 1)",
     )
+    submit.add_argument(
+        "--from-latest",
+        action="store_true",
+        help="continue each case from its own latest written output instead of its start",
+    )
     submit.add_argument("--note", help="a note to attach")
     submit.add_argument(
         "--dry-run",
@@ -135,6 +140,13 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "rm":
             command.add_argument("--purge-logs", action="store_true", help="delete its logs too")
 
+    repartition = sub.add_parser(
+        "repartition",
+        help="pause a running job at its next write and resume it on a new core count",
+    )
+    repartition.add_argument("id", help="job id, or a unique prefix of one")
+    repartition.add_argument("cores", type=int, help="cores to resume with")
+
     priority = sub.add_parser("priority", help="change a job's priority")
     priority.add_argument("id")
     priority.add_argument("priority", type=int)
@@ -162,6 +174,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the preparation transcript instead of the solver's output",
     )
     logs.add_argument("-n", "--lines", type=int, default=50, help="how many lines to show")
+
+    render = sub.add_parser(
+        "render", help="render a mesh screenshot or a flow animation with ParaView"
+    )
+    render.add_argument("path", type=Path, help="the case directory")
+    render.add_argument(
+        "-k",
+        "--kind",
+        choices=["mesh", "animation"],
+        default="mesh",
+        help="a still of the mesh, or a frame per written time step (default: mesh)",
+    )
+    render.add_argument(
+        "-c",
+        "--camera",
+        default="isometric",
+        help="front, back, left, right, top, bottom or isometric (default: isometric)",
+    )
+    render.add_argument("--field", help="field to colour by, e.g. p or U")
+    render.add_argument("--frames", type=int, metavar="N", help="cap the animation length")
+    render.add_argument("--width", type=int, default=1600)
+    render.add_argument("--height", type=int, default=1000)
+    render.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="render_dry_run",
+        help="show the command and camera that would be used, then do nothing",
+    )
+
+    case_info = sub.add_parser("case", help="describe a case directory in full")
+    case_info.add_argument("path", type=Path, help="the case directory")
 
     sub.add_parser("status", help="show the machine and the queue")
     sub.add_parser("tags", help="list tags in use")
@@ -257,6 +300,7 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
             Method.CASE_DRYRUN,
             workdir=str(path),
             cores=args.cores,
+            start_from_latest=args.from_latest,
             gpus=args.gpus or 0,
             resource=args.resource,
             ram_mb=args.ram,
@@ -273,6 +317,7 @@ async def _submit(client: DaemonClient, args: Any, console: Any, config: Config)
         Method.JOB_SUBMIT,
         workdir=str(path),
         cores=args.cores,
+        start_from_latest=args.from_latest,
         gpus=args.gpus,
         resource=args.resource,
         ram_mb=args.ram,
@@ -311,6 +356,7 @@ async def _submit_sweep(client: DaemonClient, args: Any, console: Any, path: Pat
         root=str(path),
         cores_per_job=args.cores,
         concurrency=args.concurrent,
+        start_from_latest=args.from_latest,
         gpus=args.gpus,
         resource=args.resource,
         ram_mb=args.ram,
@@ -469,6 +515,54 @@ async def _show(client: DaemonClient, args: Any, console: Any, config: Config) -
     return 0
 
 
+async def _render(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
+    """Render a case with ParaView, headlessly."""
+    path = args.path.expanduser().resolve()
+    result = await client.call(
+        Method.CASE_RENDER,
+        path=str(path),
+        kind=args.kind,
+        preset=args.camera,
+        field=args.field,
+        frames=args.frames,
+        width=args.width,
+        height=args.height,
+        dry_run=args.render_dry_run,
+    )
+    for note in result["notes"]:
+        console.print(f"  [yellow]note[/yellow] {note}")
+    console.print(f"  [bold]Tool[/bold]    {result['tool']}")
+    if not result["rendered"]:
+        console.print(f"  [bold]Command[/bold] {' '.join(result['command'])}")
+        console.print("\n  [dim]Nothing was rendered.[/dim]")
+        return 0
+    for line in result["produced"]:
+        console.print(f"  {line}")
+    for output in result["outputs"]:
+        console.print(f"  [green]wrote[/green] {output}")
+    return 0
+
+
+async def _case(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
+    """Print the full description of a case directory."""
+    report = await client.call(Method.CASE_INFO, path=str(args.path.expanduser().resolve()))
+    console.print(f"[bold]{report['title']}[/bold]  [dim]{report['solver']}[/dim]")
+    console.print(f"[dim]{report['path']}[/dim]")
+    for warning in report["warnings"]:
+        console.print(f"  [yellow]![/yellow] {warning}")
+
+    for section in report["sections"]:
+        console.print(f"\n[bold]{section['title']}[/bold]")
+        if section["missing"]:
+            console.print(f"  [dim]{section['missing']}[/dim]")
+        for item in section["fields"]:
+            value = item["value"]
+            styled = f"[cyan]{value}[/cyan]" if item["important"] else value
+            note = f"  [dim]{item['note']}[/dim]" if item["note"] else ""
+            console.print(f"  {item['label']:<20} {styled}{note}")
+    return 0
+
+
 async def _status(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
     from rich.table import Table
 
@@ -477,9 +571,10 @@ async def _status(client: DaemonClient, args: Any, console: Any, config: Config)
         Method.JOB_LIST, states=["QUEUED", "HELD", "PREPARING", "RUNNING"], limit=100
     )
 
+    unit = f"{snapshot.get('core_unit', 'core')}s"
     console.print(
         f"[bold]{snapshot['hostname']}[/bold]  "
-        f"{snapshot['free_cores']}/{snapshot['total_cores']} cores free  "
+        f"{snapshot['free_cores']}/{snapshot['total_cores']} {unit} free  "
         f"(reserved {snapshot['reserved_cores']}, allocated {snapshot['allocated_cores']})"
     )
     if snapshot.get("total_gpus"):
@@ -518,6 +613,18 @@ async def _hold(client: DaemonClient, args: Any, console: Any, config: Config) -
 async def _release(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
     job = await client.call(Method.JOB_RELEASE, id=args.id)
     console.print(f"[green]Released[/green] {job['name']}")
+    return 0
+
+
+async def _repartition(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
+    """Pause a run at its next write and bring it back on a different core count."""
+    result = await client.call(Method.JOB_REPARTITION, id=args.id, cores=args.cores)
+    job = result["job"]
+    console.print(
+        f"[yellow]Pausing[/yellow] {job['name']} at its next write; it will requeue on "
+        f"{result['cores']} core(s)"
+    )
+    console.print("  [dim]the timestep in progress is written before the solver stops[/dim]")
     return 0
 
 
@@ -832,6 +939,9 @@ _HANDLERS = {
     "hold": _hold,
     "release": _release,
     "priority": _priority,
+    "repartition": _repartition,
+    "render": _render,
+    "case": _case,
     "rm": _rm,
     "tag": _tag,
     "note": _note,

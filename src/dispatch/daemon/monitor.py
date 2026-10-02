@@ -139,6 +139,7 @@ class SystemMonitor:
             available_ram_mb=int(memory.available / (1024 * 1024)),
             load_average=self._resources.load_average(),
             uptime_s=max(0.0, self._clock.now() - self._boot),
+            cpu_mode=self._resources.cpu_mode.value,
             total_gpus=self._resources.total_gpus,
             allocated_gpus=self._resources.allocated_gpus,
         )

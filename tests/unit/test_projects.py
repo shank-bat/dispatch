@@ -206,3 +206,153 @@ def test_the_root_is_expanded(tmp_path: Path) -> None:
     """``root = "~/projects"`` in a config file has to mean the user's home."""
     config = ProjectsConfig(root=Path("~/definitely-not-a-real-directory"))
     assert "~" not in str(config.root)
+
+
+# -- regression: the search was unusable on a real tree ------------------------------------
+#
+# Reproduced against ~/projects before the fix: a query for "foam" returned 50 results of
+# which 47 were the insides of one matching case -- time directories like `0.orig` and
+# `4.5200001`, `constant`, `system` -- and the page was reported truncated because the
+# genuine matches had been pushed off the end. The cause was that the walk treated a case's
+# own subdirectories as projects, and that a path-only match competed for the same page as
+# a name match.
+
+
+def foam_case(path: Path, *, times: tuple[str, ...] = ("0", "0.orig", "4.52")) -> Path:
+    """A directory with the marker that identifies an OpenFOAM case, plus its clutter."""
+    (path / "system").mkdir(parents=True, exist_ok=True)
+    (path / "system" / "controlDict").write_text("application icoFoam;\n")
+    (path / "constant" / "polyMesh").mkdir(parents=True, exist_ok=True)
+    for name in times:
+        (path / name).mkdir(exist_ok=True)
+    for rank in range(4):
+        (path / f"processor{rank}" / "constant").mkdir(parents=True, exist_ok=True)
+    (path / "postProcessing" / "forceCoeffs" / "0").mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@pytest.fixture
+def recognise():
+    """The daemon's real stat-only case screen."""
+    from dispatch.adapters.registry import build_default_registry
+
+    return build_default_registry({}, load_plugins=False).looks_like_case
+
+
+def test_a_case_s_own_directories_are_not_offered_as_projects(tmp_path, recognise) -> None:
+    """The bug, directly: `cavity/0.orig` and `cavity/processor2` are not projects."""
+    root = tmp_path / "projects"
+    foam_case(root / "openfoam" / "cavity")
+
+    found = names(search(ProjectsConfig(root=root), "cavity", is_case=recognise))
+    assert found == ["openfoam/cavity"]
+
+
+def test_matches_are_not_crowded_out_by_one_case_s_internals(tmp_path, recognise) -> None:
+    """Three cases under a folder called `foam` must not lose the page to time directories."""
+    root = tmp_path / "projects"
+    for name in ("alpha", "beta", "gamma"):
+        foam_case(root / "foam" / name, times=tuple(f"{step}" for step in range(40)))
+
+    result = search(ProjectsConfig(root=root), "foam", is_case=recognise)
+    assert not result.truncated, "nothing genuine was dropped, so nothing should be claimed"
+    assert "foam" in names(result)
+    # The three cases are reachable because they are cases, not because of their names.
+    assert {"foam/alpha", "foam/beta", "foam/gamma"} <= set(names(result))
+    assert not any("/0" in entry or "processor" in entry for entry in names(result))
+
+
+def test_a_case_outranks_a_mere_name_match(tmp_path, recognise) -> None:
+    """The search exists to find something submittable."""
+    root = tmp_path / "projects"
+    (root / "cavity-notes").mkdir(parents=True)
+    foam_case(root / "cavity")
+
+    assert names(search(ProjectsConfig(root=root), "cavity", is_case=recognise))[0] == "cavity"
+
+
+def test_cases_inside_a_matching_folder_are_offered(tmp_path, recognise) -> None:
+    """Searching the folder name should reach the runnable cases inside it."""
+    root = tmp_path / "projects"
+    foam_case(root / "paper1" / "run-a")
+    foam_case(root / "paper1" / "run-b")
+
+    found = names(search(ProjectsConfig(root=root), "paper1", is_case=recognise))
+    assert found[0] == "paper1"
+    assert {"paper1/run-a", "paper1/run-b"} <= set(found)
+
+
+def test_path_only_noise_never_consumes_the_page(tmp_path, recognise) -> None:
+    """Genuine matches fill the limit first; context gets only what is left."""
+    root = tmp_path / "projects"
+    for index in range(6):
+        foam_case(root / "sweep" / f"case{index}")
+    # A directory that is not a case, with children that match only by path.
+    plain = root / "sweep" / "scratch"
+    for index in range(30):
+        (plain / f"junk{index}").mkdir(parents=True)
+
+    result = search(ProjectsConfig(root=root), "sweep", is_case=recognise, limit=8)
+    shown = names(result)
+    assert len(shown) == 8
+    assert sum(1 for entry in shown if "junk" in entry) <= 1, shown
+    assert sum(1 for entry in shown if entry.startswith("sweep/case")) == 6
+
+
+def test_truncation_is_reported_only_when_real_matches_are_dropped(
+    tmp_path, recognise
+) -> None:
+    root = tmp_path / "projects"
+    for index in range(10):
+        foam_case(root / f"cavity{index}")
+
+    assert search(ProjectsConfig(root=root), "cavity", is_case=recognise, limit=20).truncated is (
+        False
+    )
+    assert search(ProjectsConfig(root=root), "cavity", is_case=recognise, limit=4).truncated
+
+
+def test_nested_cases_are_found_several_levels_down(tmp_path, recognise) -> None:
+    """A real tree puts cases at `work/group/project/study/case`."""
+    root = tmp_path / "projects"
+    foam_case(root / "work" / "group" / "project" / "study" / "wing")
+
+    found = search(ProjectsConfig(root=root), "wing", is_case=recognise)
+    assert names(found) == ["work/group/project/study/wing"]
+    assert found.hits[0].is_case
+
+
+def test_spaces_and_special_characters_in_names_are_searchable(
+    tmp_path, recognise
+) -> None:
+    root = tmp_path / "projects"
+    foam_case(root / "my cases" / "wing (v2) [final]")
+
+    found = search(ProjectsConfig(root=root), "wing (v2)", is_case=recognise)
+    assert names(found) == ["my cases/wing (v2) [final]"]
+
+    assert names(search(ProjectsConfig(root=root), "my cases", is_case=recognise))[0] == (
+        "my cases"
+    )
+
+
+def test_pruning_at_cases_makes_the_walk_cheaper(tmp_path, recognise) -> None:
+    """Not an optimisation detail: it is why the search can run on every keystroke."""
+    root = tmp_path / "projects"
+    for index in range(5):
+        foam_case(root / f"case{index}", times=tuple(str(step) for step in range(30)))
+
+    without = search(ProjectsConfig(root=root), "case")
+    with_cases = search(ProjectsConfig(root=root), "case", is_case=recognise)
+    assert with_cases.scanned * 4 < without.scanned
+
+
+def test_the_case_flag_reaches_the_results(tmp_path, recognise) -> None:
+    root = tmp_path / "projects"
+    foam_case(root / "runnable")
+    (root / "folder").mkdir()
+
+    hits = {hit.relative: hit.is_case for hit in search(
+        ProjectsConfig(root=root), "", is_case=recognise
+    ).hits}
+    assert hits == {"runnable": True, "folder": False}

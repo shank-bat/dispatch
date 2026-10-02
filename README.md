@@ -46,6 +46,11 @@ dispatch submit ~/pinn --resource gpu --gpus 1      # queue GPU work
 dispatch submit ~/cases/wing --cores 20 --dry-run   # show what would happen; run nothing
 dispatch submit ~/cases/wake --cores 8 --after 3f2a  # start only once job 3f2a completes
 dispatch find cavity                      # find a project directory under ~/projects
+dispatch submit ~/sweep --sweep --from-latest      # continue every case where it stopped
+dispatch repartition <id> 24              # stop at the next write, resume on 24 cores
+dispatch case ~/cases/wing                # full description of a case
+dispatch render ~/cases/wing -c top       # mesh PNG with ParaView (headless)
+dispatch render ~/cases/wing -k animation --field p
 dispatch status                           # machine and queue, cores and GPUs
 dispatch ls                               # active jobs
 dispatch logs <id> -f                     # follow a job's output
@@ -54,7 +59,8 @@ dispatch search 'tag:paper resource:gpu cores>=16 endTime>500'
 ```
 
 In the interface: `1` dashboard, `2` queue, `3` history, `n` new job, `p` plot a job's
-numbers, `?` help. It is entirely keyboard-driven.
+numbers (`d` switches to force coefficients), `i` case information, `space` on the dashboard
+shows a job's latest CL/CD, `c` in the queue re-cores a running job, `?` help. It is entirely keyboard-driven.
 
 ## What it does
 
@@ -145,7 +151,7 @@ required no scheduler change at all. See [docs/adapters.md](docs/adapters.md).
 
 ```sh
 uv sync --all-extras
-uv run pytest              # 727 tests, ~10s
+uv run pytest              # 1007 tests, ~19s
 uv run ruff check .
 uv run mypy
 ```

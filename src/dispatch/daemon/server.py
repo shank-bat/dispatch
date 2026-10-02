@@ -16,6 +16,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -27,13 +28,15 @@ from dispatch.core.errors import DispatchError, ValidationError
 from dispatch.core.metadata import CaseMetadata
 from dispatch.core.models import JobSpec, ResourceRequest, SweepSpec
 from dispatch.core.query import parse_query
+from dispatch.core.series import PlotData
 from dispatch.core.states import JobState
+from dispatch.core.visual import VisualKind, VisualRequest
 from dispatch.daemon.dryrun import CaseInspector
 from dispatch.daemon.events import EventBus, Subscription
 from dispatch.daemon.executor import JobExecutor
 from dispatch.daemon.joblog import assign_log_paths
 from dispatch.daemon.monitor import SystemMonitor
-from dispatch.daemon.plotdata import extract_series
+from dispatch.daemon.plotdata import extract_datasets, latest_case_values
 from dispatch.daemon.projects import search_projects
 from dispatch.daemon.resources import ResourceModel
 from dispatch.daemon.scheduler import Scheduler
@@ -44,6 +47,8 @@ from dispatch.ipc.protocol import (
     Event,
     Method,
     Response,
+    encode_case_report,
+    encode_dataset,
     encode_detection,
     encode_dry_run,
     encode_event,
@@ -282,11 +287,15 @@ class IpcServer:
             Method.JOB_NOTE: self._job_note,
             Method.JOB_TAG: self._job_tag,
             Method.JOB_PROVENANCE: self._job_provenance,
+            Method.JOB_REPARTITION: self._job_repartition,
+            Method.JOB_METRICS: self._job_metrics,
             Method.JOB_SERIES: self._job_series,
             Method.TAGS_LIST: self._tags_list,
             Method.HISTORY_SEARCH: self._history_search,
             Method.CASE_DETECT: self._case_detect,
             Method.CASE_VALIDATE: self._case_validate,
+            Method.CASE_INFO: self._case_info,
+            Method.CASE_RENDER: self._case_render,
             Method.CASE_DRYRUN: self._case_dryrun,
             Method.FS_LIST: self._fs_list,
             Method.PROJECTS_SEARCH: self._projects_search,
@@ -372,11 +381,13 @@ class IpcServer:
         after = str(params.get("depends_on_job_id") or "").strip()
         depends_on_job_id = self._repo.resolve_id(after) if after else None
 
+        start_from_latest = bool(params.get("start_from_latest"))
         result = self._inspector.inspect(
             workdir,
             cores=cores,
             ram_mb=request.ram_mb,
             gpus=request.gpus,
+            start_from_latest=start_from_latest,
             solver=params.get("solver"),
             job_name=str(params.get("name") or ""),
             build_plan=False,
@@ -409,6 +420,7 @@ class IpcServer:
             note=params.get("note"),
             metadata=metadata,
             depends_on_job_id=depends_on_job_id,
+            start_from_latest=start_from_latest,
         )
 
         can, reason = self._resources.can_admit(spec.resources)
@@ -480,6 +492,46 @@ class IpcServer:
         self._bus.publish(Event.JOB_STATE, encode_job(job))
         self._scheduler.nudge()
         return {"cancelling": False, "id": job_id, "job": encode_job(job)}
+
+    async def _job_repartition(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Pause a running job at its next write and bring it back on a new core count.
+
+        The job is never taken out of the scheduler's hands: it stays RUNNING while the
+        solver finishes its step, then takes the ``RUNNING -> QUEUED`` edge and is admitted
+        again like anything else. So a repartition cannot strand an allocation, and a job
+        caught mid-resize is -- correctly -- either running or queued.
+        """
+        job_id = self._resolve(params)
+        job = self._repo.get(job_id)
+        cores = _as_int(params.get("cores"), default=0)
+
+        request = ResourceRequest.build(
+            cores=cores, gpus=job.gpus or None, resource=job.resource_kind.value
+        )
+        if request.cores > self._resources.schedulable_cores:
+            raise ValidationError(
+                f"{request.describe()} can never be scheduled on this machine "
+                f"({self._resources.schedulable_cores} schedulable), so the job would "
+                "stop and never resume."
+            )
+        if request.cores == job.cores:
+            raise ValidationError(f"{job.name} is already running on {job.cores} core(s)")
+
+        if not self._executor.is_running(job_id):
+            raise ValidationError(
+                f"{job.name} is not running, so there is nothing to pause. Change its core "
+                "count by cancelling and resubmitting it."
+            )
+
+        await self._executor.repartition(job_id, request.cores)
+        updated = self._repo.get(job_id)
+        return {
+            "job": encode_job(updated),
+            "pausing": True,
+            "cores": request.cores,
+        }
 
     def _job_hold(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
         job = self._scheduler.hold(self._resolve(params))
@@ -562,6 +614,247 @@ class IpcServer:
             "metadata": result.metadata.to_json() if result.metadata else None,
         }
 
+    async def _case_info(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """A full description of a case directory, for the information view (§9.8).
+
+        The solver-specific reading is the adapter's -- ``describe_case`` -- and two sections
+        are added here because they are Dispatch's own knowledge rather than the solver's:
+        what version control says about the directory, and what Dispatch has already run in
+        it. Neither is something an adapter should be shelling out to ``git`` to discover.
+
+        Takes a path rather than a job id, so the view works on a directory being browsed
+        before anything has been submitted, which is when it is most useful. A job id is
+        accepted too and resolves to that job's working directory.
+        """
+        raw = params.get("path") or params.get("workdir")
+        if raw:
+            workdir = Path(str(raw)).expanduser()
+        else:
+            workdir = self._repo.get(self._resolve(params)).workdir
+
+        try:
+            resolved = workdir.resolve()
+        except OSError as exc:
+            raise ValidationError(f"Cannot read {workdir}: {exc}") from exc
+        if not resolved.is_dir():
+            raise ValidationError(f"{resolved} is not a directory")
+
+        detection = self._registry.best_detection(resolved)
+        if detection is None:
+            raise ValidationError(
+                f"No solver recognises {resolved}, so there is nothing to describe. "
+                "Browse into a case directory."
+            )
+
+        adapter = self._registry.get(detection.solver)
+        ctx = self._registry.context(
+            resolved,
+            entry=detection.entry,
+            env=dict(os.environ),
+            adapter=detection.solver,
+            cpu_mode=self._resources.cpu_mode.value,
+        )
+        try:
+            report = await asyncio.to_thread(adapter.describe_case, ctx)
+        except Exception:
+            log.exception("Adapter %s failed describing %s", detection.solver, resolved)
+            raise ValidationError(
+                f"The {detection.solver} adapter could not describe this case."
+            ) from None
+
+        sections = encode_case_report(report)
+        sections["sections"].extend(
+            [
+                await self._version_control_section(resolved),
+                self._dispatch_section(resolved),
+            ]
+        )
+        sections["sections"] = [item for item in sections["sections"] if item]
+        sections["path"] = str(resolved)
+        return sections
+
+    async def _version_control_section(self, workdir: Path) -> dict[str, Any]:
+        """What git says about the case directory, reusing the provenance collector's probe.
+
+        The same code that records provenance at job start, so the information view and the
+        history cannot disagree about what the repository looked like. ``dirty`` leads,
+        because it is the field that actually matters later: a clean commit recorded against a
+        modified tree is a lie shaped like provenance.
+        """
+        git = await self._provenance_git(workdir)
+        if git is None or not git.is_present:
+            return {}
+        fields = [
+            {
+                "label": "Commit",
+                "value": (git.commit or "")[:12],
+                "note": "uncommitted changes" if git.dirty else "clean",
+                "important": git.dirty,
+            }
+        ]
+        if git.branch:
+            fields.append(
+                {"label": "Branch", "value": git.branch, "note": "", "important": False}
+            )
+        if git.remote:
+            fields.append(
+                {"label": "Remote", "value": git.remote, "note": "", "important": False}
+            )
+        return {"title": "version control", "missing": "", "fields": fields}
+
+    async def _provenance_git(self, workdir: Path) -> Any:
+        """Probe git, never fatally. A missing git is a blank section, not an error."""
+        try:
+            return await self._executor.provenance_git(workdir)
+        except Exception as exc:
+            log.debug("Could not read git state of %s: %s", workdir, exc)
+            return None
+
+    def _dispatch_section(self, workdir: Path) -> dict[str, Any]:
+        """What Dispatch has already run in this directory.
+
+        Often the most useful thing on the page: "this case ran for six hours last Tuesday
+        and failed" is not in any of the solver's own files.
+        """
+        jobs = self._repo.jobs_for_workdir(workdir)
+        if not jobs:
+            return {}
+
+        fields: list[dict[str, Any]] = [
+            {"label": "Runs", "value": str(len(jobs)), "note": "", "important": False}
+        ]
+        newest = jobs[0]
+        fields.append(
+            {
+                "label": "Latest",
+                "value": newest.state.value.lower(),
+                "note": f"{newest.id[:8]} · {newest.resources.describe()}",
+                "important": True,
+            }
+        )
+        if newest.metrics.runtime_s:
+            fields.append(
+                {
+                    "label": "Ran for",
+                    "value": _duration(newest.metrics.runtime_s),
+                    "note": "",
+                    "important": False,
+                }
+            )
+        if newest.exit_detail:
+            fields.append(
+                {
+                    "label": "Failed because",
+                    "value": newest.exit_detail.splitlines()[0],
+                    "note": "",
+                    "important": True,
+                }
+            )
+        return {"title": "dispatch history", "missing": "", "fields": fields}
+
+    async def _case_render(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Render a picture of a case, with the adapter deciding how (§8.10).
+
+        The adapter returns commands; this runs them. Same division as everything else: the
+        solver-specific half -- which renderer, where the camera goes, what the file is
+        called -- belongs to the adapter, and supervision belongs here.
+
+        Runs the command rather than handing it to the executor on purpose. A render is not a
+        simulation: it holds no allocation, has no exit code worth recording in the history,
+        and must not take a place in the queue behind a week-long run. It is bounded by the
+        step's own timeout, because a renderer that cannot find a GL context does not fail --
+        it waits.
+        """
+        raw = params.get("path") or params.get("workdir")
+        if raw:
+            workdir = Path(str(raw)).expanduser()
+        else:
+            workdir = self._repo.get(self._resolve(params)).workdir
+        try:
+            resolved = workdir.resolve()
+        except OSError as exc:
+            raise ValidationError(f"Cannot read {workdir}: {exc}") from exc
+        if not resolved.is_dir():
+            raise ValidationError(f"{resolved} is not a directory")
+
+        detection = self._registry.best_detection(resolved)
+        if detection is None:
+            raise ValidationError(f"No solver recognises {resolved}, so there is nothing to render")
+
+        request = VisualRequest(
+            kind=VisualKind(str(params.get("kind") or VisualKind.MESH.value).lower()),
+            preset=str(params.get("preset") or "isometric"),
+            field=params.get("field"),
+            frames=_as_optional_int(params.get("frames")),
+            width=_as_int(params.get("width"), default=1600),
+            height=_as_int(params.get("height"), default=1000),
+        )
+
+        preview = bool(params.get("dry_run"))
+        adapter = self._registry.get(detection.solver)
+        ctx = replace(
+            self._registry.context(
+                resolved,
+                entry=detection.entry,
+                env=dict(os.environ),
+                adapter=detection.solver,
+                cpu_mode=self._resources.cpu_mode.value,
+            ),
+            # A preview describes the render; it must not leave a generated script and a
+            # reader stub behind in a case it was only asked about.
+            dry_run=preview,
+        )
+        plan = await asyncio.to_thread(adapter.visualise, ctx, request)
+        if plan is None:
+            tool = getattr(adapter, "renderer", "") or "A renderer for this solver"
+            raise ValidationError(
+                f"{tool} was not found on this machine, so Dispatch cannot render this case."
+            )
+
+        if preview:
+            return _render_result(plan, started=False, outputs=[])
+
+        produced: list[str] = []
+        for step in plan.steps:
+            code, output = await self._run_tool(step)
+            if code != 0:
+                raise ValidationError(
+                    f"{plan.tool} failed while rendering (exit {code}). "
+                    f"{output.strip().splitlines()[-1] if output.strip() else ''}"
+                )
+            produced.extend(line for line in output.splitlines() if line.strip())
+
+        return _render_result(plan, started=True, outputs=produced)
+
+    async def _run_tool(self, step: Any) -> tuple[int, str]:
+        """Run one external tool, capturing its output and bounding its runtime.
+
+        Output is captured rather than written to a job log because this is not a job: there
+        is no job id to file it under, and the few lines a renderer prints are the result the
+        caller wants back rather than a transcript to keep.
+        """
+        process = await asyncio.create_subprocess_exec(
+            *step.argv,
+            cwd=str(step.cwd),
+            env=dict(step.env) if step.env is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=step.timeout_s)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            raise ValidationError(
+                f"The render exceeded its {step.timeout_s:.0f}s limit and was stopped."
+            ) from None
+        return process.returncode or 0, stdout.decode("utf-8", errors="replace")
+
     def _case_dryrun(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
         ram = params.get("ram_mb")
         report = self._inspector.dry_run(
@@ -570,6 +863,7 @@ class IpcServer:
             ram_mb=int(ram) if ram else None,
             gpus=_as_int(params.get("gpus"), default=0),
             resource=params.get("resource"),
+            start_from_latest=bool(params.get("start_from_latest")),
             solver=params.get("solver"),
             job_name=str(params.get("name") or ""),
         )
@@ -587,16 +881,36 @@ class IpcServer:
         exist (§3).
         """
         job = self._repo.get(self._resolve(params))
-        data = await asyncio.to_thread(
-            extract_series, job, registry=self._registry, config=self._config.plot
+        datasets = await asyncio.to_thread(
+            extract_datasets, job, registry=self._registry, config=self._config.plot
         )
+        # The log dataset is also returned flat, as it always was. A client from before
+        # datasets existed keeps working, and the handshake does not have to refuse it over
+        # a purely additive field.
+        from_log = next((item for item in datasets if item.key == "log"), None)
         return {
             "id": job.id,
             "name": job.name,
             "solver": job.solver,
             "path": str(job.output_path) if job.output_path else None,
-            **encode_plot_data(data),
+            "datasets": [encode_dataset(item) for item in datasets],
+            **encode_plot_data(from_log.data if from_log else PlotData()),
         }
+
+    async def _job_metrics(
+        self, session: ClientSession, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The latest values a case's own output files hold, for a one-line summary.
+
+        Deliberately not ``job.series`` with the last point taken: this reads only the case's
+        post-processing files and never the log, so the dashboard can ask it about a job
+        without paying to parse a gigabyte of residuals.
+        """
+        job = self._repo.get(self._resolve(params))
+        latest = await asyncio.to_thread(
+            latest_case_values, job, registry=self._registry
+        )
+        return {"id": job.id, "name": job.name, "datasets": latest}
 
     async def _projects_search(
         self, session: ClientSession, params: dict[str, Any]
@@ -610,7 +924,13 @@ class IpcServer:
         query = str(params.get("query") or "").strip()
         limit = _as_int(params.get("limit"), default=self._config.projects.limit)
         result = await asyncio.to_thread(
-            search_projects, self._config.projects, query, limit=max(1, limit)
+            search_projects,
+            self._config.projects,
+            query,
+            limit=max(1, limit),
+            # The cheap, stat-only screen -- not `detect`, which parses and would cost
+            # half a millisecond per directory on a tree of thousands.
+            is_case=self._registry.looks_like_case,
         )
 
         detect = bool(params.get("detect", True))
@@ -685,6 +1005,7 @@ class IpcServer:
             cores_per_job=request.cores,
             concurrency=concurrency,
             name=str(params.get("name") or ""),
+            start_from_latest=bool(params.get("start_from_latest")),
         )
 
         members: list[JobSpec] = []
@@ -696,6 +1017,7 @@ class IpcServer:
                 gpus=request.gpus,
                 solver=detection.solver,
                 build_plan=False,
+                start_from_latest=spec.start_from_latest,
             )
             metadata = result.metadata or CaseMetadata.empty(detection.solver)
             if result.detection is not None and result.detection.entry is not None:
@@ -718,6 +1040,7 @@ class IpcServer:
                     metadata=metadata,
                     sweep_id=spec.sweep_id,
                     sweep_position=position,
+                    start_from_latest=spec.start_from_latest,
                 )
             )
 
@@ -832,6 +1155,39 @@ class IpcServer:
         if not raw:
             raise ValidationError("A job id is required")
         return self._repo.resolve_id(raw)
+
+
+def _render_result(plan: Any, *, started: bool, outputs: Sequence[str]) -> dict[str, Any]:
+    """Render result, including what the plan *would* produce for a dry run."""
+    return {
+        "tool": plan.tool,
+        "rendered": started,
+        "notes": list(plan.notes),
+        "outputs": [str(path) for path in plan.outputs],
+        "produced": list(outputs),
+        "command": list(plan.steps[0].argv) if plan.steps else [],
+    }
+
+
+def _duration(seconds: float | None) -> str:
+    """Render a runtime compactly: ``3d 4h``, ``2h 14m``, ``45s``.
+
+    A copy of the CLI's, deliberately: the daemon may not import the CLI, and three lines of
+    arithmetic is a far smaller price than a shared module that exists only to hold it.
+    """
+    if not seconds or seconds < 0:
+        return "-"
+    total = int(seconds)
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def _as_int(value: Any, *, default: int = 0) -> int:

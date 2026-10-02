@@ -14,12 +14,21 @@ The case is left exactly as the solver left it.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import ClassVar
 
-from dispatch.adapters import foamdict, foamlog, gpuenv, mpi
+from dispatch.adapters import (
+    foamcoeffs,
+    foamdict,
+    foamlog,
+    foammesh,
+    gpuenv,
+    mpi,
+    paraview,
+)
 from dispatch.adapters.base import (
     BaseAdapter,
     CaseContext,
@@ -27,6 +36,10 @@ from dispatch.adapters.base import (
     generic_failure_summary,
 )
 from dispatch.adapters.shellenv import capture, find_first
+from dispatch.core.caseinfo import CaseReport
+from dispatch.core.caseinfo import ReportBuilder as InfoBuilder
+from dispatch.core.errors import ValidationError
+from dispatch.core.geometry import CaseGeometry
 from dispatch.core.metadata import (
     CaseMetadata,
     FieldType,
@@ -36,8 +49,9 @@ from dispatch.core.metadata import (
 )
 from dispatch.core.models import Detection
 from dispatch.core.plan import CommandStep, ExecutionPlan, FailureAction, StepKind
-from dispatch.core.series import PlotData
+from dispatch.core.series import Dataset, PlotData
 from dispatch.core.validation import ReportBuilder, ValidationReport
+from dispatch.core.visual import VisualKind, VisualPlan, VisualRequest
 
 __all__ = ["OpenFOAMAdapter"]
 
@@ -84,6 +98,10 @@ class OpenFOAMAdapter(BaseAdapter):
     ``log.foam`` rather than ``log.interFoam``: the application can change between runs of
     the same case, and a name that moves is a name nobody can tail from memory.
     """
+
+    case_markers: ClassVar[Sequence[str]] = ("system/controlDict",)
+    renderer: ClassVar[str] = "ParaView (pvbatch)"
+    """One stat. The same file :meth:`detect` then parses for the application."""
 
     metadata_spec: ClassVar[MetadataSpec] = MetadataSpec(
         ref=SpecRef(adapter="openfoam", version=1),
@@ -348,20 +366,27 @@ class OpenFOAMAdapter(BaseAdapter):
         =========================  ==============================================
         """
         case = ctx.workdir
-        # Heal a case whose cancellation never got to run its finalize -- a daemon killed
-        # between the two would otherwise leave `stopAt writeNow` in place forever, and
-        # every run from then on would stop at its first time step.
-        _restore_stop_at(case)
-        _restore_start_from(case)
+        if not ctx.dry_run:
+            # Heal a case whose cancellation never got to run its finalize -- a daemon
+            # killed between the two would otherwise leave `stopAt writeNow` in place
+            # forever, and every run from then on would stop at its first time step.
+            _restore_stop_at(case)
+            _restore_start_from(case)
 
-        if ctx.resume:
-            # Restarting after the machine went down under this run. OpenFOAM's own restart
-            # mechanism is `startFrom latestTime`, which makes the solver pick up the
-            # highest time it finds written in the case -- so the restart point comes from
-            # the case's files, not from anything Dispatch believes about it. The previous
-            # value is parked first and put back by `finalize`, exactly as the graceful-stop
-            # edit is: it steers this run only, and a `startFrom` left behind would silently
-            # change where every later run of the case begins.
+        latest = latest_written_time(case) if ctx.resume else None
+
+        if ctx.resume and not ctx.dry_run:
+            # Continuing rather than starting: either the machine went down under this run
+            # (§6.7) or the case was explicitly asked to pick up where it stopped (§6.12).
+            # OpenFOAM's own mechanism for both is `startFrom latestTime`, which makes the
+            # solver read the highest time written in the case -- so the restart point comes
+            # from the case's files, not from anything Dispatch believes about it. The
+            # previous value is parked first and put back by `finalize`, exactly as the
+            # graceful-stop edit is: it steers this run only, and a `startFrom` left behind
+            # would silently change where every later run of the case begins.
+            #
+            # Skipped under `dry_run` precisely *because* `finalize` undoes it: a preview
+            # never reaches `finalize`, so the edit would outlive the preview.
             _request_latest_time(case)
 
         env = gpuenv.apply_gpu_visibility(dict(ctx.env), ctx)
@@ -378,7 +403,7 @@ class OpenFOAMAdapter(BaseAdapter):
                 CommandStep(
                     argv=[application],
                     cwd=case,
-                    description=f"Running {application}",
+                    description=f"Running {application}{_from_clause(ctx, latest)}",
                     kind=StepKind.SOLVE,
                     env=env,
                 )
@@ -398,7 +423,8 @@ class OpenFOAMAdapter(BaseAdapter):
             )
 
         if existing != wanted:
-            self._ensure_decompose_dict(ctx, wanted)
+            if not ctx.dry_run:
+                self._ensure_decompose_dict(ctx, wanted)
             steps.append(
                 CommandStep(
                     argv=["decomposePar", "-force"],
@@ -413,7 +439,11 @@ class OpenFOAMAdapter(BaseAdapter):
             CommandStep(
                 argv=mpi.launch_argv(wanted, application, "-parallel"),
                 cwd=case,
-                description=f"Running {application} on {wanted} cores",
+                description=(
+                    f"Running {application} on "
+                    f"{wanted} {'thread' if ctx.counts_threads else 'core'}"
+                    f"{'' if wanted == 1 else 's'}{_from_clause(ctx, latest)}"
+                ),
                 kind=StepKind.SOLVE,
                 env=env,
             )
@@ -506,6 +536,338 @@ class OpenFOAMAdapter(BaseAdapter):
         with no adapter, no context, and no case directory in sight.
         """
         return foamlog.parse_foam_log(text)
+
+    def case_datasets(self, ctx: CaseContext) -> Sequence[Dataset]:
+        """Force coefficients, when the case has a ``forceCoeffs`` function object.
+
+        Read from ``postProcessing/`` rather than the log, which is why it is a dataset of
+        its own: the function object writes on its own schedule, so its rows do not line up
+        with the solver's time steps and must not be paired with them by position.
+
+        Finding the file is the substance -- see :mod:`~dispatch.adapters.foamcoeffs`. The
+        path is searched and ranked by modification time, because the directory is named by
+        the user, the time directory is named by the restart, and the filename changed
+        spelling in v2012.
+        """
+        found = foamcoeffs.find_coefficient_file(ctx.workdir)
+        if found is None:
+            return ()
+        text, truncated = _read_tail(found, foamcoeffs.MAX_BYTES)
+        data = foamcoeffs.parse_coefficients(text, truncated=truncated)
+        if not data:
+            return ()
+        return (
+            Dataset(
+                key="forceCoeffs",
+                label="Force coefficients",
+                data=data,
+                source=str(found),
+            ),
+        )
+
+    def geometry(self, ctx: CaseContext) -> CaseGeometry:
+        """Whether the case is planar, and how big it is.
+
+        Both read from the case's own files -- see :mod:`~dispatch.adapters.foammesh`. The
+        planarity is exact rather than inferred: OpenFOAM has no 2-D meshes, so a planar case
+        declares itself by giving its front and back faces the ``empty`` patch type, which is
+        how the user tells the solver to skip that direction.
+        """
+        return foammesh.read_geometry(ctx.workdir)
+
+    def describe_case(self, ctx: CaseContext) -> CaseReport:
+        """Everything worth reading about the case, grouped for a human (§9.8).
+
+        Reads only headers and small dictionaries, so it is cheap enough for a keypress on a
+        directory being browsed. Every section tolerates its source being absent, because the
+        most common reason to open this page is that something about the case is incomplete.
+        """
+        case = ctx.workdir
+        control = case / "system" / "controlDict"
+        settings = foamdict.parse_file(control)
+        builder = InfoBuilder(case.name or str(case), self.name)
+
+        # -- solver -------------------------------------------------------------------
+        builder.section("solver")
+        application = settings.get("application")
+        builder.field(
+            "Application",
+            application if isinstance(application, str) else None,
+            important=True,
+        )
+        builder.field("Case", str(case))
+        if not control.is_file():
+            builder.warn("system/controlDict is missing: this is not a runnable case yet")
+
+        # -- time ---------------------------------------------------------------------
+        builder.section("time")
+        builder.field("Start from", settings.get("startFrom"))
+        builder.field("Start time", _fmt(_as_float(settings.get("startTime"))), note="s")
+        builder.field(
+            "End time", _fmt(_as_float(settings.get("endTime"))), note="s", important=True
+        )
+        builder.field("Time step", _fmt(_as_float(settings.get("deltaT"))), note="s")
+        builder.field("Stop at", settings.get("stopAt"))
+        latest = latest_written_time(case)
+        builder.field(
+            "Latest written",
+            _fmt(latest),
+            note="continue from here" if latest is not None else "",
+            important=latest is not None,
+        )
+        if latest is None:
+            builder.field("Latest written", "nothing beyond the initial condition")
+
+        adjustable = settings.get("adjustTimeStep")
+        builder.field("Adjustable step", adjustable)
+        builder.field("Max Courant", _fmt(_as_float(settings.get("maxCo"))))
+
+        # -- output -------------------------------------------------------------------
+        builder.section("output")
+        builder.field("Write control", settings.get("writeControl"))
+        builder.field("Write interval", _fmt(_as_float(settings.get("writeInterval"))))
+        builder.field("Purge write", settings.get("purgeWrite"))
+        builder.field("Format", settings.get("writeFormat"))
+        times = _written_times(case)
+        if times:
+            builder.field(
+                "Times written",
+                len(times),
+                note=f"{_fmt(times[0])} … {_fmt(times[-1])}" if len(times) > 1 else "",
+            )
+
+        # -- mesh ---------------------------------------------------------------------
+        counts = foammesh.mesh_counts(case)
+        builder.section(
+            "mesh", missing="" if counts else "no mesh has been generated yet"
+        )
+        builder.field("Cells", _thousands(counts.cells), important=True)
+        builder.field("Points", _thousands(counts.points))
+        builder.field("Faces", _thousands(counts.faces))
+        builder.field("Internal faces", _thousands(counts.internal_faces))
+
+        shape = self.geometry(ctx)
+        builder.field(
+            "Dimensionality",
+            "2D (planar)" if shape.is_planar else "3D",
+            note=shape.source or "",
+        )
+        if shape.bounds is not None:
+            size = shape.bounds.size
+            builder.field(
+                "Extent",
+                " x ".join(_fmt(value) or "?" for value in size),
+                note="m, from blockMeshDict",
+            )
+
+        # -- patches ------------------------------------------------------------------
+        patches = foammesh.boundary_patches(case)
+        builder.section(
+            "boundary patches", missing="" if patches else "no boundary file to read"
+        )
+        for patch in patches:
+            faces = patch.get("faces")
+            builder.field(
+                str(patch["name"]),
+                str(patch["type"]),
+                note=f"{_thousands(int(faces))} faces" if isinstance(faces, int) else "",
+            )
+
+        # -- fields -------------------------------------------------------------------
+        fields = _initial_fields(case)
+        builder.section(
+            "fields", missing="" if fields else "no time directory with fields to read"
+        )
+        if fields:
+            names, directory = fields
+            builder.field("Present", ", ".join(names), note=f"in {directory}/")
+            for name in names:
+                # The dimension vector, which is the field's units and the thing that makes
+                # `p` either a pressure or a kinematic pressure.
+                dimensions = _field_dimensions(case / directory / name)
+                builder.field(name, dimensions, note="dimensions" if dimensions else "")
+
+        # -- parallel -----------------------------------------------------------------
+        decomposed = count_processor_dirs(case)
+        decompose_dict = case / "system" / "decomposeParDict"
+        builder.section("parallel")
+        builder.field(
+            "Decomposed into",
+            f"{decomposed} subdomains" if decomposed else "not decomposed",
+            important=bool(decomposed),
+        )
+        if decompose_dict.is_file():
+            declared = foamdict.read_int(decompose_dict, "numberOfSubdomains")
+            builder.field("decomposeParDict", f"{declared} subdomains" if declared else "present")
+            builder.field("Method", foamdict.read_value(decompose_dict, "method"))
+            if declared and decomposed and declared != decomposed:
+                builder.warn(
+                    f"the case is decomposed into {decomposed} but decomposeParDict asks "
+                    f"for {declared}; submitting will re-decompose it"
+                )
+
+        # -- post-processing ----------------------------------------------------------
+        found = foamcoeffs.find_coefficient_file(case)
+        builder.section("post-processing")
+        if found is not None:
+            text, truncated = _read_tail(found, foamcoeffs.MAX_BYTES)
+            data = foamcoeffs.parse_coefficients(text, truncated=truncated)
+            latest_values = foamcoeffs.latest_coefficients(data)
+            builder.field(
+                "Force coefficients",
+                f"{data.samples} writes",
+                note=str(found.relative_to(case)),
+            )
+            for label, keys in (
+                ("Cl (lift)", foamcoeffs.LIFT_KEYS),
+                ("Cd (drag)", foamcoeffs.DRAG_KEYS),
+            ):
+                builder.field(
+                    label, _fmt(foamcoeffs.pick(latest_values, keys)), important=True
+                )
+        functions = settings.get("functions")
+        if isinstance(functions, dict) and functions:
+            builder.field("Function objects", ", ".join(sorted(functions)))
+
+        # -- setup warnings -----------------------------------------------------------
+        if (case / "0.orig").is_dir() and not (case / "0").is_dir():
+            builder.warn("there is a 0.orig/ but no 0/: the case has not been set up yet")
+
+        return builder.build()
+
+    def visualise(self, ctx: CaseContext, request: VisualRequest) -> VisualPlan | None:
+        """Render the case with ParaView, headlessly (§8.10).
+
+        Returns ``None`` when ParaView is not installed, so the caller can say exactly that
+        rather than reporting a command that failed. Dispatch runs on machines reached over
+        SSH, and the GUI binary is deliberately never used -- see
+        :mod:`~dispatch.adapters.paraview`.
+
+        The camera is derived from the case's own bounding box, and a planar case is never
+        rendered edge-on: for a 2-D OpenFOAM mesh -- a 3-D mesh one cell thick -- four of the
+        seven angles would correctly produce a picture of a line, so they are substituted and
+        the substitution is reported in the plan's notes.
+
+        Writes two things into the case: the generated script, and a ``.foam`` stub if none
+        exists. The stub is unavoidable -- it is how ParaView's reader is pointed at an
+        OpenFOAM case -- and both land under ``postProcessing/dispatch/`` or are reused if
+        already present, so nothing of the simulation is touched.
+        """
+        binary = paraview.find_paraview(ctx.env)
+        if binary is None:
+            return None
+
+        try:
+            preset = paraview.CameraPreset(request.preset.strip().lower())
+        except ValueError as exc:
+            valid = ", ".join(paraview.presets())
+            raise ValidationError(
+                f"Unknown camera preset {request.preset!r}. Valid presets: {valid}"
+            ) from exc
+
+        case = ctx.workdir
+        output = case / paraview.OUTPUT_DIR
+        shape = self.geometry(ctx)
+        # Resolved before the camera, because the angle has to be honoured -- and a
+        # substitution reported -- whether or not the bounds happen to be readable.
+        angle_preset, substituted = paraview.resolve_preset(preset, shape)
+        camera = paraview.camera_for(
+            shape.bounds if shape else None, preset, geometry=shape
+        )
+
+        decomposed = count_processor_dirs(case) > 0
+        # Always names the angle, including when the bounds were unknown and ParaView framed
+        # the mesh itself: a predictable filename is one that does not depend on whether a
+        # blockMeshDict happened to be readable.
+        name = f"{request.kind.value}-{angle_preset.value}"
+        spec = paraview.RenderRequest(
+            reader=self._reader_stub(case, write=not ctx.dry_run),
+            output=output,
+            name=name,
+            preset=angle_preset,
+            size=(request.width, request.height),
+            field=request.field,
+            decomposed=decomposed,
+            frames=request.frames,
+            planar=bool(shape and shape.is_planar),
+        )
+        body = (
+            paraview.animation_script(spec, camera)
+            if request.kind is VisualKind.ANIMATION
+            else paraview.screenshot_script(spec, camera)
+        )
+
+        script = output / f"{name}.py"
+        if not ctx.dry_run:
+            output.mkdir(parents=True, exist_ok=True)
+            script.write_text(body, encoding="utf-8")
+
+        notes: list[str] = []
+        if substituted:
+            notes.append(
+                f"this case is 2D, so {preset.value} would have looked edge-on at it; "
+                f"rendering from {angle_preset.value} instead"
+            )
+        if camera is None and shape is not None and shape.is_planar:
+            notes.append(
+                "this case is 2D but its extent could not be read, so the camera will be "
+                "aimed along the plane's normal from the mesh ParaView opens"
+            )
+        elif camera is None:
+            notes.append(
+                "the mesh bounds could not be read from the case, so ParaView will frame it"
+            )
+        if decomposed:
+            notes.append("reading the decomposed case from its processor directories")
+
+        outputs: list[Path] = [output / f"{name}.png"]
+        if request.kind is VisualKind.ANIMATION:
+            outputs = [output]
+
+        return VisualPlan(
+            steps=(
+                CommandStep(
+                    argv=paraview.render_argv(binary, script),
+                    cwd=case,
+                    description=(
+                        f"Rendering {request.kind.value} of {case.name} "
+                        f"from {angle_preset.value}"
+                    ),
+                    kind=StepKind.SOLVE,
+                    env=dict(ctx.env),
+                    timeout_s=paraview.RENDER_TIMEOUT_S,
+                ),
+            ),
+            outputs=tuple(outputs),
+            tool=binary,
+            notes=tuple(notes),
+        )
+
+    def _reader_stub(self, case: Path, *, write: bool) -> Path:
+        """The ``.foam`` file ParaView's reader opens, creating one if the case has none.
+
+        An empty file whose *directory* is the case; that is the whole convention. An existing
+        one is reused, so a user who already keeps ``case.foam`` in their case keeps it.
+
+        **Dispatch's own log is excluded explicitly.** The working-directory log is called
+        ``log.foam`` (§6.4), which matches ``*.foam``; handing it to ParaView would open a
+        text file as a case and fail in a way nobody would connect to the log convention.
+        """
+        existing = sorted(
+            path
+            for path in _safe_iterdir(case)
+            if path.is_file() and path.suffix == ".foam" and not path.name.startswith("log.")
+        )
+        if existing:
+            return existing[0]
+
+        stub = case / f"{case.name or 'case'}.foam"
+        if write and not stub.exists():
+            try:
+                stub.touch()
+            except OSError as exc:  # pragma: no cover - unwritable case directory
+                log.warning("Could not create the ParaView reader stub %s: %s", stub, exc)
+        return stub
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
         """Ask the solver to write and stop at the end of the current step.
@@ -601,6 +963,140 @@ class OpenFOAMAdapter(BaseAdapter):
     def _application(self, ctx: CaseContext) -> str | None:
         """The solver named in ``controlDict``."""
         return foamdict.read_value(ctx.workdir / "system" / "controlDict", "application")
+
+
+def _written_times(case: Path) -> list[float]:
+    """Every time this case has written, in order, excluding the initial condition.
+
+    Looks in ``processor0`` first for the same reason the resume point does: a parallel run
+    writes its times there, and a parallel run is the one worth asking about.
+    """
+    for root in (case / "processor0", case):
+        found: list[float] = []
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            try:
+                value = float(child.name)
+            except ValueError:
+                continue
+            if value > 0:
+                found.append(value)
+        if found:
+            return sorted(found)
+    return []
+
+
+def _initial_fields(case: Path) -> tuple[list[str], str] | None:
+    """Field names in the earliest time directory, and which directory that was.
+
+    The earliest rather than the latest, because the question this answers is "what does
+    this case solve for", and the initial condition is where the full set is declared.
+    """
+    candidates: list[tuple[float, Path]] = []
+    for child in _safe_iterdir(case):
+        if not child.is_dir():
+            continue
+        try:
+            candidates.append((float(child.name), child))
+        except ValueError:
+            continue
+    if not candidates:
+        return None
+    _, directory = min(candidates, key=lambda item: item[0])
+    names = sorted(
+        entry.name
+        for entry in _safe_iterdir(directory)
+        if entry.is_file() and not entry.name.startswith(".")
+    )
+    return (names, directory.name) if names else None
+
+
+FIELD_HEADER_BYTES = 2048
+"""Enough for a FoamFile header and the ``dimensions`` line that follows it."""
+
+_DIMENSIONS = re.compile(r"\bdimensions\s+(\[[^\]]*\])\s*;")
+
+
+def _field_dimensions(path: Path) -> str | None:
+    """A field's dimension vector, e.g. ``[0 2 -2 0 0 0 0]``.
+
+    Read from the top of the file only. These are the field's units, and they are what
+    distinguish a pressure from a kinematic pressure -- a distinction that has cost people
+    whole studies.
+    """
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(FIELD_HEADER_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _DIMENSIONS.search(head)
+    return match.group(1) if match else None
+
+
+def _safe_iterdir(path: Path) -> list[Path]:
+    try:
+        return list(path.iterdir())
+    except OSError:
+        return []
+
+
+def _fmt(value: float | None) -> str | None:
+    """Render a number the way a solver's own output would: ``%g``.
+
+    A case's time step is as likely to be ``1e-05`` as ``0.01``, and neither a fixed number
+    of decimals nor ``str`` renders both readably.
+    """
+    return None if value is None else f"{value:g}"
+
+
+def _thousands(value: int | None) -> str | None:
+    """Group a count, because ``6908400`` and ``6,908,400`` are not equally readable."""
+    return None if value is None else f"{value:,}"
+
+
+def _read_tail(path: Path, limit: int) -> tuple[str, bool]:
+    """Read up to ``limit`` bytes from the end of a file, with whether it was truncated.
+
+    From the end, for the same reason the log reader is: when only part of a long history
+    can be read, the recent part is the one worth having. The first partial line after a
+    mid-file seek is dropped, since a half row parsed as a whole one puts a column's value
+    under a different column's name.
+    """
+    try:
+        size = path.stat().st_size
+        truncated = size > limit
+        with path.open("rb") as handle:
+            if truncated:
+                handle.seek(-limit, os.SEEK_END)
+                handle.readline()
+            data = handle.read()
+    except OSError as exc:
+        log.debug("Cannot read %s: %s", path, exc)
+        return "", False
+    return data.decode("utf-8", errors="replace"), truncated
+
+
+def _from_clause(ctx: CaseContext, latest: float | None) -> str:
+    """The " from ..." tail of a SOLVE description, when the run is not starting afresh.
+
+    Part of the step description rather than a separate report field so that every surface
+    which shows a plan -- the dry run, the TUI's plan view, the step transcript -- says the
+    same thing without any of them having to know what ``startFrom`` is.
+
+    A case asked to continue that has written nothing says so plainly. ``startFrom
+    latestTime`` on such a case is not an error: OpenFOAM finds only the initial condition
+    and starts there, which is the right behaviour and worth stating rather than implying.
+    """
+    if not ctx.resume:
+        return ""
+    if latest is None:
+        return " from the beginning (no saved time to continue from)"
+    return f" continuing from t = {latest:g}"
 
 
 def _normalise_banner(line: str) -> str:

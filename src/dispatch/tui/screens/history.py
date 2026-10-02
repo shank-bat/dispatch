@@ -38,6 +38,7 @@ class HistoryScreen(DispatchScreen):
         Binding("slash", "focus_search", "search"),
         Binding("enter", "open", "logs"),
         Binding("p", "plot", "plot"),
+        Binding("i", "case_info", "info"),
         Binding("t", "edit_tags", "tags"),
         Binding("n", "add_note", "note"),
         Binding("delete,d", "delete", "delete"),
@@ -158,6 +159,12 @@ class HistoryScreen(DispatchScreen):
         job = self._selected()
         if job is not None:
             self.dispatch_app.open_logs(job["id"])
+
+    def action_case_info(self) -> None:
+        """Describe the selected job's case."""
+        job = self._selected()
+        if job is not None:
+            self.dispatch_app.open_case_info(job_id=job["id"])
 
     def action_plot(self) -> None:
         """Plot a finished run's residuals, months after it finished."""

@@ -117,7 +117,17 @@ class FakeAdapter(BaseAdapter):
         return None
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
-        return (ctx.workdir / "graceful").exists()
+        """Signal the fake solver through the case, as a real clean stop does.
+
+        OpenFOAM's is ``stopAt writeNow`` in ``controlDict``: the adapter writes into the
+        case and the *solver* decides when to act on it, at the end of a step it has
+        finished. Touching a sentinel the script watches for is the same shape, which is
+        what lets the repartition tests exercise a genuinely clean exit rather than a kill.
+        """
+        if not (ctx.workdir / "graceful").exists():
+            return False
+        (ctx.workdir / "stop").touch()
+        return True
 
     def finalize(self, ctx: CaseContext) -> None:
         """Leave a mark, so tests can assert the executor really does call this.
@@ -127,6 +137,10 @@ class FakeAdapter(BaseAdapter):
         """
         marker = ctx.workdir / "finalized"
         marker.write_text(str(int(marker.read_text() or 0) + 1) if marker.exists() else "1")
+        # The edit `stop_gracefully` made, undone -- which is the whole contract. Left in
+        # place it would make every later run of this case exit immediately, which is
+        # exactly the failure §8.1 describes for a real `stopAt writeNow`.
+        (ctx.workdir / "stop").unlink(missing_ok=True)
 
 
 def make_case(

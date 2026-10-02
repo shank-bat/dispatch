@@ -114,6 +114,13 @@ class ResourceModel:
         self._log_dir = log_dir
         self.total_cores = config.resolve_total_cores()
         self.reserved_cores = min(config.reserved_cores, max(0, self.total_cores - 1))
+        self.cpu_mode = config.resolved_cpu_mode
+        """What this ledger's core counts mean -- physical cores or logical threads.
+
+        Carried on the ledger rather than re-read from config at each call site, so the
+        number and its unit cannot come from two different places and disagree.
+        """
+
         self.total_gpus = config.resolve_total_gpus()
         """GPUs available to jobs. Nothing is held back: see :meth:`schedulable_gpus`."""
 
@@ -130,6 +137,10 @@ class ResourceModel:
     def allocated_ram_mb(self) -> int:
         """Sum of RAM estimates for jobs that declared one."""
         return sum(request.ram_mb or 0 for request in self._allocations.values())
+
+    def describe_cores(self, count: int) -> str:
+        """``20 cores`` or ``20 threads``, matching whatever this ledger counts."""
+        return self._config.describe_cores(count)
 
     @property
     def allocated_gpus(self) -> int:

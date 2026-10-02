@@ -30,9 +30,10 @@ from dispatch.adapters.base import (
 from dispatch.adapters.registry import AdapterRegistry
 from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.config import Config
-from dispatch.core.errors import AdapterError, DispatchError
+from dispatch.core.errors import AdapterError, DispatchError, ValidationError
 from dispatch.core.models import Job
 from dispatch.core.plan import CommandStep, ExecutionPlan, StepOutcome
+from dispatch.core.provenance import GitInfo
 from dispatch.core.states import ExitReason, JobState
 from dispatch.daemon.events import EventBus
 from dispatch.daemon.joblog import choose_log_path, rotate
@@ -74,6 +75,14 @@ class RunningJob:
     context: CaseContext | None = None
     cancelling: bool = False
     force_kill: bool = False
+    repartitioning: bool = False
+    """Whether this job's stop was requested in order to resize it rather than end it.
+
+    Separate from :attr:`cancelling` because the two want opposite outcomes from the same
+    clean stop: a cancellation ends the job, a repartition returns it to the queue. The
+    database holds the authoritative request (it has to survive a daemon restart); this is
+    only the in-flight hint that ``_conclude`` should go and look.
+    """
     log_files: list[IO[bytes]] = field(default_factory=list)
 
     def close_logs(self) -> None:
@@ -379,6 +388,12 @@ class JobExecutor:
         """Classify how a solver ended and record it."""
         exit_code, signal_name = describe_exit(code)
 
+        # A resize asked the solver to stop at a write and come back larger or smaller. The
+        # database holds the request, not this entry, because the daemon may have restarted
+        # between the request and the solver noticing it.
+        if not entry.cancelling and await self._requeue_for_repartition(job_id, code):
+            return
+
         if entry.cancelling:
             state, reason = JobState.CANCELLED, ExitReason.CANCELLED
         elif timed_out:
@@ -405,6 +420,48 @@ class JobExecutor:
             signal_name=signal_name,
             detail_text=detail_text,
         )
+
+    async def _requeue_for_repartition(self, job_id: str, code: int | None) -> bool:
+        """Return a cleanly stopped job to the queue on its new core count.
+
+        Only on a clean exit. A solver that crashed or was killed while stopping has not
+        necessarily finished writing its timestep, so resuming from "the latest time" could
+        resume from a half-written one -- the exact corruption the clean stop exists to
+        avoid. Such a job keeps the ordinary failure outcome, with its pending request
+        cleared and said out loud, because silently treating a failure as a pause would
+        leave a job queued to repeat a crash.
+
+        Returns:
+            Whether the job was requeued, in which case the caller must not also finish it.
+        """
+        job = self._repo.get_optional(job_id)
+        if job is None or job.repartition_cores is None:
+            return False
+
+        cores = job.repartition_cores
+        if code != 0:
+            self._repo.cancel_repartition(job_id)
+            self._event(
+                job_id,
+                "warn",
+                f"the run did not stop cleanly (exit {code}), so it was not resized to "
+                f"{cores} core(s)",
+            )
+            return False
+
+        try:
+            self._repo.requeue_for_repartition(
+                job_id,
+                cores=cores,
+                detail=f"stopped at a write; requeued on {cores} core(s)",
+            )
+        except DispatchError as exc:
+            log.warning("Could not requeue job %s for a resize: %s", job_id, exc)
+            return False
+
+        self._publish(job_id)
+        log.info("Job %s stopped cleanly and was requeued on %d core(s)", job_id[:8], cores)
+        return True
 
     def _failure_sources(self, job_id: str) -> list[Path]:
         """Which files to read when explaining why a job failed.
@@ -540,6 +597,65 @@ class JobExecutor:
             entry.task.cancel()
         return True
 
+    async def repartition(self, job_id: str, cores: int) -> bool:
+        """Ask a running job to finish its next write, then come back on ``cores`` cores.
+
+        The sequence is deliberately the one Dispatch already had, not a new one:
+
+        1. The request is recorded first, so it survives a daemon restart between now and
+           the solver noticing (:meth:`~dispatch.db.repository.JobRepository.request_repartition`).
+        2. The adapter's own clean stop is used -- for a CFD solver that means "write the
+           current state and exit", which is what makes the restart point a complete
+           timestep rather than a half-written one.
+        3. The solver exits 0. :meth:`_conclude` sees the pending request and returns the
+           job to the queue on the new count instead of marking it complete.
+        4. The scheduler admits it again when the new count is free, and the adapter plans
+           the re-decomposition and the continue-from-latest exactly as it does for any
+           other restart.
+
+        An adapter with no clean stop of its own is refused rather than signalled: killing
+        a solver mid-timestep to change its core count would corrupt the write this whole
+        feature exists to preserve.
+
+        Returns:
+            ``True`` if the job was running and has been asked to stop for a resize.
+        """
+        entry = self._running.get(job_id)
+        if entry is None:
+            return False
+        if entry.cancelling:
+            # Already on its way out. Resizing something that is being cancelled would
+            # requeue a job the user asked to stop.
+            raise ValidationError("This job is already stopping; it cannot be repartitioned")
+
+        self._repo.request_repartition(job_id, cores)
+
+        stopped = False
+        if entry.adapter is not None and entry.context is not None:
+            try:
+                stopped = await asyncio.to_thread(entry.adapter.stop_gracefully, entry.context)
+            except Exception as exc:
+                log.warning("Clean stop failed for job %s: %s", job_id, exc)
+
+        if not stopped:
+            # Nothing was asked to stop, so nothing will. Withdraw the request rather than
+            # leaving a job that believes it is about to be resized and never is.
+            self._repo.cancel_repartition(job_id)
+            self._publish(job_id)
+            raise ValidationError(
+                "This solver has no clean stop, so Dispatch cannot pause it safely at a "
+                "timestep. Cancel it and resubmit with the core count you want."
+            )
+
+        entry.repartitioning = True
+        self._event(
+            job_id,
+            "signal",
+            f"asked the solver to write and stop, to resume on {cores} core(s)",
+        )
+        self._publish(job_id)
+        return True
+
     async def shutdown(self, *, kill_jobs: bool = False) -> None:
         """Stop supervising.
 
@@ -631,6 +747,7 @@ class JobExecutor:
             env=dict(os.environ),
             adapter=job.solver,
             job_name=job.name,
+            cpu_mode=self._resources.cpu_mode.value,
         )
         try:
             env = adapter.prepare_environment(base)
@@ -646,7 +763,11 @@ class JobExecutor:
             settings=base.settings,
             job_name=base.job_name,
             metadata=job.metadata,
-            resume=job.resume_requested,
+            # Either reason asks the adapter for exactly the same thing: continue from
+            # whatever the case itself last wrote. Which of the two it was matters to the
+            # history, not to the plan (§6.12).
+            resume=job.continues_from_saved_state,
+            cpu_mode=self._resources.cpu_mode.value,
         )
 
     async def _record_resume_point(
@@ -678,6 +799,15 @@ class JobExecutor:
         )
         with contextlib.suppress(DispatchError):
             self._repo.clear_resume_request(job.id)
+
+    async def provenance_git(self, workdir: Path) -> GitInfo:
+        """What version control says about a directory, using the provenance collector.
+
+        Exposed so the information view reads the repository through the same probe that
+        records it at job start. Two probes would eventually disagree, and the one thing a
+        provenance record must not do is disagree with what the user is being shown.
+        """
+        return await self._provenance.git_info(workdir)
 
     def _log_dir(self, job: Job) -> Path:
         directory = self._config.paths.job_dir(job.id)

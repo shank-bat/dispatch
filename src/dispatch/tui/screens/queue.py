@@ -8,7 +8,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 from dispatch.ipc.protocol import Method
 from dispatch.tui.screens.base import DispatchScreen, run_when_confirmed
@@ -33,7 +33,13 @@ class QueueScreen(DispatchScreen):
         Binding("minus,underscore,j", "lower_priority", "", show=False),
         Binding("enter", "open", "logs"),
         Binding("p", "plot", "plot"),
+        Binding("i", "case_info", "info"),
+        Binding("c", "repartition", "re-core"),
     ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._prompt_mode = ""
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -41,6 +47,7 @@ class QueueScreen(DispatchScreen):
             yield Static("", id="heading")
             yield JobTable(id="queue-table")
             yield Static("", id="why")
+            yield Input(id="prompt", classes="prompt")
         yield from self.compose_footer()
 
     async def on_mount(self) -> None:
@@ -97,8 +104,20 @@ class QueueScreen(DispatchScreen):
         job = self._selected()
         if job is None:
             return Text("")
+        pending = job.get("repartition_cores")
+        if pending:
+            # The most important thing to say about this job: it is still running, and it is
+            # going to stop by itself. Without this the queue looks like nothing happened.
+            text = Text("finishing its current timestep", style=Palette.WARNING)
+            text.append(
+                f" — will requeue on {pending} {self._unit(pending)}", style=Palette.MUTED
+            )
+            return text
         if job["state"] in ("RUNNING", "PREPARING"):
-            return Text(f"running on {job['cores']} cores", style=Palette.FAINT)
+            return Text(
+                f"running on {job['cores']} {self._unit(int(job['cores']))}",
+                style=Palette.FAINT,
+            )
         if job["state"] == "HELD":
             return Text("held — press H to release", style=Palette.WARNING)
 
@@ -130,6 +149,58 @@ class QueueScreen(DispatchScreen):
     def _selected(self) -> dict[str, Any] | None:
         job_id = self.query_one("#queue-table", JobTable).selected_job_id
         return self.app_state.get(job_id) if job_id else None
+
+    def _open_prompt(self, mode: str, placeholder: str) -> None:
+        self._prompt_mode = mode
+        box = self.query_one("#prompt", Input)
+        box.placeholder = placeholder
+        box.value = ""
+        box.add_class("visible")
+        box.focus()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        box = self.query_one("#prompt", Input)
+        box.remove_class("visible")
+        self.query_one("#queue-table", JobTable).focus()
+
+        job = self._selected()
+        if self._prompt_mode != "repartition" or job is None or not value:
+            return
+        try:
+            cores = int(value)
+        except ValueError:
+            self.notify_error(f"{value!r} is not a number")
+            return
+        try:
+            result = await self.dispatch_app.call(
+                Method.JOB_REPARTITION, id=job["id"], cores=cores
+            )
+        except Exception as exc:
+            self.notify_error(str(exc))
+            return
+        self.notify_ok(
+            f"{job['name']} will finish its timestep, then requeue on "
+            f"{result['cores']} {self._unit(int(result['cores']))}"
+        )
+
+    def _unit(self, count: int) -> str:
+        """``cores`` or ``threads``, matching what the daemon is actually counting."""
+        unit = str(self.app_state.snapshot.get("core_unit", "core"))
+        return unit if count == 1 else f"{unit}s"
+
+    def action_repartition(self) -> None:
+        """Pause a running job at its next write and resume it on a different core count."""
+        job = self._selected()
+        if job is None:
+            return
+        if job["state"] not in ("RUNNING", "PREPARING"):
+            self.notify_error("Only a running job can be paused and re-cored.")
+            return
+        self._open_prompt(
+            "repartition",
+            f"resume {job['name']} on how many {self._unit(2)}? (now {job['cores']})",
+        )
 
     def action_cancel(self) -> None:
         job = self._selected()
@@ -170,6 +241,12 @@ class QueueScreen(DispatchScreen):
         job = self._selected()
         if job is not None:
             self.dispatch_app.open_logs(job["id"])
+
+    def action_case_info(self) -> None:
+        """Describe the selected job's case."""
+        job = self._selected()
+        if job is not None:
+            self.dispatch_app.open_case_info(job_id=job["id"])
 
     def action_plot(self) -> None:
         """Plot whatever numbers this job's adapter can find in its output."""

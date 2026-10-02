@@ -26,6 +26,11 @@ reserved_cores = 1
 # Unlike cores, none are held back: nothing about logging in over SSH needs a GPU.
 # total_gpus = 2
 
+# What a requested core means. "physical" (default, unchanged behaviour) counts physical cores;
+# "logical" counts SMT threads. Both count only CPUs this process may run on, and neither pins
+# jobs to CPU ids. `dispatch doctor` prints the topology and which half is being counted.
+cpu_mode = "physical"
+
 # RAM kept free above the sum of running jobs' declared estimates.
 ram_margin_mb = 2048
 
@@ -50,7 +55,7 @@ root = "~/projects"
 
 # Bounds on the walk. It runs on a keystroke rather than from an index, so it has to stay
 # fast; when a limit stops it, the results say so rather than looking complete.
-max_depth = 6
+max_depth = 8
 max_entries = 20000
 limit = 50
 

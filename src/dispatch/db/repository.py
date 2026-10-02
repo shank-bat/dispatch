@@ -60,7 +60,8 @@ _JOB_COLUMNS: Final = """
     state, created_at, started_at, finished_at, exit_code, exit_reason, exit_signal,
     exit_detail, stdout_path, stderr_path, log_path, pid, pid_start_time, metadata,
     runtime_s, peak_rss_mb, mean_cpu_pct, depends_on_job_id, resource_kind, gpus,
-    sweep_id, sweep_position, resume_requested, boot_time
+    sweep_id, sweep_position, resume_requested, boot_time, start_from_latest,
+    repartition_cores
 """
 
 # Columns a transition is permitted to set. An allowlist rather than "whatever the caller
@@ -84,6 +85,11 @@ _TRANSITION_FIELDS: Final = frozenset(
         # for and cause a second one.
         "resume_requested",
         "boot_time",
+        # Rewritten in the same statement that returns a repartitioned job to the queue,
+        # so its allocation and its state can never disagree about how many cores it wants
+        # (§6.13). The request is cleared by the same statement that honours it.
+        "cores",
+        "repartition_cores",
     }
 )
 
@@ -170,12 +176,12 @@ class JobRepository:
                     id, seq, name, workdir, solver, solver_binary, cores, ram_estimate_mb,
                     priority, state, created_at, stdout_path, stderr_path, log_path,
                     metadata, depends_on_job_id, resource_kind, gpus,
-                    sweep_id, sweep_position
+                    sweep_id, sweep_position, start_from_latest
                 ) VALUES (
                     :id, :seq, :name, :workdir, :solver, :solver_binary, :cores, :ram,
                     :priority, :state, :created_at, :stdout, :stderr, :log,
                     :metadata, :depends_on, :resource_kind, :gpus,
-                    :sweep_id, :sweep_position
+                    :sweep_id, :sweep_position, :start_from_latest
                 )
                 """,
                 {
@@ -199,6 +205,7 @@ class JobRepository:
                     "depends_on": spec.depends_on_job_id,
                     "sweep_id": spec.sweep_id,
                     "sweep_position": spec.sweep_position,
+                    "start_from_latest": 1 if spec.start_from_latest else 0,
                 },
             )
             self._write_tags(job_id, spec.tags)
@@ -345,8 +352,12 @@ class JobRepository:
             self._conn.execute(
                 """
                 INSERT INTO sweeps (
-                    id, name, root, solver, cores_per_job, concurrency, created_at
-                ) VALUES (:id, :name, :root, :solver, :cores, :concurrency, :created_at)
+                    id, name, root, solver, cores_per_job, concurrency, created_at,
+                    start_from_latest
+                ) VALUES (
+                    :id, :name, :root, :solver, :cores, :concurrency, :created_at,
+                    :start_from_latest
+                )
                 """,
                 {
                     "id": spec.sweep_id,
@@ -356,6 +367,7 @@ class JobRepository:
                     "cores": spec.cores_per_job,
                     "concurrency": spec.concurrency,
                     "created_at": now,
+                    "start_from_latest": 1 if spec.start_from_latest else 0,
                 },
             )
         created = [self.create(job) for job in jobs]
@@ -367,7 +379,8 @@ class JobRepository:
         """One sweep by id, with its live member counts, or ``None``."""
         row = self._conn.execute(
             """
-            SELECT id, name, root, solver, cores_per_job, concurrency, created_at
+            SELECT id, name, root, solver, cores_per_job, concurrency, created_at,
+                   start_from_latest
             FROM sweeps WHERE id = ?
             """,
             (sweep_id,),
@@ -380,7 +393,8 @@ class JobRepository:
         """Every sweep, newest first, with live member counts."""
         rows = self._conn.execute(
             """
-            SELECT id, name, root, solver, cores_per_job, concurrency, created_at
+            SELECT id, name, root, solver, cores_per_job, concurrency, created_at,
+                   start_from_latest
             FROM sweeps ORDER BY created_at DESC
             """
         ).fetchall()
@@ -395,6 +409,26 @@ class JobRepository:
             ORDER BY sweep_position ASC, seq ASC
             """,
             (sweep_id,),
+        ).fetchall()
+        return self._hydrate(rows)
+
+    def jobs_for_workdir(self, workdir: Path) -> Sequence[Job]:
+        """Every job that ran in a directory, newest first.
+
+        For the case information view, which answers "what has Dispatch already done here?"
+        -- a question none of the solver's own files can answer.
+
+        Matched on the stored path exactly. Resolving each row's path to compare would mean
+        a filesystem call per job in the history, and the submission path already stores a
+        resolved path, so the comparison is between two values produced the same way.
+        """
+        rows = self._conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS} FROM jobs
+            WHERE workdir = ?
+            ORDER BY seq DESC
+            """,
+            (str(workdir),),
         ).fetchall()
         return self._hydrate(rows)
 
@@ -446,6 +480,7 @@ class JobRepository:
             cores_per_job=int(row["cores_per_job"]),
             concurrency=int(row["concurrency"]),
             created_at=float(row["created_at"]),
+            start_from_latest=bool(row["start_from_latest"]),
             total=int(counts["total"] or 0),
             running=int(counts["running"] or 0),
             finished=int(counts["finished"] or 0),
@@ -611,6 +646,81 @@ class JobRepository:
             job_id,
             JobState.QUEUED,
             detail=detail,
+            resume_requested=1,
+            started_at=None,
+            pid=None,
+            pid_start_time=None,
+        )
+
+    def request_repartition(self, job_id: str, cores: int) -> Job:
+        """Record that a running job should come back on a different core count (§6.13).
+
+        Only the request is stored. The job keeps running, keeps its current allocation, and
+        keeps its state -- nothing changes until the solver reaches its next write and the
+        executor acts on this. Storing it rather than holding it in the executor is what
+        makes the request survive a daemon restart: one that lived in memory would be lost,
+        and the job would quietly finish on its old core count having been told otherwise.
+
+        Raises:
+            JobNotFound: If no such job exists.
+            ValidationError: If the job is not running, or the count is not positive.
+        """
+        if cores < 1:
+            raise ValidationError(f"A job needs at least one core, got {cores}")
+        job = self.get(job_id)
+        if job.state not in (JobState.RUNNING, JobState.PREPARING):
+            raise ValidationError(
+                f"{job.name} is {job.state.value.lower()}, so there is no run to repartition"
+            )
+        with transaction(self._conn):
+            self._conn.execute(
+                "UPDATE jobs SET repartition_cores = ? WHERE id = ?", (cores, job_id)
+            )
+            self._append_event(
+                job_id,
+                "note",
+                f"will stop at its next write and resume on {cores} core(s)",
+                self._clock.now(),
+            )
+        return self.get(job_id)
+
+    def cancel_repartition(self, job_id: str) -> Job:
+        """Withdraw a pending core change, leaving the run alone.
+
+        The solver may already have been asked to stop, in which case the stop still
+        happens -- this only means the job will not be requeued for it. Said plainly here
+        because "cancel the repartition" and "cancel the stop" are different things and
+        only the first is in Dispatch's gift.
+        """
+        with transaction(self._conn):
+            self._conn.execute(
+                "UPDATE jobs SET repartition_cores = NULL WHERE id = ?", (job_id,)
+            )
+        return self.get(job_id)
+
+    def requeue_for_repartition(self, job_id: str, *, cores: int, detail: str) -> Job:
+        """Return a cleanly stopped job to the queue on a new core count.
+
+        One statement, and that is the point. The new ``cores``, the cleared request, the
+        resume flag and the state change all land together, so there is no instant at which
+        the job is queued on a core count that does not match what it asked for, or carries
+        a request that has already been honoured.
+
+        The job keeps its ``seq``, and therefore its place in the queue: a core change is
+        not a resubmission, and sending a half-finished run to the back of the queue behind
+        work that was submitted after it would be the opposite of what was asked for.
+
+        ``started_at``, ``pid`` and ``pid_start_time`` are cleared because they describe a
+        process that has exited. The *ledger* is released separately, by the executor, after
+        this returns -- so between the two the ledger over-reports what is in use, which is
+        the safe direction: it can delay an admission but can never oversubscribe.
+        """
+        return self.transition(
+            job_id,
+            JobState.QUEUED,
+            detail=detail,
+            cores=cores,
+            repartition_cores=None,
             resume_requested=1,
             started_at=None,
             pid=None,

@@ -310,6 +310,30 @@ If you write an adapter for another declarative Python workload, reuse
 one-command plan, GPU visibility, and training-curve parsing, and you write `detect` and a
 `log_name`.
 
+
+## More optional hooks
+
+All additive, all with safe defaults, so `ADAPTER_API_VERSION` is unchanged.
+
+| Hook | Default | Used by |
+|---|---|---|
+| `case_markers` (class var) | `()` | Project search. Stat-only relative paths that identify a case root (`("system/controlDict",)`); the walk stops there. Declare only unambiguous evidence — a stray `*.cfg` must not prune a subtree. |
+| `case_datasets(ctx)` | `()` | Plots and the dashboard expander. `Dataset`s read from files the case writes (force coefficients). Keep each source in its own dataset; never merge rows from different writers. |
+| `describe_case(ctx)` | a page naming the solver | The `i` view. Build it with `core.caseinfo.ReportBuilder`; format your own numbers; give empty sections a `missing` reason. |
+| `geometry(ctx)` | `None` ("cannot tell", treated as 3-D) | Rendering. Return `CaseGeometry` with bounds and dimensionality from your solver's own conventions. |
+| `visualise(ctx, request)` | `None` | `dispatch render`. Return a `VisualPlan` of `CommandStep`s; return `None` when the renderer is not installed. |
+
+Two context fields matter to some adapters:
+
+* **`ctx.dry_run`** — the plan is a preview. If `plan()` (or `visualise()`) writes into the case,
+  guard the write and still describe it. This is mandatory for any edit `finalize` undoes: a
+  preview never reaches `finalize`.
+* **`ctx.cpu_mode`** — `"physical"` or `"logical"` (`ctx.counts_threads`). Relevant only when your
+  launcher counts differently from the scheduler; `mpi.check_slots` already handles MPI.
+
+`ctx.resume` is now true both after a reboot and when a job was submitted with `--from-latest`;
+adapters should treat them identically.
+
 ## Rules
 
 * **Never spawn a process.** `plan()` describes; it does not act. Breaking this loses dry

@@ -15,6 +15,7 @@ import os
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Self
 
@@ -22,6 +23,7 @@ from dispatch.core.errors import ConfigError
 
 __all__ = [
     "Config",
+    "CpuMode",
     "DaemonConfig",
     "NotificationConfig",
     "PathsConfig",
@@ -30,10 +32,60 @@ __all__ = [
     "SchedulerConfig",
     "installed_gpus",
     "load_config",
+    "logical_cpus",
     "physical_cores",
 ]
 
 APP_NAME: Final = "dispatch"
+
+
+class CpuMode(StrEnum):
+    """What a requested CPU count means on this machine.
+
+    The distinction is real and it changes admission. On a 16-core machine with SMT the
+    kernel offers 24 logical CPUs; whether ``--cores 20`` is a request Dispatch can satisfy
+    depends entirely on which of those two numbers it is counting, and getting it wrong is
+    not a cosmetic difference -- in one direction jobs that would run sit in the queue, and
+    in the other ``mpirun`` refuses a rank count the scheduler already promised.
+
+    :class:`StrEnum` so ``config.toml`` and the dashboard spell it the same way.
+    """
+
+    PHYSICAL = "physical"
+    """A requested core is a physical core. The default, and what Dispatch always meant.
+
+    Right for the solvers Dispatch exists to run: CFD is memory-bandwidth bound, so a
+    second rank on a core's sibling thread contends for the same cache and load/store
+    units instead of adding throughput. It is also the number Open MPI sizes its default
+    slot count by (§8.7).
+    """
+
+    LOGICAL = "logical"
+    """A requested core is a logical CPU -- an SMT thread.
+
+    For workloads that genuinely scale with threads rather than with memory bandwidth:
+    a Python training loop, an OpenMP solve that is latency-bound, a queue of small serial
+    jobs where keeping every thread busy beats keeping every core uncontended.
+    """
+
+
+def logical_cpus() -> int:
+    """Logical CPUs **available to this process**, not merely present on the machine.
+
+    ``len(os.sched_getaffinity(0))`` rather than ``os.cpu_count()``, and the difference is
+    the whole point of the function: inside a cgroup, under ``taskset``, or on a machine
+    where something else owns half the CPUs, the second number describes hardware Dispatch
+    is not allowed to use. Scheduling against it would admit jobs the kernel then refuses
+    to spread out.
+
+    This is also why the count is never confused with Linux *CPU ids*. Affinity masks are
+    sparse -- a process may hold cpus 0, 2, 4 and 6 -- so there are four CPUs available and
+    the highest id is 6. Dispatch counts; it never indexes.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # pragma: no cover - non-Linux or exotic kernel
+        return os.cpu_count() or 1
 
 
 def physical_cores() -> int | None:
@@ -193,7 +245,18 @@ class SchedulerConfig:
     """
 
     total_cores: int | None = None
-    """Override the detected core count. ``None`` means the machine's *physical* cores."""
+    """Override the detected core count. ``None`` means whatever :attr:`cpu_mode` counts."""
+
+    cpu_mode: str = CpuMode.PHYSICAL.value
+    """Whether a requested core means a physical core or a logical CPU. See :class:`CpuMode`.
+
+    ``"physical"`` is the default and is what Dispatch has always counted, so an existing
+    installation schedules identically after this setting appeared. An unknown value is a
+    startup error listing the valid ones rather than a silent fallback, for the same reason
+    an unknown ``policy`` is (§13.16): a machine quietly counting threads when its
+    configuration says cores would be discovered months later, while wondering why nothing
+    ever gets the cores it asked for.
+    """
 
     total_gpus: int | None = None
     """Override the detected GPU count. ``None`` means whatever :func:`installed_gpus` finds.
@@ -222,28 +285,54 @@ class SchedulerConfig:
             raise ConfigError(f"scheduler.total_cores must be >= 1, got {self.total_cores}")
         if self.total_gpus is not None and self.total_gpus < 0:
             raise ConfigError(f"scheduler.total_gpus must be >= 0, got {self.total_gpus}")
+        try:
+            CpuMode(str(self.cpu_mode).strip().lower())
+        except ValueError as exc:
+            valid = ", ".join(mode.value for mode in CpuMode)
+            raise ConfigError(
+                f"Unknown scheduler.cpu_mode {self.cpu_mode!r}. Valid modes: {valid}"
+            ) from exc
         if self.heartbeat_s <= 0:
             raise ConfigError(f"scheduler.heartbeat_s must be positive, got {self.heartbeat_s}")
 
-    def resolve_total_cores(self) -> int:
-        """The core count to schedule against.
+    @property
+    def resolved_cpu_mode(self) -> CpuMode:
+        """The validated mode. Parsing happens once here rather than at each call site."""
+        return CpuMode(str(self.cpu_mode).strip().lower())
 
-        **Physical** cores, not the logical count ``os.cpu_count()`` reports. Two
-        independent reasons, and they happen to give the same answer:
+    def resolve_total_cores(self) -> int:
+        """The core count to schedule against, in the units :attr:`cpu_mode` selects.
+
+        An explicit ``total_cores`` always wins: a user who names a number means it, and
+        the mode then only describes what that number *is* for everything downstream.
+
+        **Physical** is the default, for two independent reasons that give the same answer:
 
         * MPI agrees with this number and not the other one. Open MPI sizes its default
           slot count by physical cores, so a job launched with more ranks than the machine
           has cores dies instantly with "not enough slots" -- before the solver runs at
           all. Scheduling against the logical count on any SMT machine therefore admits
-          jobs that cannot start.
-        * It is the right number anyway. CFD solvers are memory-bandwidth bound, so a
-          second rank on the same physical core competes for the same cache and load/store
-          units rather than adding throughput.
+          jobs that cannot start, unless the launch compensates (§8.7).
+        * It is the right number for the solvers Dispatch exists to run. CFD is
+          memory-bandwidth bound, so a second rank on the same physical core competes for
+          the same cache and load/store units rather than adding throughput.
 
-        A machine that genuinely wants hyperthreads sets ``scheduler.total_cores``
-        explicitly; that override is honoured, and the MPI launch adapts to it (§8.7).
+        ``cpu_mode = "logical"`` counts SMT threads instead, for work that genuinely scales
+        with them. The count comes from :func:`logical_cpus`, which reports what this
+        process is *allowed* to use rather than what the machine has.
         """
-        return self.total_cores or physical_cores() or os.cpu_count() or 1
+        if self.total_cores:
+            return self.total_cores
+        if self.resolved_cpu_mode is CpuMode.LOGICAL:
+            return logical_cpus()
+        # Capped by what the process may actually run on: a 16-core machine confined to
+        # four CPUs by a cgroup has four, whatever the hardware reports.
+        return min(physical_cores() or logical_cpus(), logical_cpus())
+
+    def describe_cores(self, count: int) -> str:
+        """``20 cores`` or ``20 threads``, so every display agrees with the ledger."""
+        unit = "thread" if self.resolved_cpu_mode is CpuMode.LOGICAL else "core"
+        return f"{count} {unit}{'' if count == 1 else 's'}"
 
     def resolve_total_gpus(self) -> int:
         """The GPU count to schedule against.
@@ -325,8 +414,13 @@ class ProjectsConfig:
     root: Path = field(default_factory=lambda: Path.home() / "projects")
     """The one directory searched by name. Never the whole filesystem."""
 
-    max_depth: int = 6
-    """How deep below the root to descend. Deep enough for ``paper1/cases/re100/cavity``."""
+    max_depth: int = 8
+    """How deep below the root to descend.
+
+    Raised from six once the walk stopped descending into cases (§9.5): the pruning made
+    it several times cheaper, and real trees put cases at ``work/group/project/study/case``
+    with room to spare above that.
+    """
 
     max_entries: int = 20000
     """Directories visited before the walk gives up and returns what it has.

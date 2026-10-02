@@ -28,7 +28,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import ListItem, ListView, Static
 
-from dispatch.core.series import PlotData, Series, align
+from dispatch.core.series import Dataset, PlotData, Series, align
 from dispatch.ipc.protocol import Method
 from dispatch.tui.plot import (
     Charset,
@@ -65,13 +65,22 @@ class PlotScreen(DispatchScreen):
         Binding("l", "toggle_log", "log scale"),
         Binding("m", "toggle_marker", "marks"),
         Binding("r", "reload", "reload"),
+        Binding("d", "next_dataset", "dataset"),
         Binding("p", "focus_axes", "series", show=False),
     ]
 
     def __init__(self, job_id: str) -> None:
         super().__init__()
         self.job_id = job_id
-        self.data = PlotData()
+        self.datasets: list[Dataset] = []
+        """Every source of numbers this job has: its log, and the files its case writes.
+
+        Separate rather than merged because their rows do not correspond -- a log records
+        one per time step, a function object one per write -- so pairing across them by
+        position would plot one quantity against a different moment of another.
+        """
+
+        self._dataset = 0
         self.job_name = ""
         self.error: str | None = None
         self._x_key: str | None = None
@@ -79,6 +88,33 @@ class PlotScreen(DispatchScreen):
         self._style = PlotStyle()
         self._log_chosen = False
         """Whether the user has overridden the automatic log-scale guess."""
+
+    @property
+    def data(self) -> PlotData:
+        """The dataset currently being plotted. Empty when the job has none."""
+        if not self.datasets:
+            return PlotData()
+        return self.datasets[self._dataset % len(self.datasets)].data
+
+    @data.setter
+    def data(self, value: PlotData) -> None:
+        """Replace everything with a single unnamed dataset.
+
+        A convenience for "just plot this", used by tests and by any caller that has numbers
+        rather than a source. Assigning an empty :class:`PlotData` clears the screen, which
+        is what "this job has nothing to plot" looks like.
+        """
+        self.datasets = (
+            [Dataset(key="log", label="Solver log", data=value)] if value else []
+        )
+        self._dataset = 0
+
+    @property
+    def dataset(self) -> Dataset | None:
+        """The current dataset itself, for its label and source."""
+        if not self.datasets:
+            return None
+        return self.datasets[self._dataset % len(self.datasets)]
 
     def compose(self) -> ComposeResult:
         yield from self.compose_header()
@@ -106,13 +142,14 @@ class PlotScreen(DispatchScreen):
             payload = await self.dispatch_app.call(Method.JOB_SERIES, id=self.job_id)
         except Exception as exc:
             self.error = str(exc)
-            self.data = PlotData()
+            self.datasets = []
             self._redraw()
             return
 
         self.error = None
         self.job_name = str(payload.get("name") or "")
-        self.data = _decode(payload)
+        self.datasets = _decode_datasets(payload)
+        self._dataset = 0
         self._choose_defaults()
         self._fill_lists()
         self._redraw()
@@ -276,6 +313,15 @@ class PlotScreen(DispatchScreen):
     def _status(self, notes: list[str]) -> Text:
         """Scale, sample count, and anything the pairing had to say."""
         text = Text()
+        current = self.dataset
+        if current is not None:
+            text.append(current.label, style=Palette.ACCENT)
+            if len(self.datasets) > 1:
+                text.append(
+                    f" ({self._dataset + 1}/{len(self.datasets)}, d to change)",
+                    style=Palette.FAINT,
+                )
+            text.append("   ")
         text.append("y ", style=Palette.FAINT)
         text.append("log" if self._style.log_y else "linear", style=Palette.MUTED)
         text.append("   marks ", style=Palette.FAINT)
@@ -327,6 +373,21 @@ class PlotScreen(DispatchScreen):
         self._style = PlotStyle(
             charset=following, log_y=self._style.log_y, log_x=self._style.log_x
         )
+        self._redraw()
+
+    def action_next_dataset(self) -> None:
+        """Move to the next source of numbers -- the log, the force coefficients, ...
+
+        A key rather than a third list: most jobs have one dataset and a selector that is
+        usually a single row would be chrome. The status line names the current one, and the
+        key is only interesting on a case that has more than one.
+        """
+        if len(self.datasets) < 2:
+            self.notify_error("This job has only one set of data to plot.")
+            return
+        self._dataset = (self._dataset + 1) % len(self.datasets)
+        self._choose_defaults()
+        self._fill_lists()
         self._redraw()
 
     async def action_reload(self) -> None:
@@ -415,6 +476,36 @@ def _decode(payload: dict[str, Any]) -> PlotData:
         samples=int(payload.get("samples") or 0),
         truncated=bool(payload.get("truncated")),
     )
+
+
+def _decode_datasets(payload: dict[str, Any]) -> list[Dataset]:
+    """Rebuild the dataset list, falling back to the flat payload.
+
+    The fallback is what makes the field additive: a daemon from before datasets existed
+    answers with ``series`` alone, and that is read as the one log dataset rather than as an
+    empty screen.
+    """
+    raw = payload.get("datasets")
+    if not raw:
+        data = _decode(payload)
+        if not data:
+            return []
+        return [Dataset(key="log", label="Solver log", data=data, source=payload.get("path"))]
+
+    datasets: list[Dataset] = []
+    for item in raw:
+        data = _decode(item)
+        if not data:
+            continue
+        datasets.append(
+            Dataset(
+                key=str(item.get("key") or "data"),
+                label=str(item.get("label") or item.get("key") or "data"),
+                data=data,
+                source=item.get("source"),
+            )
+        )
+    return datasets
 
 
 def _nothing_to_plot(data: PlotData) -> Text:

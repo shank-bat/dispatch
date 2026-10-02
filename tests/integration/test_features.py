@@ -11,6 +11,7 @@ shell script, and the GPU count is configuration.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
@@ -18,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from dispatch.core.config import Config, ProjectsConfig
-from dispatch.core.states import JobState
+from dispatch.core.states import ExitReason, JobState
 from dispatch.daemon.main import Daemon
 from dispatch.daemon.recovery import recover
 from dispatch.ipc.client import DaemonClient, RemoteError
@@ -603,3 +604,426 @@ async def test_a_sweep_and_its_order_survive_a_daemon_restart(
     assert [job.name for job in daemon.repo.sweep_members(sweep_id)] == [
         f"case_{i:03d}" for i in range(1, 5)
     ]
+
+
+# == pausing a run to change its core count (§6.13) =========================================
+#
+# The whole feature, through a real daemon and real processes. The fake solver watches for a
+# sentinel the adapter's clean stop touches, which is the same shape as OpenFOAM's
+# `stopAt writeNow`: the adapter writes into the case and the solver decides when to act, at
+# the end of a step it has finished writing.
+
+WATCHES_FOR_STOP = (
+    "echo running; "
+    "while [ ! -f stop ]; do sleep 0.05; done; "
+    "echo 'wrote the timestep'; exit 0"
+)
+
+
+async def await_cores(
+    client: DaemonClient, job_id: str, cores: int, timeout: float = 25.0
+) -> dict:
+    """Wait until a job is running on exactly ``cores``.
+
+    The resize passes through QUEUED so briefly that polling for that state is a race: the
+    scheduler re-admits on the same nudge that requeued the job. What matters is the
+    outcome, so that is what is waited for; `test_a_paused_job_waits_for_its_new_cores`
+    pins the queued state deliberately by making the new count unavailable.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    seen: object = None
+    while loop.time() < deadline:
+        detail = await client.call(Method.JOB_GET, id=job_id)
+        seen = (detail["job"]["state"], detail["job"]["cores"])
+        if seen == (JobState.RUNNING.value, cores):
+            return detail
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"job never ran on {cores} cores; last seen {seen}")
+
+
+async def test_a_running_job_can_be_paused_and_resumed_on_more_cores(
+    client: DaemonClient, daemon: Daemon, tmp_path: Path
+) -> None:
+    """The headline: stop at a write, change the count, come back and continue."""
+    case = make_case(tmp_path / "resize", script=WATCHES_FOR_STOP, graceful=True)
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    result = await client.call(Method.JOB_REPARTITION, id=job["id"], cores=5)
+    assert result["pausing"] is True and result["cores"] == 5
+
+    detail = await await_cores(client, job["id"], 5)
+    assert detail["job"]["repartition_cores"] is None, "the request was honoured and cleared"
+    assert any("requeued on 5" in event["detail"] for event in detail["events"])
+    assert any(
+        "last saved state" in event["detail"] or "no saved state" in event["detail"]
+        for event in detail["events"]
+    ), "the restart continued rather than silently starting over"
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_a_paused_job_waits_for_its_new_cores(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Requeued, not special-cased: it waits for capacity like any other queued job."""
+    blocker = await submit(client, make_case(tmp_path / "blocker", script="sleep 30"), cores=6)
+    await await_state(client, blocker["id"], JobState.RUNNING.value)
+
+    case = make_case(tmp_path / "waits", script=WATCHES_FOR_STOP, graceful=True)
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    await client.call(Method.JOB_REPARTITION, id=job["id"], cores=5)
+    detail = await await_state(client, job["id"], JobState.QUEUED.value)
+    assert detail["job"]["cores"] == 5
+    assert detail["job"]["resume_requested"] is True
+    assert detail["job"]["repartition_cores"] is None
+    assert "core" in (detail["waiting_because"] or "")
+
+    for job_id in (blocker["id"], job["id"]):
+        await client.call(Method.JOB_CANCEL, id=job_id, force=True)
+
+
+async def test_the_timestep_is_written_before_the_process_stops(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Not a kill: the solver reaches its own exit after finishing the step."""
+    case = make_case(tmp_path / "clean", script=WATCHES_FOR_STOP, graceful=True)
+    job = await submit(client, case, cores=1)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    await client.call(Method.JOB_REPARTITION, id=job["id"], cores=3)
+    await await_cores(client, job["id"], 3)
+
+    # The first run's own words, written after the stop was requested and before it exited.
+    assert "wrote the timestep" in (case / "log.fake.1").read_text()
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_the_ledger_follows_the_new_core_count(
+    client: DaemonClient, daemon: Daemon, tmp_path: Path
+) -> None:
+    """Resource accounting changes with the job's state, not independently of it."""
+    case = make_case(tmp_path / "ledger", script=WATCHES_FOR_STOP, graceful=True)
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+    assert daemon.resources.allocated_cores == 2
+
+    await client.call(Method.JOB_REPARTITION, id=job["id"], cores=5)
+    await await_cores(client, job["id"], 5)
+    assert daemon.resources.allocated_cores == 5
+
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_a_paused_job_keeps_its_place_in_the_queue(
+    client: DaemonClient, daemon: Daemon, tmp_path: Path
+) -> None:
+    """A core change is not a resubmission; it must not go behind later work."""
+    first = await submit(
+        client,
+        make_case(tmp_path / "first", script=WATCHES_FOR_STOP, graceful=True),
+        cores=2,
+    )
+    await await_state(client, first["id"], JobState.RUNNING.value)
+    later = await submit(client, make_case(tmp_path / "later", script="sleep 30"), cores=8)
+
+    # Admission is paused for the duration, so the queued state can be observed at all:
+    # otherwise the scheduler re-admits on the same nudge that requeued the job.
+    daemon.scheduler.pause()
+    await client.call(Method.JOB_REPARTITION, id=first["id"], cores=8)
+    await await_state(client, first["id"], JobState.QUEUED.value)
+
+    assert first["seq"] < later["seq"]
+    # Queue *position*, which is the derived truth (§13.3), not the listing order.
+    page = await client.call(Method.JOB_LIST, states=["QUEUED"], limit=10)
+    positions = {item["id"]: item["queue_position"] for item in page["items"]}
+    assert positions[first["id"]] < positions[later["id"]]
+
+    daemon.scheduler.resume()
+    for job_id in (first["id"], later["id"]):
+        await client.call(Method.JOB_CANCEL, id=job_id, force=True)
+
+
+async def test_a_pending_pause_is_visible_while_it_is_pending(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Otherwise the interface looks like the keypress did nothing."""
+    case = make_case(tmp_path / "pending", script="sleep 30", graceful=True)
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    await client.call(Method.JOB_REPARTITION, id=job["id"], cores=4)
+    detail = await client.call(Method.JOB_GET, id=job["id"])
+    # The solver ignores the stop, so the job is still running with the request showing.
+    assert detail["job"]["state"] == JobState.RUNNING.value
+    assert detail["job"]["repartition_cores"] == 4
+
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_a_solver_with_no_clean_stop_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Killing a solver mid-timestep to resize it would corrupt the very write this
+    feature exists to preserve."""
+    case = make_case(tmp_path / "nostop", script="sleep 30")  # graceful=False
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    with pytest.raises(RemoteError, match="no clean stop"):
+        await client.call(Method.JOB_REPARTITION, id=job["id"], cores=4)
+
+    detail = await client.call(Method.JOB_GET, id=job["id"])
+    assert detail["job"]["state"] == JobState.RUNNING.value
+    assert detail["job"]["repartition_cores"] is None, "the request was withdrawn"
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_a_queued_job_cannot_be_paused(client: DaemonClient, tmp_path: Path) -> None:
+    blocker = await submit(
+        client, make_case(tmp_path / "blocker", script="sleep 30"), cores=8
+    )
+    await await_state(client, blocker["id"], JobState.RUNNING.value)
+    waiting = await submit(client, make_case(tmp_path / "waiting"), cores=8)
+
+    with pytest.raises(RemoteError, match="not running"):
+        await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=2)
+    await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+
+async def test_resizing_to_more_cores_than_exist_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """It would stop the run and then never resume it."""
+    case = make_case(tmp_path / "toobig", script="sleep 30", graceful=True)
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    with pytest.raises(RemoteError, match="never be scheduled"):
+        await client.call(Method.JOB_REPARTITION, id=job["id"], cores=9999)
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_resizing_to_the_same_count_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    case = make_case(tmp_path / "same", script="sleep 30", graceful=True)
+    job = await submit(client, case, cores=3)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    with pytest.raises(RemoteError, match="already running on 3"):
+        await client.call(Method.JOB_REPARTITION, id=job["id"], cores=3)
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_a_run_that_does_not_stop_cleanly_is_not_requeued(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """A crash while stopping may have left a half-written timestep, so resuming from
+    "the latest time" could resume from a corrupt one. It fails honestly instead."""
+    case = make_case(
+        tmp_path / "crashes",
+        script="while [ ! -f stop ]; do sleep 0.05; done; exit 7",
+        graceful=True,
+    )
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    await client.call(Method.JOB_REPARTITION, id=job["id"], cores=4)
+    detail = await await_state(client, job["id"], JobState.FAILED.value)
+    assert detail["job"]["exit_code"] == 7
+    assert detail["job"]["repartition_cores"] is None
+    assert any("not resized" in event["detail"] for event in detail["events"])
+
+
+async def test_cancelling_still_ends_a_job_that_was_being_resized(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Cancel and resize want opposite outcomes from the same stop; cancel must win."""
+    case = make_case(tmp_path / "both", script=WATCHES_FOR_STOP, graceful=True)
+    job = await submit(client, case, cores=2)
+    await await_state(client, job["id"], JobState.RUNNING.value)
+
+    await client.call(Method.JOB_REPARTITION, id=job["id"], cores=4)
+    await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+    detail = await await_state(client, job["id"], JobState.CANCELLED.value)
+    assert detail["job"]["state"] == JobState.CANCELLED.value
+
+
+# == the case information view and rendering (§9.8, §8.10) ==================================
+
+
+def foam_case_at(root: Path) -> Path:
+    """A structurally valid OpenFOAM case, built from text files."""
+    (root / "system").mkdir(parents=True, exist_ok=True)
+    (root / "constant" / "polyMesh").mkdir(parents=True, exist_ok=True)
+    (root / "0").mkdir(exist_ok=True)
+    (root / "system" / "controlDict").write_text(
+        "FoamFile { object controlDict; }\napplication icoFoam;\nstartFrom startTime;\n"
+        "startTime 0;\nendTime 0.5;\ndeltaT 0.01;\nwriteControl timeStep;\nwriteInterval 20;\n"
+    )
+    (root / "system" / "fvSchemes").touch()
+    (root / "system" / "fvSolution").touch()
+    (root / "constant" / "polyMesh" / "owner").write_text(
+        'FoamFile { object owner; note "nPoints:8  nCells:400  nFaces:6"; }\n'
+    )
+    (root / "constant" / "polyMesh" / "boundary").write_text(
+        "FoamFile { object boundary; }\n2\n(\n"
+        "    walls { type wall; nFaces 3; startFace 0; }\n"
+        "    frontAndBack { type empty; nFaces 2; startFace 3; }\n)\n"
+    )
+    (root / "0" / "p").write_text(
+        "FoamFile { object p; }\ndimensions [0 2 -2 0 0 0 0];\n"
+    )
+    return root
+
+
+@pytest.fixture
+def foam_client(daemon: Daemon, client: DaemonClient) -> DaemonClient:
+    """A client talking to a daemon that also has the real OpenFOAM adapter."""
+    from dispatch.adapters.openfoam import OpenFOAMAdapter
+
+    daemon.registry.register(OpenFOAMAdapter)
+    return client
+
+
+async def test_a_case_describes_itself_over_the_socket(
+    foam_client: DaemonClient, tmp_path: Path
+) -> None:
+    """The whole point of the layering: the adapter reads the dictionaries, not the screen."""
+    case = foam_case_at(tmp_path / "cavity")
+    report = await foam_client.call(Method.CASE_INFO, path=str(case))
+
+    assert report["solver"] == "openfoam"
+    assert report["title"] == "cavity"
+    sections = {item["title"]: item for item in report["sections"]}
+    fields = {f["label"]: f["value"] for f in sections["solver"]["fields"]}
+    assert fields["Application"] == "icoFoam"
+    assert {f["label"]: f["value"] for f in sections["mesh"]["fields"]}["Cells"] == "400"
+    assert "2D" in {f["label"]: f["value"] for f in sections["mesh"]["fields"]}["Dimensionality"]
+
+
+async def test_the_description_works_on_a_directory_never_submitted(
+    foam_client: DaemonClient, tmp_path: Path
+) -> None:
+    """Which is when it is most useful -- deciding whether to submit at all."""
+    case = foam_case_at(tmp_path / "unsubmitted")
+    report = await foam_client.call(Method.CASE_INFO, path=str(case))
+    assert report["path"] == str(case)
+    assert not any(item["title"] == "dispatch history" for item in report["sections"])
+
+
+async def test_the_description_includes_what_dispatch_has_run_there(
+    daemon: Daemon, client: DaemonClient, tmp_path: Path
+) -> None:
+    """Not in any of the solver's own files, and often the most useful thing on the page."""
+    from dispatch.adapters.openfoam import OpenFOAMAdapter
+
+    case = foam_case_at(tmp_path / "ran")
+    # The job row is written directly rather than run: a directory holding both a
+    # controlDict and a fake.job is claimed by two adapters at once, which detection
+    # correctly refuses to resolve. What is under test is the history section, not running.
+    from dispatch.core.models import JobSpec, ResourceRequest
+
+    created = daemon.repo.create(
+        JobSpec(
+            workdir=case,
+            solver="openfoam",
+            resources=ResourceRequest(cores=4),
+            name="ran",
+        )
+    )
+    daemon.repo.mark_preparing(created.id)
+    daemon.repo.mark_started(created.id, pid=1, pid_start_time=1.0)
+    daemon.repo.mark_finished(
+        created.id, state=JobState.COMPLETED, exit_code=0, reason=ExitReason.OK
+    )
+
+    daemon.registry.register(OpenFOAMAdapter)
+    report = await client.call(Method.CASE_INFO, path=str(case))
+    history = next(
+        item for item in report["sections"] if item["title"] == "dispatch history"
+    )
+    values = {f["label"]: f["value"] for f in history["fields"]}
+    assert values["Runs"] == "1"
+    assert values["Latest"] == "completed"
+
+
+async def test_describing_something_that_is_not_a_case_is_refused(
+    foam_client: DaemonClient, tmp_path: Path
+) -> None:
+    plain = tmp_path / "notes"
+    plain.mkdir()
+    with pytest.raises(RemoteError, match="No solver recognises"):
+        await foam_client.call(Method.CASE_INFO, path=str(plain))
+
+
+async def test_a_render_is_planned_without_running_it(
+    foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    """``--dry-run`` on a render: the command and the camera, and nothing touched."""
+    binary = tmp_path / "bin" / "pvbatch"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary.parent}:{os.environ['PATH']}")
+
+    case = foam_case_at(tmp_path / "wing")
+    result = await foam_client.call(
+        Method.CASE_RENDER, path=str(case), kind="mesh", preset="front", dry_run=True
+    )
+
+    assert result["rendered"] is False
+    assert result["command"][0].endswith("pvbatch")
+    assert "--force-offscreen-rendering" in result["command"]
+    # The case declares an empty patch, so it is planar; it has no blockMeshDict, so its
+    # extent is unknown and the camera is settled inside the script instead.
+    assert any("2D" in note for note in result["notes"])
+    assert not (case / "postProcessing").exists(), "a preview touches nothing"
+
+
+async def test_rendering_without_paraview_says_so(
+    foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    """Rather than reporting a command that failed for reasons nobody can act on."""
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    case = foam_case_at(tmp_path / "wing")
+    with pytest.raises(RemoteError, match=r"ParaView .* was not found"):
+        await foam_client.call(Method.CASE_RENDER, path=str(case), kind="mesh")
+
+
+async def test_a_render_failure_is_reported_with_its_output(
+    foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    binary = tmp_path / "bin" / "pvbatch"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\necho 'cannot open display'\nexit 3\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary.parent}:{os.environ['PATH']}")
+
+    case = foam_case_at(tmp_path / "wing")
+    with pytest.raises(RemoteError, match="exit 3"):
+        await foam_client.call(Method.CASE_RENDER, path=str(case), kind="mesh")
+
+
+async def test_a_successful_render_reports_what_it_wrote(
+    foam_client: DaemonClient, tmp_path: Path, monkeypatch
+) -> None:
+    binary = tmp_path / "bin" / "pvbatch"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\necho rendered\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary.parent}:{os.environ['PATH']}")
+
+    case = foam_case_at(tmp_path / "wing")
+    result = await foam_client.call(
+        Method.CASE_RENDER, path=str(case), kind="mesh", preset="top"
+    )
+    assert result["rendered"] is True
+    assert result["produced"] == ["rendered"]
+    assert result["outputs"][0].endswith("mesh-top.png")
+    # The generated script and the reader stub are the only things written into the case.
+    assert (case / "postProcessing" / "dispatch" / "mesh-top.py").is_file()
+    assert (case / "wing.foam").is_file()

@@ -23,11 +23,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+from dispatch.core.caseinfo import CaseReport
+from dispatch.core.geometry import CaseGeometry
 from dispatch.core.metadata import EMPTY_SPEC, CaseMetadata, MetadataSpec
 from dispatch.core.models import Detection
 from dispatch.core.plan import ExecutionPlan
-from dispatch.core.series import PlotData
+from dispatch.core.series import Dataset, PlotData
 from dispatch.core.validation import ValidationReport
+from dispatch.core.visual import VisualPlan, VisualRequest
 
 __all__ = [
     "ADAPTER_API_VERSION",
@@ -111,6 +114,35 @@ class CaseContext:
     the answer off the disk.
     """
 
+    dry_run: bool = False
+    """Whether this plan is being built only to be shown, and must touch nothing.
+
+    :meth:`SolverAdapter.plan` is allowed to write configuration into a case -- the
+    OpenFOAM adapter rewrites ``decomposeParDict`` there, and says so in a validation
+    finding first. That is correct for a run and wrong for a preview, and the distinction
+    had been missing: ``--dry-run`` was rewriting the dictionary of a case it was only
+    describing.
+
+    It matters most for an edit the adapter undoes in :meth:`finalize`. A preview never
+    reaches ``finalize``, so an edit made under one would outlive the preview and silently
+    change where every later run of that case begins -- the exact failure mode §8.1 warns
+    about, arrived at from the other direction.
+
+    An adapter that writes nothing in ``plan`` can ignore this. One that does should guard
+    the write and still *describe* it, so the preview stays accurate about what a real run
+    would do.
+    """
+
+    cpu_mode: str = "physical"
+    """Whether :attr:`cores` counts physical cores or logical threads (§4.3.2).
+
+    An adapter needs this where the *launcher* counts differently from the scheduler.
+    ``mpirun`` sizes its default slots by physical cores, so twenty ranks on a machine
+    configured to count twenty threads is a deliberate oversubscription rather than a
+    mistake -- and the difference between those two readings is a warning on every single
+    job versus none. Adapters that do not launch under MPI can ignore it entirely.
+    """
+
     gpus: int = 0
     """GPUs the scheduler has reserved for this job. Zero for CPU work.
 
@@ -127,6 +159,11 @@ class CaseContext:
     def exists(self, *parts: str) -> bool:
         """Whether a path inside the case directory exists."""
         return self.path(*parts).exists()
+
+    @property
+    def counts_threads(self) -> bool:
+        """Whether :attr:`cores` is a thread count rather than a physical-core count."""
+        return self.cpu_mode == "logical"
 
     @property
     def uses_gpu(self) -> bool:
@@ -184,6 +221,7 @@ class SolverAdapter(Protocol):
     metadata_spec: ClassVar[MetadataSpec]
     env_keys: ClassVar[Sequence[str]]
     log_name: ClassVar[str]
+    case_markers: ClassVar[Sequence[str]]
 
     @classmethod
     def detect(cls, path: Path) -> Detection | None:
@@ -220,6 +258,22 @@ class SolverAdapter(Protocol):
 
     def parse_series(self, text: str, ctx: CaseContext) -> PlotData:
         """Extract plottable numerical series from a job's output."""
+        ...
+
+    def case_datasets(self, ctx: CaseContext) -> Sequence[Dataset]:
+        """Plottable series read from files the case writes beside its log."""
+        ...
+
+    def describe_case(self, ctx: CaseContext) -> CaseReport:
+        """A human-readable description of the case, for the information view."""
+        ...
+
+    def geometry(self, ctx: CaseContext) -> CaseGeometry | None:
+        """The case's spatial extent and dimensionality, when it can be determined."""
+        ...
+
+    def visualise(self, ctx: CaseContext, request: VisualRequest) -> VisualPlan | None:
+        """Commands that render a picture of the case, or ``None`` if it cannot."""
         ...
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
@@ -314,6 +368,29 @@ class BaseAdapter(ABC):
     never heard of Dispatch.
     """
 
+    renderer: ClassVar[str] = ""
+    """The external tool :meth:`visualise` uses, named for a "not installed" message.
+
+    Here rather than in the daemon so that generic code never names a vendor's tool; empty
+    for adapters that cannot render.
+    """
+
+    case_markers: ClassVar[Sequence[str]] = ()
+    """Relative paths whose mere existence marks a directory as one of this adapter's cases.
+
+    Deliberately **not** a second detector. :meth:`detect` is the authority on what a case
+    is and may read files to be sure; this is a stat-only screen for the one place that
+    cannot afford to read anything -- the project search, which walks thousands of
+    directories on a keystroke (§9.5). ``("system/controlDict",)`` is one ``stat``;
+    ``detect`` parses the dictionary it finds there.
+
+    Its job in the search is pruning. A case's own subdirectories -- time directories,
+    ``processorN``, ``postProcessing`` -- are not projects, and offering them crowds the
+    real answers off the page, so the walk stops at anything these match. Declaring
+    nothing is safe and costs only that pruning, which is why the default is empty and no
+    existing adapter had to change to keep working.
+    """
+
     def __init__(self, settings: Mapping[str, Any] | None = None) -> None:
         """Args:
         settings: This adapter's section of ``config.toml``.
@@ -340,6 +417,22 @@ class BaseAdapter(ABC):
         """Build the execution plan. Describes side effects; performs none."""
 
     # -- optional, with defaults --------------------------------------------------------
+
+    @classmethod
+    def looks_like_case(cls, path: Path) -> bool:
+        """Whether :attr:`case_markers` says ``path`` is one of this adapter's cases.
+
+        Stat-only and never raises, because it runs on every directory of a filesystem
+        walk. An adapter that declares no markers always answers ``False``, which simply
+        means the search does not prune below its cases.
+        """
+        for marker in cls.case_markers:
+            try:
+                if (path / marker).exists():
+                    return True
+            except OSError:  # pragma: no cover - unreadable directory mid-walk
+                continue
+        return False
 
     def collect_metadata(self, ctx: CaseContext) -> CaseMetadata:
         """Extract declared case settings. Defaults to an empty envelope."""
@@ -382,6 +475,67 @@ class BaseAdapter(ABC):
             a log with no ``Uy`` residual must not offer an empty ``residual(Uy)``.
         """
         return PlotData()
+
+    def case_datasets(self, ctx: CaseContext) -> Sequence[Dataset]:
+        """Plottable series read from files the case writes beside its log.
+
+        The companion to :meth:`parse_series`, which reads the log. A solver's own
+        post-processing output -- force coefficients, probe histories, integrated
+        quantities -- lives in files rather than in stdout, and is the answer to the
+        questions a log cannot answer.
+
+        Each group of columns that shares a sample index is its own
+        :class:`~dispatch.core.series.Dataset`, and that separation is load-bearing rather
+        than tidiness: a log records one row per time step while a function object records
+        one row per *write*, so row 5 of one is not row 5 of the other and pairing them by
+        position would plot one quantity against a different moment of another.
+
+        Called only when a user asks to plot or to inspect a case -- never on a timer, never
+        by the scheduler, and never in a way that can change a job's state. Should return
+        ``()`` rather than raise when the files are absent, which is the normal case.
+        """
+        return ()
+
+    def describe_case(self, ctx: CaseContext) -> CaseReport:
+        """A human-readable description of the case, for the information view (§9.8).
+
+        Reading a solver's configuration is solver knowledge, so the adapter does it and the
+        interface only lays the answer out. An adapter that implements nothing here produces
+        a page naming the solver and saying there is nothing more it can tell -- which is
+        honest, and better than a screen that only works for one solver.
+
+        Should never raise: this is a keypress on a directory the user is browsing, and a
+        half-written case is the normal reason to press it.
+        """
+        return CaseReport(title=ctx.workdir.name or str(ctx.workdir), solver=self.name)
+
+    def geometry(self, ctx: CaseContext) -> CaseGeometry | None:
+        """The case's spatial extent and dimensionality, or ``None`` when unknown.
+
+        Exists so that tools which have to point a camera at a mesh -- or decide whether
+        pointing it edge-on would show nothing -- can ask the adapter instead of guessing
+        (§8.10). Whether a case is two-dimensional is a fact about the solver's own
+        conventions: for OpenFOAM it is a patch type, for another solver it will be
+        something else entirely, and neither belongs in generic code.
+
+        ``None`` means "I cannot tell", which a caller should treat as three-dimensional
+        rather than as flat.
+        """
+        return None
+
+    def visualise(self, ctx: CaseContext, request: VisualRequest) -> VisualPlan | None:
+        """Commands that render a picture of the case, or ``None`` if it cannot (§8.10).
+
+        A plan rather than an action, for the same reason :meth:`plan` is: the commands are
+        run, logged, timed out and cancelled in one place, and the camera arithmetic that is
+        the hard part of this becomes a pure function.
+
+        ``None`` means this adapter has no way to render its cases, which is the default and
+        true of most. A renderer that is simply not installed should also yield ``None``
+        rather than a plan that cannot run -- the caller turns that into "ParaView was not
+        found" rather than into a failed command.
+        """
+        return None
 
     def stop_gracefully(self, ctx: CaseContext) -> bool:
         """Attempt a clean solver-native stop.

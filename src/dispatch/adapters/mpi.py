@@ -92,24 +92,40 @@ def launch_argv(
 
 
 def check_slots(ctx: CaseContext, builder: ReportBuilder, *, slots: int | None = None) -> None:
-    """Warn when a parallel run will oversubscribe the machine.
+    """Report when a parallel run will put more ranks on the machine than it has slots.
 
-    A warning rather than an error: the job *will* run, thanks to
-    :func:`launch_argv`. What it will not do is run well, and saying so at submission is
-    considerably more use than leaving the user to wonder why 24 ranks are slower than 16.
+    A finding rather than an error: the job *will* run, thanks to :func:`launch_argv`. What
+    it will not do is run as fast as the rank count suggests, and saying so at submission
+    is considerably more use than leaving the user to wonder why 24 ranks are slower than
+    16.
+
+    **Severity depends on whether the oversubscription was asked for.** In the default
+    physical-core mode it is a WARNING: the scheduler and the launcher agree on what a core
+    is, so exceeding the slot count means the request was larger than the machine. Under
+    ``scheduler.cpu_mode = "logical"`` the same arithmetic is the *point* -- the user is
+    deliberately scheduling SMT threads, and ``mpirun`` still counts physical cores -- so it
+    drops to INFO. Emitting a warning on every single job of a correctly configured machine
+    is how a validator teaches people to ignore it.
     """
     if ctx.cores < 2:
         return
     available = slots_available() if slots is None else slots
     if available is None or ctx.cores <= available:
         return
+
+    if ctx.counts_threads:
+        builder.info(
+            f"{ctx.cores} ranks on {available} physical cores: this machine schedules "
+            f"logical threads, so the ranks will share cores by design"
+        )
+        return
     builder.warning(
         f"{ctx.cores} ranks were requested but this machine has {available} physical "
         f"cores, so the ranks will share cores and the run will be slower than "
         f"{available} would be",
         hint=(
-            "Request at most one rank per physical core. Dispatch schedules against "
-            "physical cores unless scheduler.total_cores overrides it."
+            "Request at most one rank per physical core, or set "
+            '[scheduler] cpu_mode = "logical" if sharing them is intended.'
         ),
         code="mpi_oversubscribed",
     )

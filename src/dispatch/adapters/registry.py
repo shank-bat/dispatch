@@ -199,6 +199,28 @@ class AdapterRegistry:
                 found.append(detection)
         return tuple(sorted(found, key=lambda d: d.confidence, reverse=True))
 
+    def looks_like_case(self, path: Path) -> bool:
+        """Whether any adapter's cheap marker says ``path`` is one of its case roots.
+
+        Stat-only: this is the screen the project search can afford to run on every
+        directory it walks, where :meth:`detect` -- which parses files -- would cost
+        roughly half a millisecond a directory and make typing feel broken.
+
+        Adapters whose evidence is a *content* check declare no markers and are absent
+        from this answer on purpose. Pruning a subtree on weak evidence would hide real
+        work: a projects folder containing one stray ``.cfg`` must not stop the walk.
+        """
+        for adapter_cls in self._classes.values():
+            marker = getattr(adapter_cls, "looks_like_case", None)
+            if marker is None:
+                continue
+            try:
+                if marker(path):
+                    return True
+            except Exception:  # pragma: no cover - a plugin must not break the walk
+                continue
+        return False
+
     def best_detection(self, path: Path, *, margin: float = 0.15) -> Detection | None:
         """Return the single unambiguous detection for ``path``, if there is one.
 
@@ -278,6 +300,7 @@ class AdapterRegistry:
         env: Mapping[str, str] | None = None,
         adapter: str | None = None,
         job_name: str = "",
+        cpu_mode: str = "physical",
     ) -> CaseContext:
         """Build a :class:`CaseContext` with the right settings section attached."""
         return CaseContext(
@@ -285,6 +308,7 @@ class AdapterRegistry:
             cores=cores,
             ram_mb=ram_mb,
             gpus=gpus,
+            cpu_mode=cpu_mode,
             entry=entry,
             env=dict(env or {}),
             settings=self._settings.get(adapter or "", {}),

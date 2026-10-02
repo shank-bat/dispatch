@@ -544,6 +544,48 @@ async def test_no_widget_shadows_a_textual_internal() -> None:
     assert not offenders, "Attributes shadowing Textual internals:\n  " + "\n  ".join(offenders)
 
 
+def test_no_screen_defines_a_method_textual_already_owns() -> None:
+    """The same hazard as the attribute check, one level up -- and it has bitten.
+
+    A screen that defines ``_render`` overrides ``Widget._render``, whose job is to produce
+    the renderable Textual paints. The override has a different signature and returns
+    ``None``, so the screen goes blank with no error anywhere. The attribute check above does
+    not see it, because it is a method rather than an assignment in ``__init__``.
+
+    ``compose``, ``render`` and the ``on_*`` and ``action_*`` families are the documented
+    extension points and are meant to be defined; everything else private to MessagePump and
+    Widget is not.
+    """
+    import ast
+
+    from textual.message_pump import MessagePump
+    from textual.screen import Screen
+    from textual.widget import Widget
+
+    reserved = {
+        name
+        for cls in (MessagePump, Widget, Screen)
+        for name in dir(cls)
+        if name.startswith("_") and not name.startswith("__") and callable(getattr(cls, name, None))
+    }
+
+    offenders: list[str] = []
+    root = Path(__file__).resolve().parents[2] / "src" / "dispatch" / "tui"
+    for module in sorted(root.rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if (
+                    isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and item.name in reserved
+                ):
+                    offenders.append(f"{module.name}: {node.name}.{item.name}")
+
+    assert not offenders, "Methods shadowing Textual internals:\n  " + "\n  ".join(offenders)
+
+
 # -- the new surface ---------------------------------------------------------------------
 
 

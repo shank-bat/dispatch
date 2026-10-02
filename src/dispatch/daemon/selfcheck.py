@@ -11,6 +11,7 @@ logged in.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -57,7 +58,7 @@ def run_checks(config: object | None = None) -> list[Check]:
         _python_check(),
         _sqlite_check(),
         _pidfd_check(),
-        _resource_check(),
+        _resource_check(config),
         _linger_check(),
     ]
     if config is not None:
@@ -102,18 +103,32 @@ def _sqlite_check() -> Check:
     return Check("sqlite", CheckStatus.OK, f"SQLite {sqlite3.sqlite_version} with FTS5 and JSON1")
 
 
-def _resource_check() -> Check:
-    """What Dispatch will schedule against.
+def _resource_check(config: object | None = None) -> Check:
+    """What Dispatch will schedule against, and in which units.
 
     Reported rather than judged. Zero GPUs is the correct and common answer, and the check
-    exists so that a user whose GPU job is refused can see immediately whether Dispatch
-    can see the card at all -- which is otherwise a confusing thing to have to guess.
-    """
-    from dispatch.core.config import installed_gpus, physical_cores
+    exists so that a user whose GPU job is refused can see immediately whether Dispatch can
+    see the card at all -- which is otherwise a confusing thing to have to guess.
 
-    cores = physical_cores() or os.cpu_count() or 1
+    The core line prints both halves of the topology because the interesting question is
+    which one is being counted: on an SMT machine "16 cores / 24 threads, counting cores"
+    answers at a glance why ``--cores 20`` was refused.
+    """
+    from dispatch.core.config import CpuMode, installed_gpus, logical_cpus, physical_cores
+
+    physical = physical_cores()
+    logical = logical_cpus()
     gpus = installed_gpus()
-    detail = f"{cores} physical cores, {gpus} GPU(s) detected"
+
+    mode = CpuMode.PHYSICAL
+    scheduler = getattr(config, "scheduler", None)
+    if scheduler is not None:
+        with contextlib.suppress(Exception):
+            mode = scheduler.resolved_cpu_mode
+
+    counting = "threads" if mode is CpuMode.LOGICAL else "cores"
+    topology = f"{physical if physical else '?'} cores / {logical} threads"
+    detail = f"{topology}, scheduling {counting}; {gpus} GPU(s) detected"
     if gpus:
         return Check("resources", CheckStatus.OK, detail)
     return Check(

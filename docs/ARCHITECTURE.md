@@ -435,6 +435,34 @@ Dispatch that knows a GPU vendor exists. Everything above it — ledger, schedul
 interface, search — deals in an integer. `scheduler.total_gpus` overrides the answer, including
 with an explicit `0`.
 
+#### 4.3.2 Physical cores or logical threads
+
+`[scheduler] cpu_mode` says what a requested core *is*:
+
+| Mode | Counts | Total from | Default |
+|---|---|---|---|
+| `physical` | physical cores | `psutil.cpu_count(logical=False)`, capped by the affinity mask | yes — unchanged behaviour |
+| `logical` | SMT threads | `len(os.sched_getaffinity(0))` | opt-in |
+
+The number is carried on the ledger (`ResourceModel.cpu_mode`), the snapshot (`cpu_mode`,
+`core_unit`) and the adapter context (`CaseContext.cpu_mode`), so admission, the dashboard's
+`cores`/`threads` label, `dispatch status`, `dispatch doctor` and the execution plan all agree about
+what it means. An explicit `total_cores` still wins in either mode; an unknown mode is a startup
+error, like an unknown policy (§13.16).
+
+Two details carry the correctness:
+
+* **Available, not present.** The logical count is the affinity mask's *size*, never the highest
+  CPU id. Masks are sparse — a process may hold CPUs 0, 2, 4, 6 — so there are four available and the
+  highest id is 6. Dispatch counts; it never indexes, and it pins nothing (manual affinity is
+  deliberately not implemented). The physical count is capped by the same mask, so a 16-core machine
+  confined to four CPUs by a cgroup schedules four.
+* **The launcher still counts physical slots.** `mpirun` sizes its default slots by physical cores in
+  both modes, so `mpi.launch_argv` keeps adding `--oversubscribe` when it must. What changes is the
+  validator: in physical mode exceeding the slot count is a WARNING (the request is larger than the
+  machine); in logical mode it is INFO (sharing cores is the point), because warning on every job of
+  a correctly configured machine teaches people to ignore the validator.
+
 ### 4.4 Structured metadata
 
 A bare `Mapping[str, Any]` is a place where information goes to become unsearchable. Every adapter
@@ -687,6 +715,7 @@ corrupting data — a real risk on a machine that runs for months across upgrade
 | 002 | `jobs.exit_detail` | `NULL` — its log was never read for this, and inventing an explanation after the fact would be worse than a blank |
 | 003 | `jobs.depends_on_job_id` | `NULL` — schedule as soon as it fits, exactly as before |
 | 004 | `jobs.resource_kind`, `jobs.gpus`, `jobs.log_path` | `'cpu'`, `0`, `NULL` — which is what every job before this feature *was*, and whose output is still where it was written |
+| 006 | `jobs.start_from_latest`, `sweeps.start_from_latest`, `jobs.repartition_cores` | `0`, `0`, `NULL` — every existing job starts where it always did and has no pending core change |
 
 Every column added so far has been nullable or defaulted, and that is a rule rather than a
 coincidence: **the upgrade path must never require deleting the database.** Migration 004's
@@ -1176,6 +1205,52 @@ would otherwise start the whole sweep at once.
 `--after` remains authoritative throughout. A sweep member with a dependency waits for it even when
 the sweep has room and cores are free, and the sweep's cap still applies once the dependency is met.
 
+
+**Continuing from the latest written time.** `dispatch submit --sweep --from-latest` (or `l` in the
+wizard) asks every member to pick up from its own most recent output instead of its configured
+start — the setting most wanted when re-submitting a folder of long runs. It reuses the reboot-resume
+mechanism rather than paralleling it: the job's `start_from_latest` flag (and the sweep's own copy,
+for history) makes `CaseContext.resume` true, and the OpenFOAM adapter's existing `startFrom
+latestTime` edit — parked in `system/.dispatch-startFrom`, restored by `finalize` — does the rest.
+The flag is *sticky*, unlike the transient `resume_requested`: it describes configuration rather than
+an accident, so it survives a reboot and the history does not report it as one. A case that has
+written nothing beyond `0/` starts at `0/` — correct OpenFOAM behaviour — and the plan says so
+("from the beginning (no saved time to continue from)") instead of implying work was preserved. The
+SOLVE step's description carries the restart point, so every surface that shows a plan agrees.
+
+**Previews no longer touch the case.** `CaseContext.dry_run` is set by the dry run, the information
+view, and render previews. An adapter that edits a case while planning must guard the edit and still
+describe it. This fixed a pre-existing wart (`--dry-run` was writing `decomposeParDict`) and made the
+`startFrom` edit safe to preview — a preview never reaches `finalize`, so an edit made under one
+would otherwise have outlived it.
+
+### 6.13 Pausing at a write to change the core count
+
+`dispatch repartition <id> <cores>` (or `c` on the queue screen) stops a running job at its next
+write and brings it back on a different core count. There is **no PAUSED state**: the design is a
+pending request plus edges that already existed.
+
+1. `jobs.repartition_cores` records the request — persisted, so a daemon restart between the request
+   and the solver noticing it does not lose it. The job stays RUNNING, holding its allocation.
+2. The adapter's own clean stop is used (`stopAt writeNow` for OpenFOAM): the solver finishes the
+   timestep it is on, writes it, and exits 0. An adapter with no clean stop is **refused** and the
+   request withdrawn — killing a solver mid-timestep would corrupt the very write this preserves.
+3. `_conclude` sees the pending request on a clean exit and calls
+   `requeue_for_repartition`: one `UPDATE` sets `state = QUEUED`, the new `cores`,
+   `resume_requested = 1`, and clears the request. The job keeps its `seq`, so it keeps its place.
+   The executor then releases the old allocation, so between the two the ledger over-reports — the
+   safe direction; it can delay an admission and never oversubscribe.
+4. The scheduler admits it when the new count is free, like any other job. The adapter plans
+   `reconstructPar -latestTime`, removes the old processor directories, re-decomposes for the new
+   count and continues with `startFrom latestTime` — the existing decomposition table, unchanged.
+   Serial↔parallel transitions use the same table's serial rows.
+
+A run that exits non-zero while stopping is **not** requeued: it may have left a half-written
+timestep, so it keeps its ordinary failure, the request is cleared and an event says why. A cancel
+wins over a pending resize. The queue view shows "finishing its current timestep — will requeue on
+N cores" while the request is pending, so the keypress is visibly doing something.
+
+
 ---
 
 ## 7. IPC protocol
@@ -1247,12 +1322,16 @@ with "restart the daemon", not a `KeyError`.
 | `job.tag` | id, add[], remove[] → job |
 | `tags.list` | — → tag names with job counts |
 | `job.provenance` | id → full reproducibility record |
-| `job.series` | id → plottable numerical series read from the job's log (§9.6) |
+| `job.series` | id → plottable series: the log, plus `datasets` from case files (§9.6, §9.7) |
+| `job.metrics` | id → latest values of each case dataset, adapter-labelled (§9.7) |
+| `job.repartition` | id, cores → stop at the next write, requeue on a new count (§6.13) |
 | `history.search` | query string (§5.2 syntax), limit, offset → page of jobs |
 | `case.detect` | path → detections ranked by confidence |
 | `case.validate` | path, solver, cores → ValidationReport |
 | `case.dryrun` | same params as `job.submit` → DryRunReport (§6.11), no side effects |
 | `fs.list` | path → directories (+ per-entry "looks like a case" hint) |
+| `case.info` | path or id → full adapter-produced case description (§9.8) |
+| `case.render` | path or id, kind, preset, field, dry_run → ParaView render (§8.10) |
 | `projects.search` | query, limit → directories under the projects root, ranked (§9.5) |
 | `subscribe` / `unsubscribe` | topics → ack |
 
@@ -1593,6 +1672,39 @@ dropped, and **only series that actually appeared are emitted** — a 2-D case h
 and is offered none. `adapters/pyjob.py` does the equivalent for training output, and SU2 or
 CalculiX can add one without touching a line outside their own file.
 
+
+### 8.10 Rendering with ParaView (OpenFOAM only)
+
+`dispatch render <case>` (or `v`/`V` in the information view) produces a mesh screenshot or an
+animation. It follows §13.9: the adapter returns a `VisualPlan` of ordinary `CommandStep`s and the
+daemon runs them. Only OpenFOAM implements `SolverAdapter.visualise`; every other adapter inherits
+`None`, and no generic VTK/VTU support exists by design.
+
+* **Headless only.** `pvbatch` (then `pvpython`) with `--force-offscreen-rendering`; the GUI binary is
+  never used, because the machine is reached over SSH. Not installed → `visualise` returns `None` and
+  the daemon says "ParaView was not found" rather than reporting a failed command.
+* **Not a job.** A render holds no allocation and must not queue behind a week-long run, so
+  `case.render` runs it directly, bounded by a 15-minute timeout (a ParaView with no GL context waits
+  rather than failing).
+* **Output** goes to `postProcessing/dispatch/<kind>-<angle>.png` beside the generated script.
+  Animations are a numbered PNG series — always available, unlike a video encoder — and the script
+  prints the `ffmpeg` command. The only other write is a `.foam` reader stub, reused if one exists.
+  **`log.foam` is excluded explicitly**: it is Dispatch's own log (§6.4) and matches `*.foam`.
+
+**Dimensionality comes from the adapter** (`SolverAdapter.geometry`, default `None` = "cannot tell",
+treated as 3-D). OpenFOAM has no 2-D meshes; a planar case is one cell thick with `empty` front and
+back patches, so `constant/polyMesh/boundary` is read and the answer is exact. Bounds come from
+`blockMeshDict`'s vertices with `scale` applied — never from `polyMesh/points`, which runs to hundreds
+of megabytes.
+
+**The camera** (`paraview.camera_for`, pure) looks at the box centre from a distance derived from the
+bounding *diagonal* with a 15% margin, so no preset can crop the mesh. For a planar case, the plane's
+normal is the thinnest axis (a declared 2-D mesh is routinely a few per cent thick, so no ratio
+threshold applies), and any preset not looking along it — including isometric — is substituted, with
+a note saying so. When the extent cannot be read (snappyHexMesh, imported meshes), the direction is
+still set and ParaView picks the distance; for a planar case without bounds the script itself reads
+the opened mesh's bounds and aims along its thinnest axis, so a 2-D case is never rendered as a line.
+
 ## 9. TUI
 
 Textual, keyboard-only, no mouse bindings registered. The TUI holds **no** authoritative state: it
@@ -1714,6 +1826,56 @@ on depth, so a project sorts above its own sub-cases. Results carry the same "lo
 mark the browser uses, which is the other reason the search runs daemon-side: the mark comes from
 the real adapters.
 
+**Fixed: the search was unusable on a real tree.** Reproduced against `~/projects`: a query for
+`foam` returned 50 results, 47 of them the insides of one matching case (`0.orig`, `4.5200001`,
+`constant`, `processor2`), and the page was marked truncated because real matches had been pushed
+off it. Two causes: the walk treated a case's own subdirectories as projects, and path-only matches
+competed for the same page as name matches. The fix:
+
+* **The walk stops at a case.** `SolverAdapter.case_markers` — stat-only relative paths, declared
+  only where the evidence is unambiguous (`system/controlDict`) — feed
+  `AdapterRegistry.looks_like_case`, about 7 µs a directory against ~470 µs for full detection. A
+  case is yielded but not descended into; on the real tree this cut the walk from 1120 directories
+  to 254. Weak signals (`*.cfg`, `*.c`) are deliberately not markers: a stray file must not prune a
+  subtree.
+* **Cases rank first** (`CASE_BONUS`), and **results are tiered**: name matches and cases inside a
+  matching folder fill the page; non-case path-only matches get only the room left, and never cause
+  a truncation warning.
+* `projects.max_depth` default raised 6 → 8, now that pruning makes the walk cheap.
+
+### 9.7 Force coefficients: plot and dashboard
+
+`postProcessing/forceCoeffs*/<time>/coefficient*.dat` (or the pre-v2012 `forceCoeffs*.dat`) is
+**found by search and ranked by modification time**, never by constructing a path: the directory is
+named by the user, the time directory by the restart (`0.0004319995976` is ordinary), and the
+filename changed spelling and gains `_0` on restart. A candidate must parse to count, so an empty
+file from a just-started function object is passed over. Columns come from the file's own last
+header line; a short trailing row (still being written), malformed fields, `nan` and `inf` are
+dropped. Parsing lives in `adapters/foamcoeffs.py`.
+
+It arrives through a second adapter hook, `case_datasets`, as its own `Dataset` — separate from the
+log's, because a function object writes on its own schedule and row 5 of one is not row 5 of the
+other. The plot screen cycles datasets with `d`; the renderer, axes and legend are the residual
+plot's. `job.series` still returns the log dataset flat, so older clients keep working.
+
+The dashboard's `space` expander calls `job.metrics`, which reads only case datasets — never the log
+— and shows the last values with the **adapter's own labels** (`Cl (lift) +0.49908   Cd (drag)
++0.043677   at time 0.00137`). The TUI knows nothing about lift. It fetches on expand only, never on a
+timer.
+
+### 9.8 Case information
+
+`i` — on a directory in the submit browser, or on a job anywhere else — opens a full description.
+The adapter produces it (`SolverAdapter.describe_case` → `core.caseinfo.CaseReport` of titled
+sections of pre-formatted fields) and the screen only lays it out, so a second solver gets the page
+by implementing one method. OpenFOAM reports solver, time control, latest written time, output
+control, mesh counts (from the `owner` header note), dimensionality, extent, boundary patches with
+face counts, fields with their dimension vectors, decomposition, force coefficients and function
+objects, plus warnings (case not set up; decomposition disagreeing with `decomposeParDict`). The
+daemon appends what is Dispatch's rather than the solver's: git state through the provenance
+collector's own probe, and the jobs Dispatch has run in that directory. Missing sources produce a
+section saying what is missing rather than vanishing. `dispatch case <path>` prints the same report.
+
 ### 9.6 Terminal plotting
 
 Select a job, press `p`, and choose what to put on each axis:
@@ -1816,7 +1978,7 @@ Idle CPU: two heartbeat wakeups per minute with no clients and no jobs. Measurab
 
 ## 12. Testing strategy
 
-`pytest` + `pytest-asyncio` + `coverage`. 727 tests, about ten seconds, and none of it
+`pytest` + `pytest-asyncio` + `coverage`. 1007 tests, about ten seconds, and none of it
 requires OpenFOAM, SU2, Basilisk, CalculiX, CUDA, PyTorch, TensorFlow, or JAX to be
 installed. Adapters are tested by asserting on the command lists and environments they
 produce; GPUs are a configured integer; solver logs are fixtures.
@@ -2064,6 +2226,43 @@ sixel, kitty graphics — was excluded by requirement and is also simply wrong f
 machine is headless and reached over SSH, and a picture that some terminals cannot show is not a
 plot. The braille/blocks toggle exists because font support for braille is good but not universal.
 
+**13.28 A repartition is a pending request plus existing edges, not a PAUSED state.**
+A PAUSED state would need a scheduler rule, a ledger mode for "allocated but not running", a
+recovery path and a UI for each. Instead the job stays RUNNING until the solver's own clean stop
+writes a timestep, then takes the RUNNING → QUEUED edge reboot resume already uses, with its core
+count rewritten in the same statement. Rejected also: signalling the solver (corrupts the timestep),
+and resizing in place (MPI rank counts are fixed at launch).
+
+**13.29 Continuing from the latest time reuses the resume path, with its own sticky flag.**
+Reusing `resume_requested` would have made the history call a deliberate setting a reboot, and the
+flag would have been cleared after one restart. A second, independent mechanism for writing
+`startFrom latestTime` would have been a second thing to restore. One edit, two reasons, both
+flowing into `CaseContext.resume`.
+
+**13.30 Search prunes at cases using declared, stat-only markers.**
+Full detection per directory made the walk ~70× slower; heuristics on directory names (skip numeric
+names, skip `processor*`) would have put solver knowledge in the daemon and failed the
+architecture test. Adapters declare what a case root looks like; the daemon asks.
+
+**13.31 Case datasets are separate from the log dataset.**
+Merging coefficients into the log's `PlotData` would have shared one sample index across sources
+written on different schedules, and `align` would then pair a residual with a lift coefficient from a
+different moment. Separate datasets cost a key in the plot screen.
+
+**13.32 Rendering is adapter-specific, headless, and returns a plan.**
+A generic visualisation layer for one renderer and one solver would be abstraction on credit. A GUI
+or display-dependent path would not work on the target machine. Running the render as a scheduled
+job was rejected because it holds no allocation and must not queue behind simulations.
+
+**13.33 Plan previews are marked, and adapters guard their edits.**
+`plan()` may write into a case (§8.1), which was fine for runs and wrong for previews; the
+`startFrom` edit made it unsafe, since a preview never reaches `finalize`. `CaseContext.dry_run`
+costs one field and fixed a pre-existing `decomposeParDict` write as a side effect.
+
+**13.34 CPU mode counts available CPUs and never pins.**
+Using `os.cpu_count()` would schedule against hardware a cgroup forbids; exposing CPU ids would invite
+treating them as a dense range. Manual affinity is out of scope.
+
 ---
 
 ## 14. Implementation roadmap
@@ -2081,6 +2280,7 @@ Each phase ends with tests passing and something demonstrable.
 | **6** | `BasiliskAdapter` | **Done** — compile-then-run proves the plan abstraction; verified by plan assertions (see §14.2) |
 | **7** | Packaging | **Done** — systemd unit, `uv build`, README, install docs |
 | **8+** | `CalculiXAdapter` | **Done** — New adapter, zero scheduler changes — the thesis, verified |
+| **10** | Sweep continue-from-latest, pause-and-recore, CPU mode, case info, force coefficients, ParaView renders, search fix | **Done** — schema 006; one migration, no new job state |
 | **9** | Working-directory logs, CPU/GPU resources, ML + PINN adapters, project search, terminal plotting | **Done** — schema 004; two adapters added with no daemon change; `p` plots a residual history over SSH |
 
 Phase 2b is the risk concentration: process supervision, exit-code durability, and recovery are

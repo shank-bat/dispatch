@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from dispatch.adapters.base import CaseContext, SolverAdapter
@@ -83,6 +84,8 @@ class CaseInspector:
         entry: Path | None = None,
         job_name: str = "",
         build_plan: bool = True,
+        start_from_latest: bool = False,
+        dry_run: bool = False,
     ) -> InspectionResult:
         """Detect, validate, and optionally plan, touching nothing.
 
@@ -113,6 +116,8 @@ class CaseInspector:
             gpus=gpus,
             entry=entry or chosen.entry,
             job_name=job_name,
+            start_from_latest=start_from_latest,
+            dry_run=dry_run,
         )
 
         report = self._validate(adapter, ctx)
@@ -145,8 +150,14 @@ class CaseInspector:
         solver: str | None = None,
         entry: Path | None = None,
         job_name: str = "",
+        start_from_latest: bool = False,
     ) -> DryRunReport:
-        """Produce the full report ``--dry-run`` prints. Nothing is created or started."""
+        """Produce the full report ``--dry-run`` prints. Nothing is created or started.
+
+        ``dry_run=True`` on the context is what makes the last sentence true of the *case*
+        as well as of the database: an adapter that would write configuration while planning
+        is asked to describe the write instead of performing it.
+        """
         from dispatch.core.models import ResourceRequest
 
         request = ResourceRequest.build(
@@ -161,6 +172,8 @@ class CaseInspector:
             entry=entry,
             job_name=job_name,
             build_plan=True,
+            start_from_latest=start_from_latest,
+            dry_run=True,
         )
         assert result.detection is not None and result.context is not None
 
@@ -256,6 +269,8 @@ class CaseInspector:
         gpus: int,
         entry: Path | None,
         job_name: str,
+        start_from_latest: bool = False,
+        dry_run: bool = False,
     ) -> CaseContext:
         base = self._registry.context(
             workdir,
@@ -266,17 +281,21 @@ class CaseInspector:
             env=dict(os.environ),
             adapter=solver,
             job_name=job_name,
+            cpu_mode=self._resources.cpu_mode.value,
         )
         try:
             env = adapter.prepare_environment(base)
         except Exception as exc:
             log.warning("Adapter %s could not prepare its environment: %s", solver, exc)
-            return base
+            return replace(base, resume=start_from_latest, dry_run=dry_run)
         return CaseContext(
             workdir=base.workdir,
             cores=base.cores,
             ram_mb=base.ram_mb,
             gpus=base.gpus,
+            cpu_mode=base.cpu_mode,
+            resume=start_from_latest,
+            dry_run=dry_run,
             entry=base.entry,
             env=dict(env),
             settings=base.settings,
@@ -319,14 +338,12 @@ class CaseInspector:
 
 
 def _with_metadata(ctx: CaseContext, metadata: CaseMetadata) -> CaseContext:
-    return CaseContext(
-        workdir=ctx.workdir,
-        cores=ctx.cores,
-        ram_mb=ctx.ram_mb,
-        gpus=ctx.gpus,
-        entry=ctx.entry,
-        env=ctx.env,
-        settings=ctx.settings,
-        job_name=ctx.job_name,
-        metadata=metadata,
-    )
+    """The same context, carrying the metadata that was just collected.
+
+    ``replace`` rather than a fresh ``CaseContext(...)`` listing every field: the
+    hand-written version silently dropped whatever had been added to the context since it
+    was written -- ``resume`` and ``cpu_mode`` were both being lost here -- and each loss
+    showed up only as a dry run disagreeing with the real plan. A copy cannot forget a
+    field it does not name.
+    """
+    return replace(ctx, metadata=metadata)

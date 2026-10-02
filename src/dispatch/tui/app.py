@@ -26,6 +26,7 @@ from dispatch.core.config import Config, load_config
 from dispatch.core.errors import DispatchError
 from dispatch.ipc.client import DaemonClient
 from dispatch.ipc.protocol import Event, Method, Notification, Topic
+from dispatch.tui.screens.caseinfo import CaseInfoScreen
 from dispatch.tui.screens.dashboard import DashboardScreen
 from dispatch.tui.screens.help import HelpScreen
 from dispatch.tui.screens.history import HistoryScreen
@@ -226,6 +227,15 @@ class DispatchApp(App[None]):
     def open_logs(self, job_id: str) -> None:
         """Open the live log viewer for a job."""
         self.push_screen(LogScreen(job_id))
+
+    def open_case_info(self, *, path: str | None = None, job_id: str | None = None) -> None:
+        """Open the case information view, for a directory or for a job's directory.
+
+        On the app rather than on each screen because ``i`` means the same thing from the
+        browser, the dashboard, the queue and the history, and four copies of one push would
+        drift.
+        """
+        self.push_screen(CaseInfoScreen(path, job_id=job_id))
 
     def open_plot(self, job_id: str) -> None:
         """Open the plot view for a job.

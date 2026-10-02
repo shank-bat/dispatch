@@ -31,14 +31,20 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
-from dispatch.adapters.base import CaseContext
+from dispatch.adapters.base import CaseContext, SolverAdapter
 from dispatch.adapters.registry import AdapterRegistry
 from dispatch.core.config import PlotConfig
 from dispatch.core.models import Job
-from dispatch.core.series import PlotData, downsample
+from dispatch.core.series import Dataset, PlotData, downsample
 
-__all__ = ["extract_series", "read_log"]
+__all__ = [
+    "extract_datasets",
+    "extract_series",
+    "latest_case_values",
+    "read_log",
+]
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +82,137 @@ def read_log(path: Path, limit: int) -> tuple[str, bool]:
     return data.decode("utf-8", errors="replace"), truncated
 
 
+def _context(job: Job) -> CaseContext:
+    """The case context a read-only adapter query runs under.
+
+    Built here rather than at each call site so the two consumers -- plotting and the
+    dashboard's latest-value peek -- cannot disagree about which case they are asking about.
+    """
+    return CaseContext(
+        workdir=job.workdir,
+        cores=job.cores,
+        ram_mb=job.ram_estimate_mb,
+        gpus=job.gpus,
+        env=dict(os.environ),
+        job_name=job.name,
+        metadata=job.metadata,
+        dry_run=True,
+    )
+
+
+def _adapter(job: Job, registry: AdapterRegistry) -> SolverAdapter | None:
+    """The adapter that ran a job, or ``None`` if it is no longer installed.
+
+    History outlives adapters: a job run by a plugin that has since been removed is still in
+    the database and still openable, it simply has nothing to plot.
+    """
+    try:
+        return registry.get(job.solver)
+    except Exception as exc:
+        log.debug("No adapter %r for job %s: %s", job.solver, job.id[:8], exc)
+        return None
+
+
+def extract_datasets(
+    job: Job, *, registry: AdapterRegistry, config: PlotConfig
+) -> list[Dataset]:
+    """Everything plottable about a job: its log, and the files its case writes.
+
+    Two sources, kept as separate datasets, because their rows do not correspond. See
+    :class:`~dispatch.core.series.Dataset`.
+
+    Never raises, for the same reason :func:`extract_series` does not: a chart that will not
+    open is a fine outcome, and a traceback out of a keypress is not.
+    """
+    datasets: list[Dataset] = []
+
+    from_log = extract_series(job, registry=registry, config=config)
+    if from_log:
+        datasets.append(
+            Dataset(
+                key="log",
+                label="Solver log",
+                data=from_log,
+                source=str(job.output_path) if job.output_path else None,
+            )
+        )
+
+    adapter = _adapter(job, registry)
+    if adapter is None:
+        return datasets
+
+    try:
+        extra = adapter.case_datasets(_context(job))
+    except Exception:
+        log.exception("Adapter %s failed reading case datasets for %s", job.solver, job.id[:8])
+        return datasets
+
+    for dataset in extra:
+        if not dataset:
+            continue
+        datasets.append(
+            Dataset(
+                key=dataset.key,
+                label=dataset.label,
+                data=PlotData(
+                    series=tuple(
+                        downsample(item, config.max_points)
+                        for item in dataset.data.series
+                        if len(item)
+                    ),
+                    samples=dataset.data.samples,
+                    truncated=dataset.data.truncated,
+                ),
+                source=dataset.source,
+            )
+        )
+    return datasets
+
+
+def latest_case_values(job: Job, *, registry: AdapterRegistry) -> dict[str, Any]:
+    """The final value of every series in every case dataset, keyed by dataset.
+
+    The cheap question behind the dashboard's expander: "what is the lift right now?" It
+    deliberately does **not** read the log, which is the expensive half of
+    :func:`extract_datasets` and holds nothing a one-line summary wants.
+
+    Each value carries the **adapter's own label** and the adapter's own ordering. That is
+    what lets the interface render ``Cl (lift) +0.714`` without knowing that lift exists:
+    the names and their order are solver knowledge, and solver knowledge belongs to the
+    adapter (§3). The axis series is flagged rather than dropped, so a reader can be told
+    *when* the values are from.
+    """
+    adapter = _adapter(job, registry)
+    if adapter is None:
+        return {}
+    try:
+        datasets = adapter.case_datasets(_context(job))
+    except Exception:
+        log.exception("Adapter %s failed reading case datasets for %s", job.solver, job.id[:8])
+        return {}
+
+    latest: dict[str, Any] = {}
+    for dataset in datasets:
+        values = [
+            {
+                "key": item.key,
+                "label": item.display,
+                "value": item.values[-1],
+                "axis": item.axis,
+            }
+            for item in dataset.data.series
+            if item.values
+        ]
+        if values:
+            latest[dataset.key] = {
+                "label": dataset.label,
+                "source": dataset.source,
+                "samples": dataset.data.samples,
+                "values": values,
+            }
+    return latest
+
+
 def extract_series(
     job: Job, *, registry: AdapterRegistry, config: PlotConfig
 ) -> PlotData:
@@ -102,23 +239,11 @@ def extract_series(
     if not text.strip():
         return PlotData(truncated=truncated)
 
-    try:
-        adapter = registry.get(job.solver)
-    except Exception as exc:
-        # History outlives adapters: a job run by a plugin that has since been uninstalled
-        # is still in the database and still openable, it simply has nothing to plot.
-        log.debug("No adapter %r to parse job %s: %s", job.solver, job.id[:8], exc)
+    adapter = _adapter(job, registry)
+    if adapter is None:
         return PlotData(truncated=truncated)
 
-    ctx = CaseContext(
-        workdir=job.workdir,
-        cores=job.cores,
-        ram_mb=job.ram_estimate_mb,
-        gpus=job.gpus,
-        env=dict(os.environ),
-        job_name=job.name,
-        metadata=job.metadata,
-    )
+    ctx = _context(job)
     try:
         data = adapter.parse_series(text, ctx)
     except Exception:

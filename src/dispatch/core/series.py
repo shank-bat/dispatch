@@ -31,7 +31,14 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-__all__ = ["PlotData", "Series", "align", "downsample", "series_from_records"]
+__all__ = [
+    "Dataset",
+    "PlotData",
+    "Series",
+    "align",
+    "downsample",
+    "series_from_records",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +133,39 @@ class PlotData:
     def others(self) -> Sequence[Series]:
         """Everything else -- the quantities usually wanted on Y."""
         return tuple(item for item in self.series if not item.axis)
+
+
+@dataclass(frozen=True, slots=True)
+class Dataset:
+    """One named group of series that share a sample index.
+
+    A job has more than one source of numbers, and they are **not** interchangeable. A
+    solver's log records one row per time step; a function object's output file records one
+    row per *write*, which may be every tenth step or every tenth second. Both are plottable
+    and neither can be paired with the other by position, because sample 5 of one is not
+    sample 5 of the other.
+
+    Keeping them in separate datasets is what makes :func:`align` honest. Merging them into
+    one :class:`PlotData` would put two different meanings of "sample 5" into one index and
+    silently plot a residual against a lift coefficient from a different moment.
+
+    Attributes:
+        key: Stable identifier, e.g. ``log`` or ``forceCoeffs``. Used to remember a choice.
+        label: What to show a human.
+        data: The series themselves.
+        source: Where it was read from, for a user who wants to know which file this is.
+    """
+
+    key: str
+    label: str
+    data: PlotData
+    source: str | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.data)
+
+    def __len__(self) -> int:
+        return len(self.data)
 
 
 def align(x: Series, y: Series) -> tuple[tuple[float, ...], tuple[float, ...]]:

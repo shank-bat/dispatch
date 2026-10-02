@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Final
 
+from dispatch.core.caseinfo import CaseReport
 from dispatch.core.metadata import MetadataSpec
 from dispatch.core.models import (
     Job,
@@ -31,7 +32,7 @@ from dispatch.core.models import (
 )
 from dispatch.core.plan import DryRunReport, ExecutionPlan
 from dispatch.core.provenance import Provenance
-from dispatch.core.series import PlotData, Series
+from dispatch.core.series import Dataset, PlotData, Series
 from dispatch.core.validation import ValidationReport
 
 __all__ = [
@@ -77,6 +78,12 @@ class Method(StrEnum):
     JOB_NOTE = "job.note"
     JOB_TAG = "job.tag"
     JOB_PROVENANCE = "job.provenance"
+    JOB_METRICS = "job.metrics"
+    """Latest values from a case's own output files, for a compact summary (§9.7)."""
+
+    JOB_REPARTITION = "job.repartition"
+    """Stop a running job at its next write and resume it on a different core count (§6.13)."""
+
     JOB_SERIES = "job.series"
     """Plottable numerical series read out of a job's own output (§9.6)."""
 
@@ -91,6 +98,12 @@ class Method(StrEnum):
 
     CASE_DETECT = "case.detect"
     CASE_VALIDATE = "case.validate"
+    CASE_RENDER = "case.render"
+    """Render a picture of a case -- a mesh screenshot or an animation (§8.10)."""
+
+    CASE_INFO = "case.info"
+    """A full human-readable description of a case directory (§9.8)."""
+
     CASE_DRYRUN = "case.dryrun"
     FS_LIST = "fs.list"
     PROJECTS_SEARCH = "projects.search"
@@ -215,6 +228,8 @@ def encode_job(job: Job, *, queue_position: int | None = None) -> dict[str, Any]
         "sweep_id": job.sweep_id,
         "sweep_position": job.sweep_position,
         "resume_requested": job.resume_requested,
+        "start_from_latest": job.start_from_latest,
+        "repartition_cores": job.repartition_cores,
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
@@ -246,6 +261,8 @@ def encode_snapshot(snapshot: SystemSnapshot) -> dict[str, Any]:
         "allocated_cores": snapshot.allocated_cores,
         "reserved_cores": snapshot.reserved_cores,
         "free_cores": snapshot.free_cores,
+        "cpu_mode": snapshot.cpu_mode,
+        "core_unit": snapshot.core_unit,
         "total_gpus": snapshot.total_gpus,
         "allocated_gpus": snapshot.allocated_gpus,
         "free_gpus": snapshot.free_gpus,
@@ -381,12 +398,52 @@ def encode_series(series: Series) -> dict[str, Any]:
     }
 
 
+def encode_dataset(dataset: Dataset) -> dict[str, Any]:
+    """Render one named group of series."""
+    return {
+        "key": dataset.key,
+        "label": dataset.label,
+        "source": dataset.source,
+        **encode_plot_data(dataset.data),
+    }
+
+
 def encode_plot_data(data: PlotData) -> dict[str, Any]:
     """Render everything plottable that was found in one job's output."""
     return {
         "series": [encode_series(item) for item in data.series],
         "samples": data.samples,
         "truncated": data.truncated,
+    }
+
+
+def encode_case_report(report: CaseReport) -> dict[str, Any]:
+    """Render a case description for the wire.
+
+    Already-formatted strings throughout. The adapter decided how to render its own numbers,
+    because it is the one that knows what they are; re-deriving a format here would mean the
+    interface guessing at units.
+    """
+    return {
+        "title": report.title,
+        "solver": report.solver,
+        "warnings": list(report.warnings),
+        "sections": [
+            {
+                "title": section.title,
+                "missing": section.missing,
+                "fields": [
+                    {
+                        "label": item.label,
+                        "value": item.value,
+                        "note": item.note,
+                        "important": item.important,
+                    }
+                    for item in section.fields
+                ],
+            }
+            for section in report.present
+        ],
     }
 
 
@@ -402,6 +459,7 @@ def encode_project_hit(hit: Any) -> dict[str, Any]:
         "relative": hit.relative,
         "score": hit.score,
         "depth": hit.depth,
+        "is_case": getattr(hit, "is_case", False),
     }
 
 
@@ -443,6 +501,7 @@ def encode_sweep(sweep: Sweep) -> dict[str, Any]:
         "solver": sweep.solver,
         "cores_per_job": sweep.cores_per_job,
         "concurrency": sweep.concurrency,
+        "start_from_latest": sweep.start_from_latest,
         "created_at": sweep.created_at,
         "total": sweep.total,
         "running": sweep.running,

@@ -64,9 +64,12 @@ class ResourceMeters(Static):
         total_ram = int(data.get("total_ram_mb", 0)) or 1
 
         text = Text()
+        # "cores" or "threads": the ledger's own unit, never guessed here. A machine
+        # scheduling SMT threads that said "cores" would be quietly lying about the one
+        # number every admission decision is made against (§4.3.2).
         _field(
             text,
-            "cores",
+            "threads" if data.get("cpu_mode") == "logical" else "cores",
             f"{allocated}/{total}",
             allocated / total,
             note=f"{free} free",

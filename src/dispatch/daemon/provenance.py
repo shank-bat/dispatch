@@ -81,7 +81,7 @@ class ProvenanceCollector:
             A record with nulls wherever a probe failed. Never raises.
         """
         machine = self._machine_facts()
-        git_info = await self._git_info(ctx.workdir, warn=warn)
+        git_info = await self.git_info(ctx.workdir, warn=warn)
         solver_version = self._solver_version(adapter, ctx, warn=warn)
         declared = tuple(getattr(adapter, "env_keys", ()) or ())
 
@@ -143,7 +143,7 @@ class ProvenanceCollector:
 
     # -- git ------------------------------------------------------------------------------------
 
-    async def _git_info(self, workdir: Path, *, warn: object) -> GitInfo:
+    async def git_info(self, workdir: Path, *, warn: object = None) -> GitInfo:
         """Read the case directory's version-control state.
 
         The *case*, not Dispatch: six months later the question is what the case looked
