@@ -10,6 +10,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Input, Static
 
+from dispatch.ipc.client import RemoteError
 from dispatch.ipc.protocol import Method
 from dispatch.tui.screens.base import DispatchScreen, run_when_confirmed
 from dispatch.tui.state import sweep_summary
@@ -172,17 +173,36 @@ class QueueScreen(DispatchScreen):
         except ValueError:
             self.notify_error(f"{value!r} is not a number")
             return
+        await self._recore(job, cores, force=False)
+
+    async def _recore(self, job: dict[str, Any], cores: int, *, force: bool) -> None:
         try:
             result = await self.dispatch_app.call(
-                Method.JOB_REPARTITION, id=job["id"], cores=cores
+                Method.JOB_REPARTITION, id=job["id"], cores=cores, force=force
             )
+        except RemoteError as exc:
+            # A waiting job is validated on its new count, as a submission is. The user may
+            # know better than the validator, so a failure is a question rather than a wall.
+            if not force and "validation" in (exc.detail or {}):
+                run_when_confirmed(
+                    self,
+                    f"Re-core {job['name']} anyway?",
+                    lambda: self.app.call_later(self._recore, job, cores, force=True),
+                    detail=str(exc),
+                )
+                return
+            self.notify_error(str(exc))
+            return
         except Exception as exc:
             self.notify_error(str(exc))
             return
-        self.notify_ok(
-            f"{job['name']} will finish its timestep, then requeue on "
-            f"{result['cores']} {self._unit(int(result['cores']))}"
-        )
+        unit = self._unit(int(result["cores"]))
+        if result.get("pausing"):
+            self.notify_ok(
+                f"{job['name']} will finish its timestep, then requeue on {result['cores']} {unit}"
+            )
+        else:
+            self.notify_ok(f"{job['name']} will start on {result['cores']} {unit}")
 
     def _unit(self, count: int) -> str:
         """``cores`` or ``threads``, matching what the daemon is actually counting."""
@@ -190,17 +210,23 @@ class QueueScreen(DispatchScreen):
         return unit if count == 1 else f"{unit}s"
 
     def action_repartition(self) -> None:
-        """Pause a running job at its next write and resume it on a different core count."""
+        """Change a job's core count.
+
+        A waiting job changes at once -- it has not been decomposed or started, and will be
+        prepared for the new count when it is admitted. A running job is paused at its next
+        write and resumed on the new count.
+        """
         job = self._selected()
         if job is None:
             return
-        if job["state"] not in ("RUNNING", "PREPARING"):
-            self.notify_error("Only a running job can be paused and re-cored.")
+        if job["state"] in ("RUNNING", "PREPARING"):
+            question = f"resume {job['name']} on how many {self._unit(2)}?"
+        elif job["state"] in ("QUEUED", "HELD"):
+            question = f"start {job['name']} on how many {self._unit(2)}?"
+        else:
+            self.notify_error("Only a waiting or running job can be re-cored.")
             return
-        self._open_prompt(
-            "repartition",
-            f"resume {job['name']} on how many {self._unit(2)}? (now {job['cores']})",
-        )
+        self._open_prompt("repartition", f"{question} (now {job['cores']})")
 
     def action_cancel(self) -> None:
         job = self._selected()

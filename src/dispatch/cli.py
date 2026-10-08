@@ -142,10 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     repartition = sub.add_parser(
         "repartition",
-        help="pause a running job at its next write and resume it on a new core count",
+        help="change a job's core count: at once if queued, at its next write if running",
     )
     repartition.add_argument("id", help="job id, or a unique prefix of one")
-    repartition.add_argument("cores", type=int, help="cores to resume with")
+    repartition.add_argument("cores", type=int, help="cores to run (or resume) with")
+    repartition.add_argument(
+        "--force", action="store_true", help="change a queued job even if validation fails"
+    )
 
     priority = sub.add_parser("priority", help="change a job's priority")
     priority.add_argument("id")
@@ -668,9 +671,17 @@ async def _release(client: DaemonClient, args: Any, console: Any, config: Config
 
 
 async def _repartition(client: DaemonClient, args: Any, console: Any, config: Config) -> int:
-    """Pause a run at its next write and bring it back on a different core count."""
-    result = await client.call(Method.JOB_REPARTITION, id=args.id, cores=args.cores)
+    """Change a job's core count, pausing it at its next write if it is running."""
+    result = await client.call(
+        Method.JOB_REPARTITION, id=args.id, cores=args.cores, force=args.force
+    )
     job = result["job"]
+    if not result.get("pausing"):
+        console.print(
+            f"[green]Re-cored[/green] {job['name']}: it will start on {result['cores']} core(s)"
+        )
+        _print_findings(console, result.get("validation"))
+        return 0
     console.print(
         f"[yellow]Pausing[/yellow] {job['name']} at its next write; it will requeue on "
         f"{result['cores']} core(s)"

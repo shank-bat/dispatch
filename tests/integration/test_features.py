@@ -781,16 +781,106 @@ async def test_a_solver_with_no_clean_stop_is_refused(
     await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
 
 
-async def test_a_queued_job_cannot_be_paused(client: DaemonClient, tmp_path: Path) -> None:
-    blocker = await submit(
-        client, make_case(tmp_path / "blocker", script="sleep 30"), cores=8
-    )
+async def blocked(client: DaemonClient, tmp_path: Path, **params) -> tuple[dict, dict]:
+    """A running eight-core job, and a job queued behind it that cannot start yet."""
+    blocker = await submit(client, make_case(tmp_path / "blocker", script="sleep 30"), cores=8)
     await await_state(client, blocker["id"], JobState.RUNNING.value)
-    waiting = await submit(client, make_case(tmp_path / "waiting"), cores=8)
+    waiting = await submit(client, make_case(tmp_path / "waiting", **params), cores=8)
+    return blocker, waiting
 
-    with pytest.raises(RemoteError, match="not running"):
-        await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=2)
+
+async def test_a_queued_job_is_re_cored_at_once(client: DaemonClient, tmp_path: Path) -> None:
+    """Nothing to pause: it has not started, so the new count is simply what it starts on."""
+    blocker, waiting = await blocked(client, tmp_path)
+    result = await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=4)
+
+    assert result["pausing"] is False
+    assert result["job"]["state"] == "QUEUED"
+    assert result["job"]["cores"] == 4
+    assert result["job"]["repartition_cores"] is None, "no pending pause is recorded"
     await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+
+async def test_a_re_cored_job_starts_on_its_new_count(
+    daemon: Daemon, client: DaemonClient, tmp_path: Path
+) -> None:
+    blocker, waiting = await blocked(client, tmp_path, script="sleep 30")
+    await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=3)
+    await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+    await await_state(client, waiting["id"], JobState.RUNNING.value)
+    assert daemon.resources.allocated_cores == 3
+    await client.call(Method.JOB_CANCEL, id=waiting["id"], force=True)
+
+
+async def test_shrinking_a_queued_job_can_let_it_start_now(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """Four of eight cores busy: an eight-core job waits, and on four it starts at once."""
+    blocker = await submit(client, make_case(tmp_path / "half", script="sleep 30"), cores=4)
+    await await_state(client, blocker["id"], JobState.RUNNING.value)
+    waiting = await submit(client, make_case(tmp_path / "big", script="sleep 30"), cores=8)
+    await asyncio.sleep(0.2)
+    assert (await client.call(Method.JOB_GET, id=waiting["id"]))["job"]["state"] == "QUEUED"
+
+    await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=4)
+    await await_state(client, waiting["id"], JobState.RUNNING.value)
+    for job in (blocker, waiting):
+        await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
+
+
+async def test_a_held_job_can_be_re_cored(client: DaemonClient, tmp_path: Path) -> None:
+    blocker, waiting = await blocked(client, tmp_path)
+    await client.call(Method.JOB_HOLD, id=waiting["id"])
+    result = await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=2)
+    assert result["job"]["state"] == "HELD" and result["job"]["cores"] == 2
+    await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+
+async def test_a_queued_job_keeps_its_place_when_re_cored(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    blocker, first = await blocked(client, tmp_path)
+    second = await submit(client, make_case(tmp_path / "second"), cores=8)
+    await client.call(Method.JOB_REPARTITION, id=first["id"], cores=6)
+
+    listing = await client.call(Method.JOB_LIST, states=["QUEUED"])
+    order = [job["id"] for job in sorted(listing["items"], key=lambda j: j["queue_position"])]
+    assert order == [first["id"], second["id"]]
+    await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+
+async def test_re_coring_a_queued_job_validates_the_new_count(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    """As a submission would. Forcing it through is still possible."""
+    blocker, waiting = await blocked(client, tmp_path)
+    (Path(waiting["workdir"]) / "invalid").touch()
+
+    with pytest.raises(RemoteError, match="does not pass validation") as excinfo:
+        await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=2)
+    assert excinfo.value.detail and "validation" in excinfo.value.detail
+    assert (await client.call(Method.JOB_GET, id=waiting["id"]))["job"]["cores"] == 8
+
+    forced = await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=2, force=True)
+    assert forced["job"]["cores"] == 2
+    await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+
+async def test_re_coring_a_queued_job_beyond_the_machine_is_refused(
+    client: DaemonClient, tmp_path: Path
+) -> None:
+    blocker, waiting = await blocked(client, tmp_path)
+    with pytest.raises(RemoteError, match="can never be scheduled"):
+        await client.call(Method.JOB_REPARTITION, id=waiting["id"], cores=64)
+    await client.call(Method.JOB_CANCEL, id=blocker["id"], force=True)
+
+
+async def test_a_finished_job_cannot_be_re_cored(client: DaemonClient, tmp_path: Path) -> None:
+    job = await submit(client, make_case(tmp_path / "done"), cores=2)
+    await await_state(client, job["id"], JobState.COMPLETED.value)
+    with pytest.raises(RemoteError, match="completed"):
+        await client.call(Method.JOB_REPARTITION, id=job["id"], cores=4)
 
 
 async def test_resizing_to_more_cores_than_exist_is_refused(
@@ -813,7 +903,7 @@ async def test_resizing_to_the_same_count_is_refused(
     job = await submit(client, case, cores=3)
     await await_state(client, job["id"], JobState.RUNNING.value)
 
-    with pytest.raises(RemoteError, match="already running on 3"):
+    with pytest.raises(RemoteError, match="already set to 3"):
         await client.call(Method.JOB_REPARTITION, id=job["id"], cores=3)
     await client.call(Method.JOB_CANCEL, id=job["id"], force=True)
 

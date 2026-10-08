@@ -708,6 +708,39 @@ class JobRepository:
             )
         return self.get(job_id)
 
+    def set_waiting_cores(self, job_id: str, cores: int) -> Job:
+        """Change the core count of a job that has not started (§6.13).
+
+        No pause is needed: nothing has run, and no allocation is held. The plan, including
+        any decomposition, is built from :attr:`Job.cores` when the job is admitted, so
+        changing the number now is all it takes. A case that has never been decomposed, or
+        one decomposed for a different count, is decomposed for the new count then.
+
+        The job keeps its ``seq``, and with it its place in the queue.
+
+        Raises:
+            JobNotFound: If no such job exists.
+            ValidationError: If the job is no longer waiting, or the count is not positive.
+        """
+        if cores < 1:
+            raise ValidationError(f"A job needs at least one core, got {cores}")
+        with transaction(self._conn):
+            # The state is checked in the statement itself, so a job admitted in between
+            # cannot be given a core count different from the allocation it now holds.
+            cursor = self._conn.execute(
+                "UPDATE jobs SET cores = ? WHERE id = ? AND state IN ('QUEUED', 'HELD')",
+                (cores, job_id),
+            )
+            if cursor.rowcount != 1:
+                job = self.get(job_id)
+                raise ValidationError(
+                    f"{job.name} is {job.state.value.lower()}, not waiting to start"
+                )
+            self._append_event(
+                job_id, "note", f"core count changed to {cores} before starting", self._clock.now()
+            )
+        return self.get(job_id)
+
     def cancel_repartition(self, job_id: str) -> Job:
         """Withdraw a pending core change, leaving the run alone.
 

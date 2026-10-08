@@ -1335,3 +1335,161 @@ async def test_the_end_of_a_render_is_announced_wherever_the_user_is(
         await pilot.pause()
     assert "r1" not in app.state.renders
     assert any(expected in message and level == severity for message, level in said)
+
+
+# -- re-coring a waiting job, and reading a plot closely -------------------------------------
+
+
+async def open_queue(app: DispatchApp, pilot: Any, jobs: list[dict]) -> Any:
+    from dispatch.tui.screens.queue import QueueScreen
+
+    app.state.replace_jobs(jobs)
+    screen = QueueScreen()
+    await app.push_screen(screen)
+    await pilot.pause()
+    screen.refresh_view()
+    await pilot.pause()
+    return screen
+
+
+@pytest.mark.parametrize("state", ["QUEUED", "HELD"])
+async def test_a_waiting_job_can_be_re_cored_from_the_queue(
+    offline_config: Config, state: str
+) -> None:
+    recored = {"job": job("w", state=state, cores=2), "pausing": False, "cores": 2}
+    replies: dict[str, Any] = {Method.JOB_REPARTITION: recored}
+    app = recording_app(offline_config, replies)
+    async with app.run_test() as pilot:
+        await open_queue(app, pilot, [job("w", state=state, position=1, cores=8)])
+        await pilot.press("c")
+        await pilot.pause()
+        from textual.widgets import Input
+
+        prompt = app.screen.query_one("#prompt", Input)
+        assert "start" in str(prompt.placeholder), "a waiting job is started, not resumed"
+        await pilot.press("2", "enter")
+        await pilot.pause()
+    assert calls_to(app, Method.JOB_REPARTITION) == [{"id": "w", "cores": 2, "force": False}]
+
+
+async def test_a_failed_validation_offers_to_re_core_anyway(offline_config: Config) -> None:
+    from dispatch.ipc.client import RemoteError
+    from dispatch.tui.screens.base import ConfirmScreen
+
+    refusal = RemoteError("VALIDATION", "does not pass validation", {"validation": {}})
+    replies: dict[str, Any] = {Method.JOB_REPARTITION: refusal}
+    app = recording_app(offline_config, replies)
+    async with app.run_test() as pilot:
+        await open_queue(app, pilot, [job("w", position=1, cores=8)])
+        await pilot.press("c", "2", "enter")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmScreen)
+
+        replies[Method.JOB_REPARTITION] = {"job": job("w", cores=2), "pausing": False, "cores": 2}
+        await pilot.press("y")
+        await pilot.pause()
+    assert calls_to(app, Method.JOB_REPARTITION)[-1] == {"id": "w", "cores": 2, "force": True}
+
+
+async def test_a_finished_job_cannot_be_re_cored_from_the_queue(offline_config: Config) -> None:
+    app = recording_app(offline_config, {})
+    async with app.run_test() as pilot:
+        await open_queue(app, pilot, [job("done", state="COMPLETED", finished_at=1.0)])
+        await pilot.press("c")
+        await pilot.pause()
+        assert not app.screen.query_one("#prompt").has_class("visible")
+
+
+LIFT = {
+    "name": "wing",
+    "samples": 6,
+    "series": [
+        {"key": "iter", "label": "Iteration", "values": [0, 100, 200, 300, 400, 500],
+         "samples": [0, 1, 2, 3, 4, 5], "axis": True},
+        {"key": "Cl", "label": "Cl", "values": [9.0, 0.1, 0.3, 0.38, 0.41, 0.42],
+         "samples": [0, 1, 2, 3, 4, 5]},
+    ],
+}
+
+
+async def open_plot(offline_config: Config, keys: list[str]) -> Any:
+    from dispatch.tui.screens.plot import PlotScreen
+
+    app = recording_app(offline_config, {Method.JOB_SERIES: LIFT})
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = PlotScreen("wing")
+        await app.push_screen(screen)
+        await pilot.pause()
+        for key in keys:
+            await pilot.press(key)
+        await pilot.pause()
+        canvas = str(screen.query_one("#plot-canvas").render())
+        status = str(screen.query_one("#plot-status").render())
+        # Read before the app is torn down, when the screen can no longer be queried.
+        facts = {
+            "open": app.screen is screen,
+            "typing": screen.query_one("#plot-prompt").has_class("visible"),
+        }
+    return screen, canvas, status, facts
+
+
+async def test_the_reference_line_starts_at_zero_and_can_be_moved(offline_config: Config) -> None:
+    screen, _, status, _ = await open_plot(offline_config, [])
+    assert screen.reference == 0.0 and "ref y = 0" in status
+
+    screen, _, status, _ = await open_plot(offline_config, ["z", *"0.4", "enter"])
+    assert screen.reference == 0.4 and "ref y = 0.4" in status
+
+    screen, _, status, _ = await open_plot(offline_config, ["z", *"off", "enter"])
+    assert screen.reference is None and "ref off" in status
+
+
+async def test_only_the_last_n_can_be_shown(offline_config: Config) -> None:
+    """The start-up spike to 9 is what sets the scale until it is cut away."""
+    _, whole, _, _ = await open_plot(offline_config, [])
+    screen, cut, status, _ = await open_plot(offline_config, ["w", *"300", "enter"])
+    assert screen.window == 300.0 and "last 300" in status
+    assert "9" in whole.split("\n")[1]
+    assert not cut.split("\n")[1].strip().startswith("9")
+
+
+async def test_a_value_can_be_read_off_at_a_chosen_x(offline_config: Config) -> None:
+    screen, canvas, _, _ = await open_plot(offline_config, ["f", *"500", "enter"])
+    assert screen.lookup_x == 500.0
+    assert "at Iteration = 500:" in canvas and "Cl 0.42" in canvas
+
+
+async def test_a_value_between_samples_is_marked_approximate(offline_config: Config) -> None:
+    _, canvas, _, _ = await open_plot(offline_config, ["f", *"450", "enter"])
+    assert "≈ 0.415" in canvas
+
+
+async def test_a_value_outside_the_run_is_not_invented(offline_config: Config) -> None:
+    _, canvas, _, _ = await open_plot(offline_config, ["f", *"5000", "enter"])
+    assert "no data there (0 to 500)" in canvas
+
+
+async def test_the_lookup_ignores_the_window(offline_config: Config) -> None:
+    """Hiding the start of the plot does not change what the value was there."""
+    _, canvas, _, _ = await open_plot(
+        offline_config, ["w", *"100", "enter", "f", *"0", "enter"]
+    )
+    assert "Cl 9" in canvas
+
+
+async def test_escape_closes_the_prompt_not_the_plot(offline_config: Config) -> None:
+    _, _, _, facts = await open_plot(offline_config, ["f", "escape"])
+    assert facts == {"open": True, "typing": False}
+
+
+async def test_typing_q_into_a_prompt_does_not_leave_the_plot(offline_config: Config) -> None:
+    """``q`` is "back" on this screen, and also a letter someone may type into the box."""
+    _, _, _, facts = await open_plot(offline_config, ["z", "q"])
+    assert facts == {"open": True, "typing": True}
+
+
+async def test_nonsense_is_refused_and_changes_nothing(offline_config: Config) -> None:
+    screen, _, _, _ = await open_plot(offline_config, ["w", *"abc", "enter"])
+    assert screen.window is None
+    screen, _, _, _ = await open_plot(offline_config, ["w", *"-5", "enter"])
+    assert screen.window is None

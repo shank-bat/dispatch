@@ -47,7 +47,7 @@ dispatch submit ~/cases/wing --cores 20 --dry-run   # show what would happen; ru
 dispatch submit ~/cases/wake --cores 8 --after 3f2a  # start only once job 3f2a completes
 dispatch find cavity                      # find a project directory under ~/projects
 dispatch submit ~/sweep --sweep --from-latest      # continue every case where it stopped
-dispatch repartition <id> 24              # stop at the next write, resume on 24 cores
+dispatch repartition <id> 24              # queued: start on 24; running: stop at the next write, resume on 24
 dispatch case ~/cases/wing                # full description of a case
 dispatch render ~/cases/wing -c top       # mesh PNG with ParaView (headless)
 dispatch render ~/cases/wing -k animation --field U   # MP4 video, encoded with ffmpeg
@@ -61,10 +61,10 @@ dispatch search 'tag:paper resource:gpu cores>=16 endTime>500'
 ```
 
 In the interface: `1` dashboard, `2` queue, `3` history, `n` new job, `p` plot a job's
-numbers (`d` switches to force coefficients), `i` case information, `space` on the dashboard
+numbers (`d` switches to force coefficients; `z` reference line, `w` last N, `f` value at an x), `i` case information, `space` on the dashboard
 shows a job's latest CL/CD, `m` on the dashboard switches between counting cores and threads,
 `v`/`V` in the case view render an image or a video of any field the case has (`x` cancels),
-`c` in the queue re-cores a running job, `?` help. It is entirely keyboard-driven.
+`c` in the queue re-cores a job (a queued one at once, a running one at its next write), `?` help. It is entirely keyboard-driven.
 
 ## What it does
 

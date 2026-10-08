@@ -1273,6 +1273,16 @@ timestep, so it keeps its ordinary failure, the request is cleared and an event 
 wins over a pending resize. The queue view shows "finishing its current timestep — will requeue on
 N cores" while the request is pending, so the keypress is visibly doing something.
 
+**A job that has not started is simply re-cored.** The same method and key apply to QUEUED and HELD
+jobs. There is nothing to stop, so no request is recorded. `set_waiting_cores` changes `jobs.cores`
+in one `UPDATE … WHERE state IN ('QUEUED','HELD')`, so a job admitted in the meantime cannot end up
+with a count different from its allocation. The job keeps its `seq` and its place in the queue.
+Nothing on disk changes: preparation is planned from the job's count at admission, so a case never
+decomposed, or decomposed for another count, is (re)decomposed then. The case is validated again
+on the new count first, as a submission is. ERRORs refuse the change unless `force` is passed; the
+TUI asks before forcing. Then the scheduler is nudged, since a smaller count may admit the job at
+once.
+
 
 ---
 
@@ -1995,6 +2005,25 @@ Selection and chart live on one screen rather than a wizard followed by a pictur
 cursor redraws immediately, which turns "choose a plot" into "look through the data". `space`
 overlays up to four Y series, because residuals are read against each other. `tab` switches lists,
 `r` re-reads a running job's log, `Esc`/`q` goes back.
+
+Three typed values read the chart more closely. Each opens a one-line prompt, where `Esc` closes
+the prompt rather than the screen:
+
+* **`z` — reference line.** A dotted horizontal guide, at y = 0 until moved; `off` hides it. It is
+  labelled on the axis, replacing any tick on the same row. It does **not** widen the y range: a
+  line at zero would flatten a drag coefficient varying around 0.02 into a straight line. Off the
+  scale, the status line says so instead. It is drawn faint and beneath the curves, so it never
+  takes a series' colour.
+* **`w` — last N.** Only the pairs within N of the largest x are drawn, in x-axis units: "the last
+  500 iterations", or "the last 0.5 s" on a transient run, however often the solver wrote. The y
+  scale, and the automatic log guess, fit what is left. That is the point: the start of a run is
+  routinely orders of magnitude from where it settles.
+* **`f` — value at x.** Every plotted series' value at the typed x is shown under the legend, in
+  its colour, and a dotted vertical marker is drawn there. When no sample sits exactly at that x,
+  the value is interpolated linearly between its neighbours and shown as `≈`. It is never
+  extrapolated: past the end of the data the readout says "no data there" with the range that
+  exists. A resumed run can visit an x twice, and the later visit wins. The lookup reads the whole
+  run, not the window, and survives `r`, so it tracks a running job.
 
 ---
 

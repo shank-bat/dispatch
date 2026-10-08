@@ -47,7 +47,7 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("x", "cancel the job"),
             ("h / H", "hold / release"),
             ("+ / -", "raise / lower priority"),
-            ("c", "pause at the next write, resume on new cores"),
+            ("c", "change cores — queued: at once; running: pause at the next write, resume"),
         ],
     ),
     (
@@ -118,6 +118,9 @@ SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("l", "linear / logarithmic y axis"),
             ("m", "braille / block marks"),
             ("d", "switch data set (log, coefficients, …)"),
+            ("z", "move the reference line (y = 0 until moved; 'off' hides it)"),
+            ("w", "show only the last N of the x axis — rescales y"),
+            ("f", "read every series' value at an x"),
             ("r", "re-read the log"),
             ("esc", "back"),
         ],

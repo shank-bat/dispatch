@@ -36,7 +36,16 @@ from rich.text import Text
 
 from dispatch.tui.theme import Palette
 
-__all__ = ["Charset", "PlotStyle", "hidden_by_log", "render_plot", "series_colour"]
+__all__ = [
+    "Charset",
+    "Lookup",
+    "PlotStyle",
+    "hidden_by_log",
+    "last_window",
+    "render_plot",
+    "series_colour",
+    "value_at",
+]
 
 MIN_WIDTH: Final = 20
 MIN_HEIGHT: Final = 5
@@ -79,6 +88,9 @@ and 8 at the bottom, so the fourth row's bits are 0x40 and 0x80 rather than what
 would guess. Written out as a table because deriving it inline is how this gets subtly
 wrong.
 """
+
+GUIDE: Final = -2
+"""Canvas owner for the reference line and the lookup marker, drawn faint beneath curves."""
 
 _BLOCK_BITS: Final = ((0x01, 0x04), (0x02, 0x08))
 _BLOCK_GLYPHS: Final = (
@@ -169,6 +181,64 @@ def hidden_by_log(values: Sequence[float]) -> int:
     return sum(1 for value in values if value <= 0)
 
 
+def last_window(
+    xs: Sequence[float], ys: Sequence[float], span: float
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Keep the pairs within ``span`` of the largest x -- "the last 500 iterations".
+
+    In x-axis units rather than a count of samples, because that is what the axis below the
+    chart is read in: on a steady run one sample is one iteration and the two agree, and on
+    a transient run "the last 0.5 s" means what it says however often the solver wrote.
+
+    The point is the y scale. The first hundred iterations of a run are routinely orders of
+    magnitude away from where it settles, and the scale is fitted to whatever is drawn, so
+    dropping them is what makes the converged part readable.
+    """
+    if not xs or span <= 0:
+        return tuple(xs), tuple(ys)
+    start = max(xs) - span
+    kept = [(x, y) for x, y in zip(xs, ys, strict=False) if x >= start]
+    return tuple(x for x, _ in kept), tuple(y for _, y in kept)
+
+
+@dataclass(frozen=True, slots=True)
+class Lookup:
+    """A series' value at a requested x.
+
+    Attributes:
+        value: The value read off the data.
+        exact: Whether a sample sits at exactly that x. Otherwise the value is interpolated
+            linearly between the two samples either side, and is shown as approximate.
+    """
+
+    value: float
+    exact: bool
+
+
+def value_at(xs: Sequence[float], ys: Sequence[float], x: float) -> Lookup | None:
+    """The value of a series at ``x``, or ``None`` when ``x`` is outside its data.
+
+    Never extrapolated: "the lift at iteration 5000" of a run that has reached 3000 has no
+    answer yet, and inventing one would be worse than saying so.
+
+    The *last* match wins, in record order. A log that has been resumed can visit the same x
+    twice -- the restarted run repeats the steps after the last write -- and the later
+    visit is the one the run kept.
+    """
+    found: Lookup | None = None
+    for index, (x0, y0) in enumerate(zip(xs, ys, strict=False)):
+        if x0 == x:
+            found = Lookup(y0, exact=True)
+            continue
+        if index + 1 >= len(xs):
+            break
+        x1, y1 = xs[index + 1], ys[index + 1]
+        if x1 != x and (x0 - x) * (x1 - x) < 0:
+            fraction = (x - x0) / (x1 - x0)
+            found = Lookup(y0 + fraction * (y1 - y0), exact=False)
+    return found
+
+
 class _Canvas:
     """A grid of sub-cell dots that renders to characters.
 
@@ -237,8 +307,21 @@ class _Canvas:
                 if self._style.charset is Charset.BRAILLE
                 else _BLOCK_GLYPHS[mask]
             )
-            text.append(glyph, style=series_colour(max(0, self._owner[index])))
+            owner = self._owner[index]
+            text.append(glyph, style=Palette.FAINT if owner == GUIDE else series_colour(owner))
         return text
+
+    def dotted(self, horizontal: bool, at: int, length: int) -> None:
+        """A dotted guide line: every other dot, so it reads as a guide rather than data.
+
+        Drawn before the curves, which then take over the colour of any cell they cross --
+        the data is what is being read, and the guide only has to be findable.
+        """
+        for position in range(0, length, 2):
+            if horizontal:
+                self.set(position, at, GUIDE)
+            else:
+                self.set(at, position, GUIDE)
 
 
 def render_plot(
@@ -249,6 +332,8 @@ def render_plot(
     style: PlotStyle | None = None,
     x_label: str = "",
     y_label: str = "",
+    reference: float | None = None,
+    marker_x: float | None = None,
 ) -> list[Text]:
     """Render one or more curves as terminal lines.
 
@@ -259,6 +344,10 @@ def render_plot(
         style: Charset and axis scaling. Defaults to braille, linear.
         x_label: Axis caption, shown under the x tick labels.
         y_label: Axis caption, shown above the chart.
+        reference: Draw a dotted horizontal line at this y, labelled on the axis. Not used
+            to widen the y range: a reference at zero would flatten a drag coefficient
+            varying around 0.02 into a line. Skipped when it falls outside the range.
+        marker_x: Draw a dotted vertical line at this x -- where a value was looked up.
 
     Returns:
         Lines ready to write into a widget. A message rather than a chart when there is
@@ -286,6 +375,18 @@ def render_plot(
         ]
 
     ticks = _y_ticks(y_range, rows=height - 2, log=style.log_y)
+    # Sub-cell row of the reference line, origin top-left like everything on the canvas.
+    reference_row: int | None = None
+    if reference is not None and _within(reference, y_range, log=style.log_y):
+        sub_height = (height - 2) * style.cell[1]
+        projected = _project(reference, y_range, sub_height - 1, log=style.log_y)
+        if projected is not None:
+            reference_row = sub_height - 1 - projected
+            # Labelled where it sits. A tick on the same row gives way: "0" says what the
+            # line is, and "0.001704" beside it would say the line is somewhere else.
+            cell_row = reference_row // style.cell[1]
+            ticks = [tick for tick in ticks if tick[1] != cell_row]
+            ticks = sorted([*ticks, (_format(reference), cell_row)], key=lambda t: t[1])
     gutter = max((len(label) for label, _ in ticks), default=0) + GUTTER
     plot_cols = width - gutter - 1
     plot_rows = height - 2  # one row for the x axis, one for its labels
@@ -294,6 +395,12 @@ def render_plot(
 
     canvas = _Canvas(plot_cols, plot_rows, style)
     sub_cols, sub_rows = style.cell
+    if reference_row is not None:
+        canvas.dotted(True, reference_row, plot_cols * sub_cols)
+    if marker_x is not None and _within(marker_x, x_range, log=style.log_x):
+        column = _project(marker_x, x_range, plot_cols * sub_cols - 1, log=style.log_x)
+        if column is not None:
+            canvas.dotted(False, column, plot_rows * sub_rows)
     for index, curve in enumerate(drawable):
         _draw(
             canvas,
@@ -369,6 +476,12 @@ def _project(
         # collapsed onto an edge where it reads as a boundary.
         return extent // 2
     return max(0, min(extent, round((value - low) / (high - low) * extent)))
+
+
+def _within(value: float, span: tuple[float, float], *, log: bool) -> bool:
+    if log and value <= 0:
+        return False
+    return span[0] <= value <= span[1]
 
 
 def _range(values: Sequence[float], *, log: bool) -> tuple[float, float] | None:

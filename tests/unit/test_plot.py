@@ -25,12 +25,16 @@ from dispatch.core.series import PlotData, Series, align, downsample, series_fro
 from dispatch.tui.plot import (
     Charset,
     Curve,
+    Lookup,
     PlotStyle,
     hidden_by_log,
+    last_window,
     render_plot,
     series_colour,
     suggests_log,
+    value_at,
 )
+from dispatch.tui.theme import Palette
 
 # -- a realistic OpenFOAM log ---------------------------------------------------------------
 
@@ -415,3 +419,90 @@ def test_a_series_with_one_zero_still_renders_on_a_log_axis() -> None:
                         style=PlotStyle(log_y=True))
     assert "logarithmic" not in line_text(lines)
     assert line_text(lines).strip()
+
+
+# -- reading the chart more closely: reference line, last N, value at x -------------------
+
+
+def test_the_last_n_is_measured_in_x_axis_units() -> None:
+    """The last 500 iterations, however often the solver wrote."""
+    xs = [0.0, 100.0, 200.0, 300.0, 400.0, 500.0]
+    ys = [9.0, 8.0, 7.0, 6.0, 5.0, 4.0]
+    assert last_window(xs, ys, 200.0) == ((300.0, 400.0, 500.0), (6.0, 5.0, 4.0))
+
+
+def test_a_window_wider_than_the_run_keeps_everything() -> None:
+    assert last_window([1.0, 2.0], [3.0, 4.0], 1e9) == ((1.0, 2.0), (3.0, 4.0))
+
+
+def test_the_window_rescales_the_y_axis() -> None:
+    """The whole point: a start-up spike stops deciding the scale of the converged part."""
+    xs = [float(i) for i in range(100)]
+    ys = [1000.0 if i < 5 else 0.4 + 0.001 * (i % 3) for i in range(100)]
+    whole = line_text(render_plot([Curve("Cl", xs, ys)], width=60, height=12))
+    cut = line_text(render_plot([Curve("Cl", *last_window(xs, ys, 50.0))], width=60, height=12))
+    assert "1000" in whole
+    assert "1000" not in cut and "0.4" in cut
+
+
+def test_a_value_on_a_sample_is_exact() -> None:
+    found = value_at([0.0, 500.0, 1000.0], [0.1, 0.42, 0.5], 500.0)
+    assert found == Lookup(0.42, exact=True)
+
+
+def test_a_value_between_samples_is_interpolated_and_says_so() -> None:
+    found = value_at([0.0, 1000.0], [0.0, 1.0], 250.0)
+    assert found is not None and not found.exact
+    assert math.isclose(found.value, 0.25)
+
+
+def test_a_value_beyond_the_data_is_not_invented() -> None:
+    """Lift at iteration 5000 of a run that has reached 3000 has no answer yet."""
+    assert value_at([0.0, 3000.0], [0.1, 0.4], 5000.0) is None
+    assert value_at([10.0, 20.0], [1.0, 2.0], 5.0) is None
+    assert value_at([], [], 1.0) is None
+
+
+def test_the_last_visit_to_an_x_wins() -> None:
+    """A resumed run repeats the steps after its last write; the later run is the one kept."""
+    found = value_at([1.0, 2.0, 3.0, 2.0, 3.0], [10.0, 20.0, 30.0, 21.0, 31.0], 2.0)
+    assert found == Lookup(21.0, exact=True)
+
+
+def test_a_reference_line_is_drawn_and_labelled() -> None:
+    xs = [float(i) for i in range(50)]
+    ys = [math.sin(i / 5) for i in range(50)]
+    plain = line_text(render_plot([Curve("Cl", xs, ys)], width=60, height=13))
+    marked = render_plot([Curve("Cl", xs, ys)], width=60, height=13, reference=0.0)
+    labels = [line.plain.split("┤")[0].strip() for line in marked if "┤" in line.plain]
+    assert "0" in labels, "the reference is labelled where it sits"
+    assert line_text(marked) != plain, "the line changes the canvas"
+    faint = [
+        span for line in marked for span in line.spans if str(span.style) == Palette.FAINT
+    ]
+    assert faint, "the guide is drawn faint, not in a series colour"
+
+
+def test_a_reference_line_outside_the_data_is_left_off() -> None:
+    """Not used to widen the range: a line at zero would flatten a Cd of 0.02 into nothing."""
+    xs = [float(i) for i in range(50)]
+    ys = [0.02 + 0.0001 * (i % 4) for i in range(50)]
+    with_ref = render_plot([Curve("Cd", xs, ys)], width=60, height=12, reference=0.0)
+    without = render_plot([Curve("Cd", xs, ys)], width=60, height=12)
+    assert line_text(with_ref) == line_text(without)
+
+
+def test_a_reference_at_zero_cannot_appear_on_a_log_axis() -> None:
+    log = PlotStyle(log_y=True)
+    lines = render_plot([decaying()], width=60, height=12, style=log, reference=0.0)
+    plain = render_plot([decaying()], width=60, height=12, style=log)
+    assert line_text(lines) == line_text(plain)
+
+
+def test_the_looked_up_x_is_marked() -> None:
+    curve = Curve("Cl", [float(i) for i in range(100)], [0.5] * 100)
+    marked = render_plot([curve], width=60, height=12, marker_x=50.0)
+    plain = render_plot([curve], width=60, height=12)
+    assert line_text(marked) != line_text(plain)
+    outside = render_plot([curve], width=60, height=12, marker_x=500.0)
+    assert line_text(outside) == line_text(plain)

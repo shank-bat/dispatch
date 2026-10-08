@@ -14,6 +14,18 @@ redraws immediately, which turns "choose a plot" into "look through the data".
 series and ``space`` again removes it. That is the one piece of state worth carrying
 beyond a single chart.
 
+**Three ways to read the chart more closely**, each a typed value because each is a number
+the user already has in mind:
+
+* ``z`` moves the dotted **reference line**, at y = 0 until moved, or turns it off. A lift
+  coefficient is read against zero and a residual against its tolerance.
+* ``w`` shows only the **last N** of the x axis. The start of a run is routinely orders of
+  magnitude from where it settles, and the y scale fits whatever is drawn, so this is what
+  makes the converged part legible.
+* ``f`` **finds the value at an x** -- the lift at iteration 500 -- for every plotted series,
+  interpolated between samples when none sits exactly there, and marks it on the chart. It
+  is kept across reloads, so it reads off a running job as it advances.
+
 The rendering itself is :mod:`dispatch.tui.plot`, which is pure arithmetic over numbers
 and a size -- no widgets, no files, and above all no images.
 """
@@ -26,18 +38,21 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import ListItem, ListView, Static
+from textual.widgets import Input, ListItem, ListView, Static
 
 from dispatch.core.series import Dataset, PlotData, Series, align
 from dispatch.ipc.protocol import Method
 from dispatch.tui.plot import (
     Charset,
     Curve,
+    Lookup,
     PlotStyle,
     hidden_by_log,
+    last_window,
     render_plot,
     series_colour,
     suggests_log,
+    value_at,
 )
 from dispatch.tui.screens.base import DispatchScreen
 from dispatch.tui.theme import Palette
@@ -66,6 +81,9 @@ class PlotScreen(DispatchScreen):
         Binding("m", "toggle_marker", "marks"),
         Binding("r", "reload", "reload"),
         Binding("d", "next_dataset", "dataset"),
+        Binding("z", "reference", "ref line"),
+        Binding("w", "window", "last N"),
+        Binding("f", "find", "value at x"),
         Binding("p", "focus_axes", "series", show=False),
     ]
 
@@ -88,6 +106,13 @@ class PlotScreen(DispatchScreen):
         self._style = PlotStyle()
         self._log_chosen = False
         """Whether the user has overridden the automatic log-scale guess."""
+        self.reference: float | None = 0.0
+        """Where the dotted reference line is drawn, or ``None`` for no line."""
+        self.window: float | None = None
+        """Show only this much of the end of the x axis; ``None`` shows everything."""
+        self.lookup_x: float | None = None
+        """The x whose values are read out under the legend, if one was asked for."""
+        self._prompt_mode = ""
 
     @property
     def data(self) -> PlotData:
@@ -128,6 +153,7 @@ class PlotScreen(DispatchScreen):
                     yield ListView(id="y-list")
                 yield Static("", id="plot-canvas")
             yield Static("", id="plot-status")
+            yield Input(id="plot-prompt", classes="prompt")
         yield from self.compose_footer()
 
     async def on_mount(self) -> None:
@@ -181,7 +207,9 @@ class PlotScreen(DispatchScreen):
         """
         if self._log_chosen:
             return
-        values = [value for series in self._selected_y() for value in series.values]
+        # From what will be drawn: the transient that `w` hides should not choose the scale
+        # of the part that is left.
+        values = [value for _, _, ys in self._pairs() for value in ys]
         self._style = PlotStyle(
             charset=self._style.charset, log_y=suggests_log(values), log_x=self._style.log_x
         )
@@ -233,6 +261,21 @@ class PlotScreen(DispatchScreen):
         found = [self.data.get(key) for key in self._y_keys]
         return [series for series in found if series is not None]
 
+    def _pairs(
+        self, *, windowed: bool = True
+    ) -> list[tuple[Series, tuple[float, ...], tuple[float, ...]]]:
+        """Each selected y series paired with x, cut to the window unless asked not to be."""
+        x_series = self.data.get(self._x_key or "")
+        if x_series is None:
+            return []
+        pairs = []
+        for series in self._selected_y():
+            xs, ys = align(x_series, series)
+            if windowed and self.window is not None:
+                xs, ys = last_window(xs, ys, self.window)
+            pairs.append((series, xs, ys))
+        return pairs
+
     # -- rendering ---------------------------------------------------------------------
 
     def _redraw(self) -> None:
@@ -266,33 +309,43 @@ class PlotScreen(DispatchScreen):
 
         curves: list[Curve] = []
         notes: list[str] = []
-        for series in y_series:
-            xs, ys = align(x_series, series)
-            if not xs:
+        full = {series.key: (xs, ys) for series, xs, ys in self._pairs(windowed=False)}
+        for series, xs, ys in self._pairs():
+            aligned = len(full[series.key][0])
+            if not aligned:
                 notes.append(f"{series.label} shares no samples with {x_series.label}")
+                continue
+            if not xs:
+                notes.append(f"{series.label} has no samples in the window")
                 continue
             # Said out loud rather than silently truncated: two series of different
             # lengths is exactly where a plot starts lying about what it shows.
-            if len(xs) < min(len(x_series), len(series)):
-                notes.append(f"{series.label}: {len(xs)} of {len(series)} points align")
+            if aligned < min(len(x_series), len(series)):
+                notes.append(f"{series.label}: {aligned} of {len(series)} points align")
             # A log axis cannot draw a zero, and a solver prints them. Dropping the point
             # is right; dropping it quietly is not.
             if self._style.log_y and (hidden := hidden_by_log(ys)):
                 notes.append(f"{series.label}: {hidden} non-positive point(s) not shown")
             curves.append(Curve(series.display, xs, ys))
 
+        readout = self._readout(x_series, full)
         size = self.query_one("#plot-canvas").size
         lines = render_plot(
             curves,
             width=max(20, size.width - 1),
-            height=max(6, size.height - 2),
+            height=max(6, size.height - 2 - (1 if readout else 0)),
             style=self._style,
             x_label=x_series.display,
+            reference=self.reference,
+            marker_x=self.lookup_x,
         )
 
         body = Text()
         body.append(self._legend())
         body.append("\n")
+        if readout:
+            body.append(readout)
+            body.append("\n")
         for line in lines:
             body.append(line)
             body.append("\n")
@@ -308,6 +361,33 @@ class PlotScreen(DispatchScreen):
                 text.append("   ")
             text.append("━ ", style=series_colour(index))
             text.append(series.display, style=Palette.MUTED)
+        return text
+
+    def _readout(
+        self, x_series: Series, full: dict[str, tuple[tuple[float, ...], tuple[float, ...]]]
+    ) -> Text | None:
+        """Every plotted series' value at the looked-up x, in its own colour.
+
+        From the whole run, not the window: the question is what the value *was* at that x,
+        and hiding the start of the plot does not change the answer.
+        """
+        if self.lookup_x is None:
+            return None
+        text = Text(f"at {x_series.display} = {_number(self.lookup_x)}:", style=Palette.MUTED)
+        for index, series in enumerate(self._selected_y()):
+            xs, ys = full.get(series.key, ((), ()))
+            found: Lookup | None = value_at(xs, ys, self.lookup_x)
+            text.append("   ")
+            text.append(f"{series.display} ", style=series_colour(index))
+            if found is None:
+                span = f" ({_number(min(xs))} to {_number(max(xs))})" if xs else ""
+                text.append(f"no data there{span}", style=Palette.WARNING)
+            else:
+                # Approximate is said, not hidden: between two writes the value is a line
+                # drawn between them, not something the solver reported.
+                text.append(
+                    f"{'' if found.exact else '≈ '}{_number(found.value)}", style=Palette.TEXT
+                )
         return text
 
     def _status(self, notes: list[str]) -> Text:
@@ -326,12 +406,33 @@ class PlotScreen(DispatchScreen):
         text.append("log" if self._style.log_y else "linear", style=Palette.MUTED)
         text.append("   marks ", style=Palette.FAINT)
         text.append(self._style.charset.value, style=Palette.MUTED)
+        if self.window is not None:
+            text.append("   last ", style=Palette.FAINT)
+            text.append(_number(self.window), style=Palette.ACCENT)
+        text.append("   ref ", style=Palette.FAINT)
+        if self.reference is None:
+            text.append("off", style=Palette.MUTED)
+        else:
+            text.append(f"y = {_number(self.reference)}", style=Palette.MUTED)
+            if not self._reference_drawn():
+                text.append(" (off the scale)", style=Palette.FAINT)
         text.append(f"   {self.data.samples} samples", style=Palette.FAINT)
         if self.data.truncated:
             text.append("   (log truncated; showing the end of the run)", style=Palette.WARNING)
         for note in notes:
             text.append(f"   {note}", style=Palette.WARNING)
         return text
+
+    def _reference_drawn(self) -> bool:
+        """Whether the reference line falls inside the y range being drawn."""
+        if self.reference is None:
+            return False
+        values = [value for _, _, ys in self._pairs() for value in ys]
+        if self._style.log_y:
+            if self.reference <= 0:
+                return False
+            values = [value for value in values if value > 0]
+        return bool(values) and min(values) <= self.reference <= max(values)
 
     def heading(self) -> Text:
         text = Text("plot", style=f"bold {Palette.TEXT}")
@@ -347,7 +448,79 @@ class PlotScreen(DispatchScreen):
     # -- actions --------------------------------------------------------------------------
 
     def action_back(self) -> None:
+        # Escape while typing a value closes the prompt rather than the whole screen.
+        box = self.query_one("#plot-prompt", Input)
+        if box.has_class("visible"):
+            self._close_prompt()
+            return
         self.dismiss()
+
+    def action_reference(self) -> None:
+        """Move the dotted reference line, or turn it off."""
+        now = "off" if self.reference is None else _number(self.reference)
+        self._open_prompt("reference", f"reference line at y = ?  (now {now}; 'off' hides it)")
+
+    def action_window(self) -> None:
+        """Show only the end of the run, so its start stops deciding the scale."""
+        x_series = self.data.get(self._x_key or "")
+        unit = x_series.display if x_series else "the x axis"
+        self._open_prompt("window", f"show only the last how much of {unit}?  (empty shows all)")
+
+    def action_find(self) -> None:
+        """Read every plotted series' value at a chosen x."""
+        x_series = self.data.get(self._x_key or "")
+        unit = x_series.display if x_series else "x"
+        self._open_prompt("lookup", f"value at {unit} = ?  (empty clears)")
+
+    def _open_prompt(self, mode: str, placeholder: str) -> None:
+        self._prompt_mode = mode
+        box = self.query_one("#plot-prompt", Input)
+        box.placeholder = placeholder
+        box.value = ""
+        box.add_class("visible")
+        box.focus()
+
+    def _close_prompt(self) -> None:
+        self.query_one("#plot-prompt", Input).remove_class("visible")
+        self._prompt_mode = ""
+        self.query_one("#y-list", ListView).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        mode = self._prompt_mode
+        raw = event.value.strip()
+        self._close_prompt()
+        event.stop()
+
+        if mode == "reference" and raw.lower() in ("off", "none", "-"):
+            self.reference = None
+        elif not raw:
+            # Empty means "back to normal" for the two that have one; for the reference line,
+            # which defaults to zero, it leaves the line where it was.
+            if mode == "window":
+                self.window = None
+            elif mode == "lookup":
+                self.lookup_x = None
+            else:
+                return
+        else:
+            try:
+                value = float(raw)
+            except ValueError:
+                self.notify_error(f"{raw!r} is not a number")
+                return
+            if mode == "reference":
+                self.reference = value
+            elif mode == "window":
+                if value <= 0:
+                    self.notify_error("The window must be larger than zero.")
+                    return
+                self.window = value
+            elif mode == "lookup":
+                self.lookup_x = value
+            else:
+                return
+        self._apply_auto_log()
+        self._redraw()
 
     def action_focus_axes(self) -> None:
         """``p`` again returns to the series list, per the key's meaning everywhere else."""
@@ -524,3 +697,12 @@ def _nothing_to_plot(data: PlotData) -> Text:
 
 def _section(label: str) -> Text:
     return Text(label, style=Palette.FAINT)
+
+
+def _number(value: float) -> str:
+    """A typed or read-off value, in full enough precision to be worth having asked for.
+
+    Not the axis's compact format: the axis is read for its scale, but a value the user
+    asked for is read for its digits, and ``0.4`` for a lift of ``0.41237`` would be wrong.
+    """
+    return f"{value:.6g}"

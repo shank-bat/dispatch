@@ -26,7 +26,7 @@ from dispatch.core.clock import Clock, SystemClock
 from dispatch.core.config import Config, CpuMode
 from dispatch.core.errors import DispatchError, ValidationError
 from dispatch.core.metadata import CaseMetadata
-from dispatch.core.models import JobSpec, ResourceRequest, SweepSpec
+from dispatch.core.models import Job, JobSpec, ResourceRequest, SweepSpec
 from dispatch.core.query import parse_query
 from dispatch.core.series import PlotData
 from dispatch.core.states import JobState
@@ -577,12 +577,16 @@ class IpcServer:
     async def _job_repartition(
         self, session: ClientSession, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Pause a running job at its next write and bring it back on a new core count.
+        """Change a job's core count: at once if it is waiting, at its next write if running.
 
-        The job is never taken out of the scheduler's hands: it stays RUNNING while the
+        A running job is never taken out of the scheduler's hands: it stays RUNNING while the
         solver finishes its step, then takes the ``RUNNING -> QUEUED`` edge and is admitted
         again like anything else. So a repartition cannot strand an allocation, and a job
         caught mid-resize is -- correctly -- either running or queued.
+
+        A queued or held job has nothing to pause, so its count is simply changed. Its case is
+        validated again on the new count first, as a submission would be, because the count
+        is what decomposition and the validator's checks are measured against.
         """
         job_id = self._resolve(params)
         job = self._repo.get(job_id)
@@ -598,12 +602,18 @@ class IpcServer:
                 "stop and never resume."
             )
         if request.cores == job.cores:
-            raise ValidationError(f"{job.name} is already running on {job.cores} core(s)")
+            raise ValidationError(
+                f"{job.name} is already set to {self._resources.describe_cores(job.cores)}"
+            )
+
+        if job.state in (JobState.QUEUED, JobState.HELD) and not self._executor.is_running(
+            job_id
+        ):
+            return await self._recore_waiting(job, request.cores, force=bool(params.get("force")))
 
         if not self._executor.is_running(job_id):
             raise ValidationError(
-                f"{job.name} is not running, so there is nothing to pause. Change its core "
-                "count by cancelling and resubmitting it."
+                f"{job.name} is {job.state.value.lower()}, so its core count cannot change"
             )
 
         await self._executor.repartition(job_id, request.cores)
@@ -612,6 +622,38 @@ class IpcServer:
             "job": encode_job(updated),
             "pausing": True,
             "cores": request.cores,
+        }
+
+    async def _recore_waiting(self, job: Job, cores: int, *, force: bool) -> dict[str, Any]:
+        entry = job.metadata.extra.get("entry")
+        result = await asyncio.to_thread(
+            self._inspector.inspect,
+            job.workdir,
+            cores=cores,
+            ram_mb=job.ram_estimate_mb,
+            gpus=job.gpus,
+            solver=job.solver,
+            entry=Path(str(entry)) if entry else None,
+            job_name=job.name,
+            build_plan=False,
+            start_from_latest=job.start_from_latest,
+        )
+        if not result.report.passed and not force:
+            raise ValidationError(
+                f"On {self._resources.describe_cores(cores)} this case does not pass "
+                f"validation: {result.report.summary()}. Pass force to change it anyway.",
+                detail={"validation": encode_report(result.report)},
+            )
+        updated = self._repo.set_waiting_cores(job.id, cores)
+        self._bus.publish(Event.JOB_STATE, encode_job(updated))
+        # Fewer cores may let it start now; more may let something behind it go first.
+        self._scheduler.nudge()
+        log.info("Job %s re-cored to %d before starting", job.id[:8], cores)
+        return {
+            "job": encode_job(updated),
+            "pausing": False,
+            "cores": cores,
+            "validation": encode_report(result.report),
         }
 
     def _job_hold(self, session: ClientSession, params: dict[str, Any]) -> dict[str, Any]:
